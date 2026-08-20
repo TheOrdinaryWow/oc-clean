@@ -4,7 +4,7 @@ use crate::cli::types::Duration;
 use crate::db::DatabaseConnection;
 use crate::error::Error;
 
-const OLDER_THAN_SQL: &str = r"
+const EFFECTIVE_TIME_UPDATED_SQL: &str = r"
 WITH RECURSIVE subtree(root_id, session_id, time_updated, path, cycle) AS (
     SELECT id, id, time_updated, char(31) || id || char(31), 0
     FROM session
@@ -24,9 +24,8 @@ effective_age(root_id, effective_time_updated, cycle) AS MATERIALIZED (
     FROM subtree
     GROUP BY root_id
 )
-SELECT root_id, cycle
+SELECT root_id, effective_time_updated, cycle
 FROM effective_age
-WHERE cycle != 0 OR effective_time_updated <= ?1
 ORDER BY root_id
 ";
 
@@ -42,6 +41,12 @@ ORDER BY session.id, project_directory.directory
 
 /// A deterministic set of candidate session identifiers.
 pub type SessionIds = BTreeSet<String>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EffectiveTimeUpdated {
+    pub session_id: String,
+    pub time_updated: i64,
+}
 
 /// Filesystem case policy used for project-path matching.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,14 +77,24 @@ pub fn older_than<Access>(
             argument: "older-than".to_owned(),
             reason: "age boundary is outside the supported millisecond epoch range".to_owned(),
         })?;
+    Ok(effective_time_updated(database)?
+        .into_iter()
+        .filter(|session| session.time_updated <= boundary_ms)
+        .map(|session| session.session_id)
+        .collect())
+}
+
+pub(crate) fn effective_time_updated<Access>(
+    database: &DatabaseConnection<Access>,
+) -> Result<Vec<EffectiveTimeUpdated>, Error> {
     let mut statement = database
         .connection()
-        .prepare(OLDER_THAN_SQL)
+        .prepare(EFFECTIVE_TIME_UPDATED_SQL)
         .map_err(|source| sqlite_error("preparing effective session age query", source))?;
     let mut rows = statement
-        .query([boundary_ms])
+        .query([])
         .map_err(|source| sqlite_error("querying effective session ages", source))?;
-    let mut selected = SessionIds::new();
+    let mut effective_times = Vec::new();
 
     while let Some(row) = rows
         .next()
@@ -88,16 +103,22 @@ pub fn older_than<Access>(
         let session_id = row
             .get::<_, String>(0)
             .map_err(|source| sqlite_error("reading effective-age session id", source))?;
-        let cycle = row
+        let time_updated = row
             .get::<_, i64>(1)
+            .map_err(|source| sqlite_error("reading effective session timestamp", source))?;
+        let cycle = row
+            .get::<_, i64>(2)
             .map_err(|source| sqlite_error("reading effective-age cycle marker", source))?;
         if cycle != 0 {
             return Err(parent_cycle(&session_id));
         }
-        selected.insert(session_id);
+        effective_times.push(EffectiveTimeUpdated {
+            session_id,
+            time_updated,
+        });
     }
 
-    Ok(selected)
+    Ok(effective_times)
 }
 
 /// Selects sessions carrying a non-null archive epoch.
