@@ -2,6 +2,7 @@
 
 pub mod command;
 mod human;
+pub mod impact;
 mod json;
 pub mod logging;
 
