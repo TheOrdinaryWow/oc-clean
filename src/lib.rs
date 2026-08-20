@@ -4,6 +4,7 @@ pub mod db;
 pub mod doctor;
 pub mod error;
 pub mod paths;
+pub mod reclaim;
 pub mod report;
 pub mod safety;
 pub mod select;
