@@ -2,7 +2,7 @@ pub mod types;
 
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -14,21 +14,55 @@ use clap::Parser;
     reason = "CLI switches are independent user choices"
 )]
 pub struct Cli {
-    #[arg(long, env = "OCC_DB", value_name = "PATH")]
+    #[command(subcommand)]
+    pub command: Commands,
+
+    #[arg(long, env = "OCC_DB", value_name = "PATH", global = true)]
     pub db: Option<PathBuf>,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub apply: bool,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub force: bool,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub force_schema: bool,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub dangerously_skip_confirm: bool,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub skip_backup: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Commands {
+    /// Analyze database and external storage usage without modifying either.
+    Analyze(AnalyzeArgs),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum LogFormat {
+    Text,
+    Json,
+}
+
+#[derive(Debug, Args)]
+pub struct AnalyzeArgs {
+    /// Emit the report as one stable JSON object on stdout.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Select the tracing diagnostic format written to stderr.
+    #[arg(long, value_enum, default_value_t = LogFormat::Text)]
+    pub log_format: LogFormat,
+
+    /// Limit the largest-session rollup.
+    #[arg(long, default_value_t = 10, value_name = "N")]
+    pub top: usize,
+
+    /// Emit only file-level accounting and row counts.
+    #[arg(long)]
+    pub quick: bool,
 }

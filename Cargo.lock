@@ -574,6 +574,7 @@ dependencies = [
  "libproc",
  "procfs",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tracing",
