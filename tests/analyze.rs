@@ -183,4 +183,197 @@ mod analyze {
             assert!(!source.contains(" LENGTH("));
         }
     }
+
+    mod attribution {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        use super::super::fixture::{Fixture, FixtureConfig};
+        use oc_clean::analyze::attribution::{AttributionReport, analyze};
+        use oc_clean::db::{ConnectionOptions, open_read_only};
+        use oc_clean::error::Error;
+        use oc_clean::paths::Target;
+        use rusqlite::params;
+
+        const FIXTURE_SELF_BYTES: u64 = 21;
+
+        fn open_fixture(fixture: &Fixture) -> oc_clean::db::ReadOnlyConnection {
+            open_read_only(
+                &Target::File(fixture.database_path.clone()),
+                ConnectionOptions::default(),
+            )
+            .expect("fixture should open read-only")
+        }
+
+        fn report(config: &FixtureConfig, top_n: usize) -> (Fixture, AttributionReport) {
+            let fixture = Fixture::build(config).unwrap();
+            let database = open_fixture(&fixture);
+            let report = analyze(&database, top_n).unwrap();
+            (fixture, report)
+        }
+
+        #[test]
+        fn parent_size_includes_its_entire_descendant_subtree() {
+            let config = FixtureConfig {
+                session_count: 1,
+                sub_session_depth: 1,
+                sub_session_fan_out: 2,
+                ..FixtureConfig::default()
+            };
+            let (_fixture, report) = report(&config, 3);
+            let root = report
+                .sessions
+                .iter()
+                .find(|entry| entry.session_id == "ses_0")
+                .unwrap();
+
+            assert_eq!(root.self_bytes, FIXTURE_SELF_BYTES);
+            assert_eq!(root.subtree_bytes, FIXTURE_SELF_BYTES * 3);
+        }
+
+        #[test]
+        fn three_level_chain_is_fully_accumulated_into_root() {
+            let config = FixtureConfig {
+                session_count: 1,
+                sub_session_depth: 3,
+                sub_session_fan_out: 1,
+                ..FixtureConfig::default()
+            };
+            let (_fixture, report) = report(&config, 4);
+            let root = report
+                .sessions
+                .iter()
+                .find(|entry| entry.session_id == "ses_0")
+                .unwrap();
+
+            assert_eq!(root.subtree_bytes, FIXTURE_SELF_BYTES * 4);
+        }
+
+        #[test]
+        fn project_totals_equal_the_sum_of_session_self_sizes() {
+            let config = FixtureConfig {
+                project_count: 3,
+                session_count: 6,
+                ..FixtureConfig::default()
+            };
+            let (_fixture, report) = report(&config, 6);
+
+            for project in &report.projects {
+                let session_sum = report
+                    .sessions
+                    .iter()
+                    .filter(|session| session.project_id == project.project_id)
+                    .map(|session| session.self_bytes)
+                    .sum::<u64>();
+                assert_eq!(project.bytes, session_sum, "{}", project.project_id);
+            }
+        }
+
+        #[test]
+        fn top_n_limits_equal_sized_sessions_by_identifier() {
+            let config = FixtureConfig {
+                session_count: 3,
+                ..FixtureConfig::default()
+            };
+            let (_fixture, report) = report(&config, 2);
+
+            assert_eq!(
+                report
+                    .sessions
+                    .iter()
+                    .map(|entry| entry.session_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["ses_0", "ses_1"]
+            );
+        }
+
+        #[test]
+        fn three_projects_are_sorted_by_known_attributed_bytes() {
+            let config = FixtureConfig {
+                project_count: 3,
+                session_count: 3,
+                ..FixtureConfig::default()
+            };
+            let fixture = Fixture::build(&config).unwrap();
+            let connection = fixture.connect().unwrap();
+            for (session_id, payload_bytes) in [("ses_0", 30), ("ses_1", 10), ("ses_2", 20)] {
+                connection
+                    .execute(
+                        "UPDATE part SET data = zeroblob(?1) WHERE session_id = ?2",
+                        params![payload_bytes, session_id],
+                    )
+                    .unwrap();
+            }
+            drop(connection);
+            let database = open_fixture(&fixture);
+
+            let report = analyze(&database, 3).unwrap();
+
+            assert_eq!(
+                report
+                    .projects
+                    .iter()
+                    .map(|entry| (entry.project_id.as_str(), entry.bytes))
+                    .collect::<Vec<_>>(),
+                vec![("project-0", 40), ("project-2", 30), ("project-1", 20)]
+            );
+        }
+
+        #[test]
+        fn parent_cycle_terminates_and_returns_a_typed_error() {
+            let fixture = Fixture::build(&FixtureConfig {
+                session_count: 2,
+                ..FixtureConfig::default()
+            })
+            .unwrap();
+            let connection = fixture.connect().unwrap();
+            connection
+                .execute(
+                    "UPDATE session SET parent_id = CASE id WHEN 'ses_0' THEN 'ses_1' ELSE 'ses_0' END",
+                    [],
+                )
+                .unwrap();
+            drop(connection);
+            let database_path = fixture.database_path.clone();
+            let (sender, receiver) = mpsc::channel();
+
+            std::thread::spawn(move || {
+                let database =
+                    open_read_only(&Target::File(database_path), ConnectionOptions::default())
+                        .unwrap();
+                sender.send(analyze(&database, 2)).unwrap();
+            });
+
+            let result = receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("cycle detection should finish within two seconds");
+            match result {
+                Err(Error::SchemaIncompatible { incompatibility }) => {
+                    assert!(incompatibility.contains("session.parent_id cycle"));
+                }
+                other => panic!("expected parent cycle error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn each_payload_table_has_one_grouped_scan_for_both_rollups() {
+            let source = include_str!("../src/analyze/attribution.rs");
+
+            for table in [
+                "message",
+                "part",
+                "session_context_epoch",
+                "session_message",
+                "event",
+            ] {
+                assert_eq!(
+                    source.matches(&format!("FROM {table} ")).count(),
+                    1,
+                    "{table}"
+                );
+            }
+            assert!(source.contains("octet_length("));
+            assert!(!source.contains(" LENGTH("));
+        }
+    }
 }
