@@ -40,6 +40,8 @@ pub struct Cli {
 pub enum Commands {
     /// Analyze database and external storage usage without modifying either.
     Analyze(AnalyzeArgs),
+    /// Diagnose schema, integrity, holders, and reclaim readiness without modifying the database.
+    Doctor(DoctorArgs),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -65,4 +67,11 @@ pub struct AnalyzeArgs {
     /// Emit only file-level accounting and row counts.
     #[arg(long)]
     pub quick: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct DoctorArgs {
+    /// Emit the report as one stable JSON object on stdout.
+    #[arg(long)]
+    pub json: bool,
 }

@@ -1,6 +1,7 @@
 use clap::Parser;
 use oc_clean::{
     cli::{Cli, Commands},
+    doctor,
     error::Error,
     report,
 };
@@ -16,6 +17,7 @@ fn initialize_logging(cli: &Cli) -> Result<(), Error> {
         Commands::Analyze(arguments) => {
             report::logging::init(arguments.log_format, !arguments.json)
         }
+        Commands::Doctor(_) => report::logging::init(oc_clean::cli::LogFormat::Text, false),
     }
 }
 
@@ -25,6 +27,11 @@ fn dispatch(cli: &Cli) -> Result<(), Error> {
             let stdout = std::io::stdout();
             let mut output = stdout.lock();
             report::command::run(cli, arguments, &mut output)
+        }
+        Commands::Doctor(arguments) => {
+            let stdout = std::io::stdout();
+            let mut output = stdout.lock();
+            doctor::command::run(cli, arguments, &mut output)
         }
     }
 }
