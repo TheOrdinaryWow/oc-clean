@@ -278,4 +278,147 @@ mod db {
         assert!(matches!(&error, Error::NotFound { path } if path == &missing));
         assert_eq!(error.exit_code(), 3);
     }
+
+    mod schema {
+        use super::{Error, Fixture, FixtureConfig};
+        use oc_clean::db::schema::{inspect, inspect_report};
+        use rusqlite::Connection;
+
+        fn connection() -> (Fixture, Connection) {
+            let fixture = Fixture::build(&FixtureConfig::default()).unwrap();
+            let connection = fixture.connect().unwrap();
+            (fixture, connection)
+        }
+
+        #[test]
+        fn baseline_fixture_is_compatible() {
+            let (_fixture, connection) = connection();
+
+            let report = inspect(&connection, false).unwrap();
+
+            assert_eq!(report.tier_one_missing.as_slice(), &[] as &[String]);
+            assert_eq!(report.tier_two_warnings.as_slice(), &[] as &[String]);
+            assert_eq!(report.tier_three_findings.as_slice(), &[] as &[String]);
+            assert!(report.is_compatible());
+        }
+
+        #[test]
+        fn dropped_required_column_fails_tier_one_with_its_name() {
+            let (_fixture, connection) = connection();
+            connection
+                .execute_batch("ALTER TABLE session DROP COLUMN time_archived")
+                .unwrap();
+
+            let error = inspect(&connection, true).unwrap_err();
+
+            assert!(matches!(
+                error,
+                Error::SchemaIncompatible { incompatibility }
+                    if incompatibility.contains("session.time_archived")
+            ));
+        }
+
+        #[test]
+        fn extra_table_and_column_are_tier_two_warnings() {
+            let (_fixture, connection) = connection();
+            connection
+                .execute_batch(
+                    "CREATE TABLE plugin_cache (id TEXT PRIMARY KEY);\
+                     ALTER TABLE session ADD COLUMN plugin_data TEXT;",
+                )
+                .unwrap();
+
+            let report = inspect(&connection, false).unwrap();
+
+            assert_eq!(
+                report.tier_two_warnings,
+                [
+                    "unknown column `session.plugin_data`",
+                    "unknown table `plugin_cache`"
+                ]
+            );
+            assert_eq!(report.tier_three_findings.as_slice(), &[] as &[String]);
+            assert!(report.is_compatible());
+        }
+
+        #[test]
+        fn unknown_index_is_only_a_tier_two_warning() {
+            let (_fixture, connection) = connection();
+            connection
+                .execute_batch("CREATE INDEX plugin_session_title_idx ON session(title)")
+                .unwrap();
+
+            let report = inspect(&connection, false).unwrap();
+
+            assert_eq!(
+                report.tier_two_warnings,
+                ["unknown index `plugin_session_title_idx`"]
+            );
+            assert_eq!(report.tier_three_findings.as_slice(), &[] as &[String]);
+            assert!(report.is_compatible());
+        }
+
+        #[test]
+        fn unknown_foreign_key_to_delete_target_fails_tier_three() {
+            let (_fixture, connection) = connection();
+            connection
+                .execute_batch(
+                    "CREATE TABLE plugin_session (\
+                         id TEXT PRIMARY KEY,\
+                         session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE\
+                     )",
+                )
+                .unwrap();
+
+            let error = inspect(&connection, false).unwrap_err();
+
+            assert!(matches!(
+                error,
+                Error::SchemaIncompatible { incompatibility }
+                    if incompatibility.contains("plugin_session.session_id")
+                        && incompatibility.contains("session.id")
+            ));
+        }
+
+        #[test]
+        fn force_schema_downgrades_unknown_foreign_key_to_warning() {
+            let (_fixture, connection) = connection();
+            connection
+                .execute_batch(
+                    "CREATE TABLE plugin_session (\
+                         id TEXT PRIMARY KEY,\
+                         session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE\
+                     )",
+                )
+                .unwrap();
+
+            let report = inspect(&connection, true).unwrap();
+
+            assert_eq!(report.tier_two_warnings, ["unknown table `plugin_session`"]);
+            assert_eq!(report.tier_three_findings.len(), 1);
+            assert!(report.tier_three_findings[0].contains("plugin_session.session_id"));
+        }
+
+        #[test]
+        fn trigger_on_delete_target_fails_tier_three() {
+            let (_fixture, connection) = connection();
+            connection
+                .execute_batch("CREATE TRIGGER t AFTER DELETE ON session BEGIN SELECT 1; END")
+                .unwrap();
+
+            let report = inspect_report(&connection).unwrap();
+            assert_eq!(report.tier_one_missing.as_slice(), &[] as &[String]);
+            assert_eq!(report.tier_three_findings.len(), 1);
+            assert!(report.tier_three_findings[0].contains("trigger `t`"));
+
+            let error = inspect(&connection, false).unwrap_err();
+
+            assert!(matches!(
+                error,
+                Error::SchemaIncompatible { incompatibility }
+                    if incompatibility.contains("trigger `t`")
+                        && incompatibility.contains("session")
+            ));
+        }
+    }
 }

@@ -9,6 +9,8 @@ use rusqlite::{Connection, ErrorCode, InterruptHandle, OpenFlags};
 use crate::error::Error;
 use crate::paths::Target;
 
+pub mod schema;
+
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 const DEFAULT_CACHE_SIZE: i32 = -64_000;
 static LINK_PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
