@@ -4,4 +4,5 @@ pub mod db;
 pub mod error;
 pub mod paths;
 pub mod report;
+pub mod safety;
 pub mod select;
