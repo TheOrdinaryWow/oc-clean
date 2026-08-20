@@ -1,0 +1,116 @@
+version: "3"
+
+vars:
+  BIN: oc-clean
+
+env:
+  RUST_BACKTRACE: "1"
+
+tasks:
+  default:
+    desc: List available tasks
+    silent: true
+    cmds:
+      - task --list
+
+  build:
+    desc: Build the debug binary
+    cmds:
+      - cargo build {{.CLI_ARGS}}
+
+  build:release:
+    desc: Build the optimized release binary
+    cmds:
+      - cargo build --release {{.CLI_ARGS}}
+
+  build:small:
+    desc: Build the size-optimized binary (release-small profile)
+    cmds:
+      - cargo build --profile release-small {{.CLI_ARGS}}
+
+  build:profiling:
+    desc: Build a release binary with debug symbols for profiling
+    cmds:
+      - cargo build --profile profiling {{.CLI_ARGS}}
+
+  run:
+    desc: Run the debug binary (pass args after --)
+    cmds:
+      - cargo run -- {{.CLI_ARGS}}
+
+  run:release:
+    desc: Run the release binary (pass args after --)
+    cmds:
+      - cargo run --release -- {{.CLI_ARGS}}
+
+  test:
+    desc: Run the test suite with nextest
+    cmds:
+      - cargo nextest run --no-tests=pass {{.CLI_ARGS}}
+
+  test:doc:
+    desc: Run doctests (nextest does not cover them)
+    cmds:
+      - cargo test --doc {{.CLI_ARGS}}
+
+  coverage:
+    desc: Generate a line coverage report (target 80%)
+    cmds:
+      - cargo llvm-cov --all-features nextest --no-tests=pass {{.CLI_ARGS}}
+
+  coverage:html:
+    desc: Generate an HTML coverage report under target/llvm-cov/html
+    cmds:
+      - cargo llvm-cov --all-features --html nextest --no-tests=pass {{.CLI_ARGS}}
+
+  fmt:
+    desc: Format the workspace
+    cmds:
+      - cargo fmt --all
+
+  fmt:check:
+    desc: Verify formatting without writing changes
+    cmds:
+      - cargo fmt --all -- --check
+
+  lint:
+    desc: Run clippy with warnings denied
+    cmds:
+      - cargo clippy --all-targets --all-features -- -D warnings
+
+  lint:fix:
+    desc: Apply clippy autofixes
+    cmds:
+      - cargo clippy --all-targets --all-features --fix --allow-dirty --allow-staged
+
+  check:
+    desc: Type-check without producing binaries
+    cmds:
+      - cargo check --all-targets --all-features
+
+  doc:
+    desc: Build and open the API documentation
+    cmds:
+      - cargo doc --no-deps --open
+
+  audit:
+    desc: Scan dependencies for known advisories
+    cmds:
+      - cargo audit {{.CLI_ARGS}}
+
+  update:
+    desc: Update dependencies within semver bounds
+    cmds:
+      - cargo update
+
+  ci:
+    desc: Run the full local gate (format, lint, test)
+    cmds:
+      - task: fmt:check
+      - task: lint
+      - task: test
+
+  clean:
+    desc: Remove build artifacts
+    cmds:
+      - cargo clean
