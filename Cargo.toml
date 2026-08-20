@@ -2,5 +2,39 @@
 name = "oc-clean"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Manually prune OpenCode's SQLite database and reclaim disk space"
+readme = "README.md"
+keywords = ["opencode", "sqlite", "cleanup", "cli"]
+categories = ["command-line-utilities"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+incremental = false
+overflow-checks = false
+debug = false
+
+# Size-first variant for distribution artifacts.
+[profile.release-small]
+inherits = "release"
+opt-level = "z"
+
+# Release-grade codegen with debug symbols kept, for profiling and flamegraphs.
+[profile.profiling]
+inherits = "release"
+panic = "unwind"
+strip = "none"
+debug = "full"
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
 
 [dependencies]
