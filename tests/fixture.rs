@@ -230,3 +230,14 @@ fn fixture_storage_and_snapshot_trees_contain_requested_orphans() {
         .count();
     assert_eq!(storage_files, 7);
 }
+
+#[cfg(feature = "bench-large")]
+#[test]
+fn benchmark_fixture_config_uses_documented_scale() {
+    let config = FixtureConfig::bench_large();
+
+    assert_eq!(config.session_count, 10_000);
+    assert_eq!(config.messages_per_session, 20);
+    assert_eq!(config.parts_per_message, 4);
+    assert_eq!(config.blob_size_per_part, 4_096);
+}
