@@ -284,9 +284,11 @@ mod tests {
 
         assert_eq!(names_by_code.len(), 11);
         assert_eq!(names_by_code.get(&1), Some(&vec!["io", "sqlite"]));
-        assert!(names_by_code
-            .iter()
-            .all(|(&code, names)| code == 1 || names.len() == 1));
+        assert!(
+            names_by_code
+                .iter()
+                .all(|(&code, names)| code == 1 || names.len() == 1)
+        );
     }
 
     #[test]

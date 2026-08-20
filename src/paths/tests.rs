@@ -2,8 +2,8 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use super::{
-    data_dir, database_target, derived_paths, DatabaseOptions, DerivedPaths, Environment, Platform,
-    Target,
+    DatabaseOptions, DerivedPaths, Environment, Platform, Target, data_dir, database_target,
+    derived_paths,
 };
 use crate::error::Error;
 
@@ -50,9 +50,11 @@ fn uses_xdg_style_home_fallback_on_unix_platforms() {
         let actual = data_dir(&environment, platform).expect("Unix home should resolve");
 
         assert_eq!(actual, PathBuf::from(home).join(".local/share/opencode"));
-        assert!(!actual
-            .to_string_lossy()
-            .contains("Library/Application Support"));
+        assert!(
+            !actual
+                .to_string_lossy()
+                .contains("Library/Application Support")
+        );
     }
 }
 
