@@ -7,8 +7,16 @@ use tempfile::TempDir;
 
 #[path = "fixture/database.rs"]
 mod database;
+#[cfg(feature = "bench-large")]
+#[path = "fixture/large.rs"]
+#[allow(dead_code)]
+mod large;
 #[path = "fixture/trees.rs"]
 mod trees;
+
+#[cfg(feature = "bench-large")]
+#[allow(unused_imports)]
+pub use large::{LargeFixtureError, LargeFixtureReport};
 
 pub type FixtureResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -63,6 +71,8 @@ pub struct FixtureConfig {
     pub time_span_ms: i64,
     pub orphan_storage_file_count: usize,
     pub orphan_snapshot_dir_count: usize,
+    #[cfg(feature = "bench-large")]
+    pub target_size_bytes: Option<u64>,
 }
 
 impl Default for FixtureConfig {
@@ -82,18 +92,21 @@ impl Default for FixtureConfig {
             time_span_ms: 86_400_000,
             orphan_storage_file_count: 0,
             orphan_snapshot_dir_count: 0,
+            #[cfg(feature = "bench-large")]
+            target_size_bytes: None,
         }
     }
 }
 
 impl FixtureConfig {
     #[cfg(feature = "bench-large")]
-    pub fn bench_large() -> Self {
+    pub fn bench_large(target_size_bytes: u64) -> Self {
         Self {
-            session_count: 10_000,
+            project_count: 32,
+            session_count: 0,
             messages_per_session: 20,
             parts_per_message: 4,
-            blob_size_per_part: 4_096,
+            target_size_bytes: Some(target_size_bytes),
             ..Self::default()
         }
     }
@@ -119,6 +132,9 @@ pub struct Fixture {
     pub session_ids: Vec<String>,
     pub orphan_storage_files: Vec<PathBuf>,
     pub orphan_snapshot_dirs: Vec<PathBuf>,
+    #[cfg(feature = "bench-large")]
+    #[allow(dead_code)]
+    large_report: Option<LargeFixtureReport>,
 }
 
 impl Fixture {
@@ -128,6 +144,26 @@ impl Fixture {
         let database_path = temp_dir.path().join("opencode.db");
         let storage_dir = temp_dir.path().join("storage");
         let snapshot_dir = temp_dir.path().join("snapshot");
+        #[cfg(feature = "bench-large")]
+        let large_report = if let Some(target_size_bytes) = config.target_size_bytes {
+            large::ensure_capacity(temp_dir.path(), target_size_bytes)?;
+            Some(large::populate(&database_path, config, target_size_bytes)?)
+        } else {
+            None
+        };
+        #[cfg(feature = "bench-large")]
+        if large_report.is_some() {
+            return Ok(Self {
+                temp_dir,
+                database_path,
+                storage_dir,
+                snapshot_dir,
+                session_ids: Vec::new(),
+                orphan_storage_files: Vec::new(),
+                orphan_snapshot_dirs: Vec::new(),
+                large_report,
+            });
+        }
         let mut connection = Connection::open(&database_path)?;
         connection.pragma_update(None, "foreign_keys", true)?;
         connection.execute_batch(schema_ddl(config.shape))?;
@@ -142,6 +178,8 @@ impl Fixture {
             session_ids,
             orphan_storage_files,
             orphan_snapshot_dirs,
+            #[cfg(feature = "bench-large")]
+            large_report: None,
         })
     }
 
@@ -154,6 +192,13 @@ impl Fixture {
     #[must_use]
     pub fn root(&self) -> &Path {
         self.temp_dir.path()
+    }
+
+    #[cfg(feature = "bench-large")]
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn large_report(&self) -> Option<&LargeFixtureReport> {
+        self.large_report.as_ref()
     }
 }
 
