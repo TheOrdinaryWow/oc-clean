@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::ffi::{OsStr, OsString};
+#[cfg(windows)]
+use std::fs;
 use std::fs::File;
 #[cfg(unix)]
 use std::io::{self, Seek};
@@ -222,7 +224,35 @@ impl AnchoredDatabaseFile {
         })
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    fn open(path: &Path) -> Result<Self, Error> {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+
+        let resolved_path =
+            resolve_database_target(path).map_err(|source| path_open_error(path, source))?;
+        // The anchor stays open for the whole command. Unix rename ignores open descriptors, but
+        // Windows refuses to replace a file that any handle holds without delete sharing, which
+        // would make this process block its own P20 swap. Full sharing restores the unix
+        // behaviour; identity checks, not the handle, are what detect a swapped target.
+        let descriptor = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&resolved_path)
+            .map_err(|source| path_open_error(path, source))?;
+        let anchor = Self {
+            descriptor,
+            lexical_path: path.to_path_buf(),
+            resolved_path,
+        };
+        anchor.ensure_resolved_path_matches("database target changed while it was anchored")?;
+        Ok(anchor)
+    }
+
+    #[cfg(not(any(unix, windows)))]
     fn open(path: &Path) -> Result<Self, Error> {
         let resolved_path =
             resolve_database_target(path).map_err(|source| path_open_error(path, source))?;
