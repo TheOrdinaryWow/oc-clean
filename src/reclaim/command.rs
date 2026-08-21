@@ -258,7 +258,7 @@ where
             full_original_size: report.current_size,
             one_batch_wal_allowance: 0,
             margin_fraction: HeadroomInput::DEFAULT_MARGIN_FRACTION,
-            hardlink_supported,
+            hardlink_supported: hardlink_supported || cli.skip_backup,
         },
     )
     .map_err(|source| io_error(database_path, source))?;
@@ -687,6 +687,45 @@ mod tests {
         )
     }
 
+    fn invoke_vacuum_into_headroom(
+        skip_backup: bool,
+        available_bytes: u64,
+    ) -> (Result<(), Error>, String) {
+        let database_path = Path::new("opencode.db");
+        let target = Target::File(database_path.to_owned());
+        let mut cli = cli(database_path, false, false);
+        cli.skip_backup = skip_backup;
+        let arguments = arguments(false);
+        let mut input = Cursor::new(Vec::new());
+        let mut output = Vec::new();
+        let result = run_vacuum_into(
+            &cli,
+            &arguments,
+            &mut input,
+            &mut output,
+            &FixedFreeSpaceProvider(available_bytes),
+            RuntimeContext::piped(),
+            &target,
+            database_path,
+            false,
+            VacuumReport {
+                strategy: Strategy::VacuumInto,
+                applied: false,
+                current_size: 1_000,
+                live_bytes: 100,
+                freelist_bytes: 900,
+                estimated_post_vacuum_size: 100,
+                bytes_reclaimed: None,
+                headroom: None,
+            },
+            &SignalController::new(),
+        );
+        (
+            result,
+            String::from_utf8(output).expect("command output should be UTF-8"),
+        )
+    }
+
     #[test]
     fn dry_run_leaves_database_byte_identical_and_reports_space() {
         let fixture = fixture();
@@ -724,6 +763,30 @@ mod tests {
             assert!(!output.to_ascii_lowercase().contains("incremental"));
             assert_eq!(file_hash(&fixture.database_path), before);
         }
+    }
+
+    #[test]
+    fn skip_backup_omits_copy_bytes_without_hardlink_support() {
+        let (result, output) = invoke_vacuum_into_headroom(true, 200);
+
+        result.expect("rebuild headroom should exclude the skipped backup copy");
+        assert!(output.contains("Vacuum (dry-run)"));
+    }
+
+    #[test]
+    fn retained_backup_requires_copy_bytes_without_hardlink_support() {
+        let (result, output) = invoke_vacuum_into_headroom(false, 200);
+
+        let Error::InsufficientDiskSpace {
+            required_bytes,
+            available_bytes,
+        } = result.expect_err("retained backup copy should require full original size")
+        else {
+            panic!("headroom refusal should use InsufficientDiskSpace");
+        };
+        assert_eq!(required_bytes, 1_110);
+        assert_eq!(available_bytes, 200);
+        assert!(output.contains("Required bytes: 1110"));
     }
 
     #[test]
