@@ -175,7 +175,7 @@ oc-clean vacuum --incremental --apply
 
 在清理或回收之前，平台检查器会扫描数据库、WAL 和 SHM 路径，并报告 `CompleteForVisibleProcesses`、`PartialDueToPermissions` 或 `Unsupported` 之一。Linux 使用可见的 `/proc` 文件描述符，macOS 使用 `libproc`，Windows 使用 Restart Manager。该扫描是一次时间点观测，只能看到当前账户和平台 API 可见的进程，并且无法阻止扫描之后有其他进程再连接上来。`CompleteForVisibleProcesses` 只覆盖可见进程，并不证明数据库处于静默状态。
 
-带 `--apply` 的 `clean` 和 `vacuum` 会同时拒绝「观测到持有者」和「扫描结果无法判定」两种情况。`--force` 仅绕过这两项前置拒绝，把它们变成警告；SQLite 锁获取、`data_version` 检查、schema 策略、磁盘余量、确认和完整性检查依然有效。对着活跃进程强制执行可能干扰 OpenCode、与外部文件清理产生竞态，或让写入仍附着在被替换数据库 inode 的句柄上。
+带 `--apply` 的 `clean` 和 `vacuum` 会拒绝「观测到持有者」，而「扫描结果无法判定」只在平台完全无法扫描（`Unsupported`）时才拒绝。报告为 `PartialDueToPermissions` 的扫描仍然覆盖了当前账户可见的每个进程，因此只发出警告并继续：非特权账户永远读不到其他用户的描述符表，仅凭这一点拒绝会挡住所有非 root 调用，却证明不了任何事情。`--force` 绕过剩余的前置拒绝，把它们变成警告；SQLite 锁获取、`data_version` 检查、schema 策略、磁盘余量、确认和完整性检查依然有效。对着活跃进程强制执行可能干扰 OpenCode、与外部文件清理产生竞态，或让写入仍附着在被替换数据库 inode 的句柄上。
 
 ### Schema 严格程度
 

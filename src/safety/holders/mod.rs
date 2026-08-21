@@ -2,7 +2,9 @@
 
 #[cfg(unix)]
 use std::collections::{HashSet, VecDeque};
-use std::ffi::{OsStr, OsString};
+#[cfg(unix)]
+use std::ffi::OsStr;
+use std::ffi::OsString;
 #[cfg(unix)]
 use std::fs::File;
 use std::io;
@@ -242,12 +244,28 @@ fn decide(
         Verdict::Held(holders) if destructive && !force => {
             GateDecision::RefuseHeld(holders.clone())
         }
-        Verdict::CannotDetermine(reason) if destructive && !force => {
+        Verdict::CannotDetermine(reason)
+            if destructive && !force && blocks_destructive_work(inspection.completeness) =>
+        {
             GateDecision::RefuseCannotDetermine(reason.clone())
         }
         Verdict::Held(_) | Verdict::CannotDetermine(_) => GateDecision::Warn,
     };
     (inspection, decision)
+}
+
+/// Reports whether an indeterminate scan is too weak to allow destructive work.
+///
+/// A scan blinded by permissions still covered every process the account can see, which is exactly
+/// the coverage [`Completeness::CompleteForVisibleProcesses`] promises. An unprivileged account can
+/// never read another user's descriptor table, so refusing on that basis alone would block every
+/// non-root invocation while proving nothing. A scan the platform could not perform at all
+/// establishes no coverage, so it keeps refusing.
+const fn blocks_destructive_work(completeness: Completeness) -> bool {
+    match completeness {
+        Completeness::Unsupported => true,
+        Completeness::CompleteForVisibleProcesses | Completeness::PartialDueToPermissions => false,
+    }
 }
 
 pub(crate) fn database_related_paths(database_path: &Path) -> [PathBuf; 3] {
@@ -259,7 +277,7 @@ pub(crate) fn database_related_paths(database_path: &Path) -> [PathBuf; 3] {
     ]
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", all(unix, test)))]
 pub(crate) fn resolve_database_target(database_path: &Path) -> io::Result<PathBuf> {
     open_database_target(database_path).map(|target| target.resolved_path)
 }
@@ -445,13 +463,14 @@ fn resolve_database_target_by_path(database_path: &Path) -> io::Result<PathBuf> 
         }
 
         let target = std::fs::read_link(&current)?;
-        current = normalize_database_path(if target.is_absolute() {
-            &target
+        let resolved = if target.is_absolute() {
+            target
         } else {
-            &current
+            current
                 .parent()
-                .map_or(target.clone(), |parent| parent.join(&target))
-        });
+                .map_or_else(|| target.clone(), |parent| parent.join(&target))
+        };
+        current = normalize_database_path(&resolved);
         hops += 1;
     }
 }
@@ -504,6 +523,10 @@ fn fold_path_case(path: PathBuf) -> PathBuf {
 }
 
 #[cfg(windows)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "mirrors the non-windows identity function that returns its owned argument"
+)]
 fn fold_path_case(path: PathBuf) -> PathBuf {
     PathBuf::from(path.to_string_lossy().to_lowercase())
 }
@@ -545,14 +568,14 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     struct TransientAncestorSwapInspector {
         live_directory: PathBuf,
         displaced_directory: PathBuf,
         database_name: PathBuf,
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     impl HolderInspector for TransientAncestorSwapInspector {
         fn inspect(&self, database_path: &Path) -> Inspection {
             std::fs::rename(&self.live_directory, &self.displaced_directory)
@@ -602,6 +625,13 @@ mod tests {
         Inspection {
             verdict: Verdict::CannotDetermine("permission denied".to_owned()),
             completeness: Completeness::PartialDueToPermissions,
+        }
+    }
+
+    fn unsupported() -> Inspection {
+        Inspection {
+            verdict: Verdict::CannotDetermine("platform scan unavailable".to_owned()),
+            completeness: Completeness::Unsupported,
         }
     }
 
@@ -741,7 +771,7 @@ mod tests {
 
     #[test]
     fn gating_matrix_is_table_driven() {
-        let states = [held(), not_held(), unknown()];
+        let states = [held(), not_held(), unknown(), unsupported()];
         let commands = [
             CommandMode::Analyze,
             CommandMode::Doctor,
@@ -764,11 +794,13 @@ mod tests {
                     (Verdict::Held(_), true) => {
                         assert!(matches!(decision, GateDecision::RefuseHeld(_)));
                     }
-                    (Verdict::CannotDetermine(_), true) => {
+                    (Verdict::CannotDetermine(_), true)
+                        if state.completeness == Completeness::Unsupported =>
+                    {
                         assert!(matches!(decision, GateDecision::RefuseCannotDetermine(_)));
                     }
                     (Verdict::NotHeld, _) => assert_eq!(decision, GateDecision::Proceed),
-                    (Verdict::Held(_) | Verdict::CannotDetermine(_), false) => {
+                    (Verdict::Held(_) | Verdict::CannotDetermine(_), _) => {
                         assert_eq!(decision, GateDecision::Warn);
                     }
                 }
@@ -777,8 +809,50 @@ mod tests {
     }
 
     #[test]
+    fn permission_limited_scan_warns_instead_of_refusing_destructive_work() {
+        for command in [
+            CommandMode::Clean { apply: true },
+            CommandMode::Vacuum { apply: true },
+        ] {
+            let (inspection, decision) = inspect_and_decide(
+                &FakeInspector(unknown()),
+                Path::new("opencode.db"),
+                command,
+                false,
+            );
+
+            assert_eq!(
+                inspection.completeness,
+                Completeness::PartialDueToPermissions
+            );
+            assert!(matches!(inspection.verdict, Verdict::CannotDetermine(_)));
+            assert_eq!(decision, GateDecision::Warn);
+            assert!(decision.into_result().is_ok());
+        }
+    }
+
+    #[test]
+    fn unsupported_scan_still_refuses_destructive_work() {
+        let (_, decision) = inspect_and_decide(
+            &FakeInspector(unsupported()),
+            Path::new("opencode.db"),
+            CommandMode::Clean { apply: true },
+            false,
+        );
+
+        assert!(matches!(decision, GateDecision::RefuseCannotDetermine(_)));
+        assert_eq!(
+            decision
+                .into_result()
+                .expect_err("unsupported scan must refuse cleanup")
+                .exit_code(),
+            5
+        );
+    }
+
+    #[test]
     fn force_bypasses_both_destructive_refusals() {
-        for state in [held(), unknown()] {
+        for state in [held(), unsupported()] {
             let fake = FakeInspector(state);
             for command in [
                 CommandMode::Clean { apply: true },
@@ -803,7 +877,7 @@ mod tests {
         .into_result()
         .expect_err("held database must refuse cleanup");
         let unknown_error = inspect_and_decide(
-            &FakeInspector(unknown()),
+            &FakeInspector(unsupported()),
             Path::new("opencode.db"),
             CommandMode::Vacuum { apply: true },
             false,
@@ -818,7 +892,7 @@ mod tests {
         assert!(
             unknown_error
                 .to_string()
-                .contains("cannot determine process holders: permission denied")
+                .contains("cannot determine process holders: platform scan unavailable")
         );
     }
 }
