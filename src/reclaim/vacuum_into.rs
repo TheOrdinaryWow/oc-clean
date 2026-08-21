@@ -299,7 +299,7 @@ fn swap_critical_section<Ops: FileOperations, Hooks: SwapHooks>(
                 backup_path: backup_path.clone(),
             });
         }
-        return Err(io_error(database_path, source));
+        return Err(platform::rename_error(database_path, source));
     }
     Ok(backup_path)
 }
