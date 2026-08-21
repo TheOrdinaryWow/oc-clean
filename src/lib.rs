@@ -1,4 +1,5 @@
 pub mod analyze;
+pub mod assets;
 pub mod cli;
 pub mod db;
 pub mod delete;
