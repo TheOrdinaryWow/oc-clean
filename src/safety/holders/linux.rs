@@ -190,12 +190,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detects_holder_through_database_symlink_and_reports_lexical_path() {
+    fn detects_holder_through_database_symlink_chain_and_reports_lexical_path() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
         let target = directory.path().join("real.db");
         File::create(&target).expect("database target should be created");
+        let intermediate = directory.path().join("intermediate.db");
+        symlink("real.db", &intermediate).expect("intermediate symlink should be created");
         let link = directory.path().join("db.sqlite");
-        symlink("real.db", &link).expect("database symlink should be created");
+        symlink("intermediate.db", &link).expect("database symlink should be created");
         let _held = File::open(&target).expect("database target should be held open");
 
         let inspection = LinuxHolderInspector::default().inspect(&link);

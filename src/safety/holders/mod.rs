@@ -1,5 +1,6 @@
 //! Cross-platform process-holder inspection and command gating.
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -170,23 +171,46 @@ pub(crate) fn database_related_paths(database_path: &Path) -> [PathBuf; 3] {
 }
 
 pub(crate) fn resolve_database_target(database_path: &Path) -> io::Result<PathBuf> {
-    let lexical_path = normalize_database_path(database_path);
-    if !std::fs::symlink_metadata(&lexical_path)?
-        .file_type()
-        .is_symlink()
-    {
-        return Ok(lexical_path);
-    }
+    const MAX_SYMLINK_HOPS: usize = 40;
 
-    let target = std::fs::read_link(&lexical_path)?;
-    let resolved = if target.is_absolute() {
-        target
-    } else if let Some(parent) = lexical_path.parent() {
-        parent.join(target)
-    } else {
-        target
-    };
-    Ok(normalize_database_path(&resolved))
+    let mut current = normalize_database_path(database_path);
+    let mut visited = HashSet::with_capacity(MAX_SYMLINK_HOPS);
+    let mut hops = 0;
+
+    loop {
+        if !visited.insert(current.clone()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("symlink cycle while resolving {}", database_path.display()),
+            ));
+        }
+        if !std::fs::symlink_metadata(&current)?
+            .file_type()
+            .is_symlink()
+        {
+            return Ok(current);
+        }
+        if hops == MAX_SYMLINK_HOPS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "more than {MAX_SYMLINK_HOPS} symlink hops while resolving {}",
+                    database_path.display()
+                ),
+            ));
+        }
+
+        let target = std::fs::read_link(&current)?;
+        let next = if target.is_absolute() {
+            target
+        } else if let Some(parent) = current.parent() {
+            parent.join(target)
+        } else {
+            target
+        };
+        current = normalize_database_path(&next);
+        hops += 1;
+    }
 }
 
 fn normalize_database_path(path: &Path) -> PathBuf {
@@ -303,6 +327,49 @@ mod tests {
         assert_eq!(related[1], path_with_suffix(&link, "-wal"));
         assert_eq!(related[2], path_with_suffix(&link, "-shm"));
         assert_ne!(related[0], target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_target_resolution_rejects_symlink_cycles() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let first = directory.path().join("first.db");
+        let second = directory.path().join("second.db");
+        symlink("second.db", &first).expect("first symlink should be created");
+        symlink("first.db", &second).expect("second symlink should be created");
+
+        let error = resolve_database_target(&first).expect_err("symlink cycle should be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("symlink cycle"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_target_resolution_allows_forty_and_rejects_more_symlink_hops() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let target = directory.path().join("real.db");
+        std::fs::write(&target, []).expect("database fixture should be created");
+
+        for index in (0..=40).rev() {
+            let link = directory.path().join(format!("link-{index}.db"));
+            let target_name = if index == 40 {
+                OsString::from("real.db")
+            } else {
+                OsString::from(format!("link-{}.db", index + 1))
+            };
+            symlink(target_name, link).expect("symlink chain should be created");
+        }
+
+        let resolved = resolve_database_target(&directory.path().join("link-1.db"))
+            .expect("forty symlink hops should resolve");
+        assert_eq!(resolved, target);
+
+        let error = resolve_database_target(&directory.path().join("link-0.db"))
+            .expect_err("overlong symlink chain should be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("more than 40 symlink hops"));
     }
 
     #[test]
