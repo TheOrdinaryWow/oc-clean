@@ -18,7 +18,6 @@ unsafe extern "system" {
 }
 
 pub(super) fn rename_over(source: &Path, destination: &Path) -> io::Result<()> {
-    let destination_path = destination;
     let source = source
         .as_os_str()
         .encode_wide()
@@ -39,35 +38,9 @@ pub(super) fn rename_over(source: &Path, destination: &Path) -> io::Result<()> {
         )
     };
     if succeeded == 0 {
-        let failure = io::Error::last_os_error();
-        return Err(io::Error::new(
-            failure.kind(),
-            format!("{failure} [{}]", describe_rename_target(destination_path)),
-        ));
+        return Err(io::Error::last_os_error());
     }
     Ok(())
-}
-
-/// Describes the swap destination so a denied rename identifies what still guards the file.
-///
-/// Windows reports `ERROR_ACCESS_DENIED` for several unrelated conditions, so the raw code alone
-/// does not say whether the file is read-only, still open, or something else entirely.
-fn describe_rename_target(destination: &Path) -> String {
-    use std::fs;
-
-    let Ok(metadata) = fs::metadata(destination) else {
-        return "destination metadata unavailable".to_owned();
-    };
-    let read_only = metadata.permissions().readonly();
-    let openable_for_write = fs::OpenOptions::new()
-        .write(true)
-        .open(destination)
-        .err()
-        .map_or_else(|| "writable".to_owned(), |error| error.to_string());
-    format!(
-        "destination read_only={read_only} len={} exclusive_write={openable_for_write}",
-        metadata.len()
-    )
 }
 
 pub(super) fn rename_error(destination: &Path, source: io::Error) -> Error {

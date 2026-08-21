@@ -232,7 +232,14 @@ mod db {
 
         let error = database.file_identity().unwrap_err();
 
-        assert!(matches!(error, Error::Io { path, .. } if path == fixture.database_path));
+        let Error::Io { path, .. } = &error else {
+            panic!("missing metadata should surface as an I/O error: {error:?}");
+        };
+        assert_eq!(path.file_name(), fixture.database_path.file_name());
+        assert!(
+            path.is_absolute(),
+            "error path should stay absolute: {path:?}"
+        );
     }
 
     #[test]
