@@ -160,9 +160,15 @@ fn row_counts(connection: &rusqlite::Connection) -> Result<BTreeMap<String, u64>
     Ok(counts)
 }
 
+/// Placeholder data directory for an in-memory database, which owns no external storage.
+///
+/// The name must stay a syntactically valid relative path: Windows rejects `:memory:\\storage`
+/// outright instead of reporting it as absent, which turns "no external storage" into an error.
+const MEMORY_DATA_DIR: &str = "oc-clean-memory-target";
+
 fn report_paths(target: &Target) -> DerivedPaths {
     if matches!(target, Target::Memory) {
-        return paths::derived_paths(Path::new(":memory:"));
+        return paths::derived_paths(Path::new(MEMORY_DATA_DIR));
     }
     let path = target_path(target);
     let parent = path
