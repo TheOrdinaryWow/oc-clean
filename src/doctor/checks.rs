@@ -6,6 +6,7 @@ use super::model::{
     AutoVacuumReport, CheckReport, ForeignKeyFinding, ForeignKeyReport, HolderProcess,
     HolderReport, TimestampSanity, VacuumHeadroom,
 };
+use crate::db;
 use crate::error::Error;
 use crate::reclaim::headroom::{
     FreeSpaceProvider, Fs2FreeSpaceProvider, HeadroomInput, HeadroomVerdict, evaluate_headroom,
@@ -25,7 +26,7 @@ pub(crate) fn integrity_check(connection: &Connection) -> Result<CheckReport, Er
         "PRAGMA integrity_check",
         "running PRAGMA integrity_check",
     )
-    .map_err(|error| integrity_error("integrity_check", &error))?;
+    .map_err(|error| integrity_error("integrity_check", error))?;
     let ok = findings.as_slice() == ["ok"];
     Ok(CheckReport { ok, findings })
 }
@@ -33,12 +34,8 @@ pub(crate) fn integrity_check(connection: &Connection) -> Result<CheckReport, Er
 pub(crate) fn foreign_key_check(connection: &Connection) -> Result<ForeignKeyReport, Error> {
     let mut statement = connection
         .prepare("PRAGMA foreign_key_check")
-        .map_err(|source| {
-            integrity_error(
-                "foreign_key_check",
-                &sqlite_error("preparing PRAGMA foreign_key_check", source),
-            )
-        })?;
+        .map_err(|source| db::sqlite_error("preparing PRAGMA foreign_key_check", source))
+        .map_err(|error| integrity_error("foreign_key_check", error))?;
     let rows = statement
         .query_map([], |row| {
             Ok(ForeignKeyFinding {
@@ -48,18 +45,12 @@ pub(crate) fn foreign_key_check(connection: &Connection) -> Result<ForeignKeyRep
                 foreign_key_index: row.get(3)?,
             })
         })
-        .map_err(|source| {
-            integrity_error(
-                "foreign_key_check",
-                &sqlite_error("running PRAGMA foreign_key_check", source),
-            )
-        })?;
-    let findings = rows.collect::<Result<Vec<_>, _>>().map_err(|source| {
-        integrity_error(
-            "foreign_key_check",
-            &sqlite_error("reading PRAGMA foreign_key_check", source),
-        )
-    })?;
+        .map_err(|source| db::sqlite_error("running PRAGMA foreign_key_check", source))
+        .map_err(|error| integrity_error("foreign_key_check", error))?;
+    let findings = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| db::sqlite_error("reading PRAGMA foreign_key_check", source))
+        .map_err(|error| integrity_error("foreign_key_check", error))?;
     Ok(ForeignKeyReport {
         ok: findings.is_empty(),
         findings,
@@ -112,7 +103,7 @@ fn vacuum_headroom_with_provider(
 pub(super) fn auto_vacuum(connection: &Connection) -> Result<AutoVacuumReport, Error> {
     let value = connection
         .pragma_query_value(None, "auto_vacuum", |row| row.get::<_, u32>(0))
-        .map_err(|source| sqlite_error("reading PRAGMA auto_vacuum", source))?;
+        .map_err(|source| db::sqlite_error("reading PRAGMA auto_vacuum", source))?;
     let (mode, incremental_applicable) = match value {
         0 => ("none", false),
         1 => ("full", false),
@@ -131,7 +122,7 @@ pub(super) fn timestamp_sanity(connection: &Connection) -> Result<TimestampSanit
         .query_row("SELECT MAX(time_updated) FROM session", [], |row| {
             row.get(0)
         })
-        .map_err(|source| sqlite_error("probing maximum session time_updated", source))?;
+        .map_err(|source| db::sqlite_error("probing maximum session time_updated", source))?;
     Ok(classify_timestamp(maximum))
 }
 
@@ -247,25 +238,21 @@ const fn observation_method() -> &'static str {
 fn string_rows(connection: &Connection, sql: &str, context: &str) -> Result<Vec<String>, Error> {
     let mut statement = connection
         .prepare(sql)
-        .map_err(|source| sqlite_error(context, source))?;
+        .map_err(|source| db::sqlite_error(context, source))?;
     statement
         .query_map([], |row| row.get(0))
-        .map_err(|source| sqlite_error(context, source))?
+        .map_err(|source| db::sqlite_error(context, source))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|source| sqlite_error(context, source))
+        .map_err(|source| db::sqlite_error(context, source))
 }
 
-fn integrity_error(check: &str, error: &Error) -> Error {
-    Error::IntegrityCheckFailed {
-        check: check.to_owned(),
-        message: error.to_string(),
-    }
-}
-
-fn sqlite_error(context: &str, source: rusqlite::Error) -> Error {
-    Error::Sqlite {
-        context: context.to_owned(),
-        source,
+fn integrity_error(check: &str, error: Error) -> Error {
+    match error {
+        Error::DatabaseBusy { .. } => error,
+        error => Error::IntegrityCheckFailed {
+            check: check.to_owned(),
+            message: error.to_string(),
+        },
     }
 }
 
@@ -273,6 +260,54 @@ fn io_error(path: &Path, source: std::io::Error) -> Error {
     Error::Io {
         path: path.to_owned(),
         source,
+    }
+}
+
+#[cfg(test)]
+mod sqlite_error_tests {
+    use std::time::Duration;
+
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn integrity_query_busy_maps_to_exit_five() {
+        with_exclusive_lock(|connection| {
+            let error = integrity_check(connection).expect_err("integrity query should be busy");
+
+            assert_eq!(error.exit_code(), 5);
+        });
+    }
+
+    #[test]
+    fn foreign_key_query_busy_maps_to_exit_five() {
+        with_exclusive_lock(|connection| {
+            let error =
+                foreign_key_check(connection).expect_err("foreign key query should be busy");
+
+            assert_eq!(error.exit_code(), 5);
+        });
+    }
+
+    fn with_exclusive_lock(test: impl FnOnce(&Connection)) {
+        let directory = tempdir().expect("temporary directory should be created");
+        let path = directory.path().join("locked.db");
+        let holder = Connection::open(&path).expect("holder connection should open");
+        holder
+            .execute_batch(
+                "CREATE TABLE item (id INTEGER PRIMARY KEY); PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;",
+            )
+            .expect("holder should acquire an exclusive lock");
+        let connection = Connection::open(&path).expect("contending connection should open");
+        connection
+            .busy_timeout(Duration::ZERO)
+            .expect("busy timeout should be configured");
+
+        test(&connection);
+
+        holder
+            .execute_batch("ROLLBACK")
+            .expect("holder transaction should roll back");
     }
 }
 

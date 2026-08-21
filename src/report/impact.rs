@@ -11,7 +11,7 @@ use rusqlite::types::ValueRef;
 use crate::analyze::{attribution, orphans as orphan_census, space};
 use crate::assets::storage::session_id_from_path;
 use crate::cli::types::{Duration, Size};
-use crate::db::DatabaseConnection;
+use crate::db::{self, DatabaseConnection};
 use crate::error::Error;
 use crate::paths::DerivedPaths;
 use crate::select::orphans;
@@ -729,10 +729,7 @@ fn to_u64_len(value: usize) -> u64 {
 }
 
 fn sqlite_error(context: &str, source: rusqlite::Error) -> Error {
-    Error::Sqlite {
-        context: context.to_owned(),
-        source,
-    }
+    db::sqlite_error(context, source)
 }
 
 fn io_error(path: &Path, source: io::Error) -> Error {
@@ -1152,5 +1149,15 @@ mod tests {
                 0_i64
             );
         }
+    }
+
+    #[test]
+    fn sqlite_busy_maps_to_exit_five() {
+        let source = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+
+        assert_eq!(sqlite_error("testing impact query", source).exit_code(), 5);
     }
 }

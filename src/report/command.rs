@@ -225,8 +225,20 @@ fn integral_error(value: i64) -> rusqlite::Error {
 }
 
 fn sqlite_error(context: &str, source: rusqlite::Error) -> Error {
-    Error::Sqlite {
-        context: context.to_owned(),
-        source,
+    db::sqlite_error(context, source)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sqlite_locked_maps_to_exit_five() {
+        let source = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
+            None,
+        );
+
+        assert_eq!(sqlite_error("testing report query", source).exit_code(), 5);
     }
 }

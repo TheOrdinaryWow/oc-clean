@@ -1,6 +1,6 @@
 use rusqlite::{Connection, params};
 
-use crate::db::{Capabilities, DatabaseConnection};
+use crate::db::{self, Capabilities, DatabaseConnection};
 use crate::error::Error;
 
 const ATTRIBUTION_SQL: &str = r"
@@ -257,8 +257,23 @@ fn parent_cycle(root_id: &str) -> Error {
 }
 
 fn sqlite_error(context: &str, source: rusqlite::Error) -> Error {
-    Error::Sqlite {
-        context: context.to_owned(),
-        source,
+    db::sqlite_error(context, source)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sqlite_busy_maps_to_exit_five() {
+        let source = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+
+        assert_eq!(
+            sqlite_error("testing attribution query", source).exit_code(),
+            5
+        );
     }
 }

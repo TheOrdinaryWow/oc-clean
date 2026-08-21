@@ -6,7 +6,7 @@ use rusqlite::Connection;
 use rusqlite::types::ValueRef;
 
 use crate::assets::storage::session_id_from_path;
-use crate::db::DatabaseConnection;
+use crate::db::{self, DatabaseConnection};
 use crate::error::Error;
 use crate::paths::DerivedPaths;
 
@@ -322,10 +322,7 @@ fn io_error(path: &Path, source: std::io::Error) -> Error {
 }
 
 fn sqlite_error(context: &str, source: rusqlite::Error) -> Error {
-    Error::Sqlite {
-        context: context.to_owned(),
-        source,
-    }
+    db::sqlite_error(context, source)
 }
 
 #[cfg(test)]
@@ -511,6 +508,16 @@ mod tests {
         ] {
             assert!(!is_session_id(invalid), "{invalid}");
         }
+    }
+
+    #[test]
+    fn sqlite_locked_maps_to_exit_five() {
+        let source = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
+            None,
+        );
+
+        assert_eq!(sqlite_error("testing orphan query", source).exit_code(), 5);
     }
 
     fn count_aggregate_rows(connection: &Connection, table: &str, aggregate_id: &str) -> i64 {
