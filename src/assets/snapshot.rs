@@ -1,5 +1,7 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use rusqlite::Connection;
 
@@ -21,6 +23,214 @@ pub struct RemovalReport {
     pub retained_live_project_directories: u64,
     pub skipped_entries: u64,
     pub directory_errors: Vec<RemovalDirectoryError>,
+}
+
+/// Successful compaction metrics for one retained snapshot repository.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GcRepositoryReport {
+    pub path: PathBuf,
+    pub before_bytes: u64,
+    pub after_bytes: u64,
+    pub reclaimed_bytes: u64,
+}
+
+/// One retained snapshot repository whose Git compaction was attempted and failed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GcRepositoryFailure {
+    pub path: PathBuf,
+    pub exit_code: Option<i32>,
+    pub message: String,
+}
+
+/// Results from compacting retained snapshot repositories.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct GcReport {
+    pub compacted_repositories: Vec<GcRepositoryReport>,
+    pub repository_failures: Vec<GcRepositoryFailure>,
+    pub skipped_deleting_project_directories: u64,
+    pub skipped_entries: u64,
+}
+
+impl GcReport {
+    /// Converts attempted repository failures into the stable partial-success error category.
+    #[must_use]
+    pub fn partial_success_error(&self) -> Option<Error> {
+        if self.repository_failures.is_empty() {
+            return None;
+        }
+        let paths = self
+            .repository_failures
+            .iter()
+            .map(|failure| failure.path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(Error::PartialSuccess {
+            left_behind: format!("snapshot repositories not compacted: {paths}"),
+        })
+    }
+}
+
+/// Outcome of an explicitly requested retained-snapshot compaction pass.
+#[derive(Debug, Eq, PartialEq)]
+pub enum GcSnapshotsOutcome {
+    Completed(GcReport),
+    SkippedGitUnavailable { warning: String },
+}
+
+/// Compacts repositories belonging to retained projects while structurally excluding projects
+/// slated for deletion.
+///
+/// This operation is opt-in. Snapshot removal functions never invoke it automatically.
+///
+/// # Errors
+///
+/// Returns a typed error when a project identifier is unsafe, the snapshot tree cannot be
+/// inspected or measured, or Git availability probing fails for a reason other than an absent
+/// executable. An attempted failure for one repository is collected in [`GcReport`] and does not
+/// stop later repositories.
+pub fn gc_retained(
+    snapshot_root: &Path,
+    retained_project_ids: &ProjectIds,
+    deleting_project_ids: &ProjectIds,
+) -> Result<GcSnapshotsOutcome, Error> {
+    gc_retained_with_path(
+        snapshot_root,
+        retained_project_ids,
+        deleting_project_ids,
+        None,
+    )
+}
+
+fn gc_retained_with_path(
+    snapshot_root: &Path,
+    retained_project_ids: &ProjectIds,
+    deleting_project_ids: &ProjectIds,
+    path: Option<&OsStr>,
+) -> Result<GcSnapshotsOutcome, Error> {
+    let retained_paths = retained_project_ids
+        .iter()
+        .map(|project_id| {
+            snapshot_project_path(snapshot_root, project_id)
+                .map(|project_path| (project_id, project_path))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for project_id in deleting_project_ids {
+        validate_project_id(project_id)?;
+    }
+    if !git_is_available(path)? {
+        return Ok(GcSnapshotsOutcome::SkippedGitUnavailable {
+            warning: "SKIP: git is unavailable; retained snapshot repositories were not compacted"
+                .to_owned(),
+        });
+    }
+    if !is_real_directory(snapshot_root)? {
+        return Ok(GcSnapshotsOutcome::Completed(GcReport::default()));
+    }
+
+    let mut report = GcReport::default();
+    for (project_id, project_path) in retained_paths {
+        if deleting_project_ids.contains(project_id) {
+            report.skipped_deleting_project_directories = report
+                .skipped_deleting_project_directories
+                .saturating_add(1);
+            continue;
+        }
+        if !is_real_directory(&project_path)? {
+            report.skipped_entries = report.skipped_entries.saturating_add(1);
+            continue;
+        }
+        for entry in directory_entries(&project_path)? {
+            if !entry_is_directory(&entry)? {
+                report.skipped_entries = report.skipped_entries.saturating_add(1);
+                continue;
+            }
+            compact_repository(&entry.path(), path, &mut report)?;
+        }
+    }
+    Ok(GcSnapshotsOutcome::Completed(report))
+}
+
+fn git_is_available(path: Option<&OsStr>) -> Result<bool, Error> {
+    let mut command = Command::new("git");
+    command.arg("--version");
+    set_command_path(&mut command, path);
+    match command.output() {
+        Ok(output) if output.status.success() => Ok(true),
+        Ok(output) => Err(io_error(
+            Path::new("git"),
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "git --version exited unsuccessfully: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            ),
+        )),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(io_error(Path::new("git"), source)),
+    }
+}
+
+fn compact_repository(
+    repository: &Path,
+    path: Option<&OsStr>,
+    report: &mut GcReport,
+) -> Result<(), Error> {
+    let before_bytes = directory_bytes(repository)?;
+    let mut command = Command::new("git");
+    command
+        .arg("--git-dir")
+        .arg(repository)
+        .args(["gc", "--prune=now"]);
+    set_command_path(&mut command, path);
+    match command.output() {
+        Ok(output) if output.status.success() => {
+            let after_bytes = directory_bytes(repository)?;
+            report.compacted_repositories.push(GcRepositoryReport {
+                path: repository.to_path_buf(),
+                before_bytes,
+                after_bytes,
+                reclaimed_bytes: before_bytes.saturating_sub(after_bytes),
+            });
+        }
+        Ok(output) => report.repository_failures.push(GcRepositoryFailure {
+            path: repository.to_path_buf(),
+            exit_code: output.status.code(),
+            message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        }),
+        Err(source) => report.repository_failures.push(GcRepositoryFailure {
+            path: repository.to_path_buf(),
+            exit_code: None,
+            message: source.to_string(),
+        }),
+    }
+    Ok(())
+}
+
+fn set_command_path(command: &mut Command, path: Option<&OsStr>) {
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+}
+
+fn directory_bytes(path: &Path) -> Result<u64, Error> {
+    let mut bytes = 0_u64;
+    for entry in directory_entries(path)? {
+        let file_type = entry
+            .file_type()
+            .map_err(|source| io_error(&entry.path(), source))?;
+        if file_type.is_dir() {
+            bytes = bytes.saturating_add(directory_bytes(&entry.path())?);
+        } else if file_type.is_file() {
+            bytes = bytes.saturating_add(
+                entry
+                    .metadata()
+                    .map_err(|source| io_error(&entry.path(), source))?
+                    .len(),
+            );
+        }
+    }
+    Ok(bytes)
 }
 
 /// Removes snapshot directories for projects pruned by the current clean operation.
@@ -202,8 +412,10 @@ fn sqlite_error(context: &str, source: rusqlite::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::fs;
     use std::path::PathBuf;
+    use std::process::Command;
 
     use rusqlite::Connection;
     use tempfile::TempDir;
@@ -213,7 +425,9 @@ mod tests {
     use crate::error::Error;
     use crate::paths::Target;
 
-    use super::{remove_orphaned, remove_pruned};
+    use super::{
+        GcSnapshotsOutcome, gc_retained, gc_retained_with_path, remove_orphaned, remove_pruned,
+    };
 
     struct Fixture {
         directory: TempDir,
@@ -262,6 +476,44 @@ mod tests {
 
     fn project_ids(values: &[&str]) -> ProjectIds {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    fn bare_repository_with_loose_objects(
+        fixture: &Fixture,
+        project_id: &str,
+        repository_name: &str,
+    ) -> PathBuf {
+        let repository = fixture.snapshot_root.join(project_id).join(repository_name);
+        fs::create_dir_all(
+            repository
+                .parent()
+                .expect("repository should have a parent"),
+        )
+        .expect("project snapshot directory should be created");
+        let status = Command::new("git")
+            .arg("init")
+            .arg("--bare")
+            .arg(&repository)
+            .status()
+            .expect("git should be available for repository fixtures");
+        assert!(status.success(), "bare repository should initialize");
+
+        for index in 0..64_u32 {
+            let object = fixture.directory.path().join(format!("object-{index}"));
+            let payload = (0..16_384_u32)
+                .map(|offset| ((index.wrapping_mul(31) + offset.wrapping_mul(17)) % 251) as u8)
+                .collect::<Vec<_>>();
+            fs::write(&object, payload).expect("loose object payload should be written");
+            let status = Command::new("git")
+                .arg("--git-dir")
+                .arg(&repository)
+                .args(["hash-object", "-w"])
+                .arg(&object)
+                .status()
+                .expect("git hash-object should run");
+            assert!(status.success(), "loose object should be created");
+        }
+        repository
     }
 
     #[test]
@@ -339,5 +591,112 @@ mod tests {
         assert!(report.directory_errors.is_empty());
         assert!(linked.symlink_metadata().is_ok());
         assert!(outside.join("sentinel").exists());
+    }
+
+    #[test]
+    fn gc_compacts_retained_bare_repository_and_reports_reclaimed_bytes() {
+        let fixture = Fixture::new();
+        let repository =
+            bare_repository_with_loose_objects(&fixture, "project-retained", "worktree-hash");
+
+        let GcSnapshotsOutcome::Completed(report) = gc_retained(
+            &fixture.snapshot_root,
+            &project_ids(&["project-retained"]),
+            &ProjectIds::new(),
+        )
+        .expect("snapshot gc should complete") else {
+            panic!("git should be available");
+        };
+
+        assert_eq!(report.repository_failures, Vec::new());
+        assert!(report.partial_success_error().is_none());
+        assert_eq!(report.compacted_repositories.len(), 1);
+        let compacted = &report.compacted_repositories[0];
+        assert_eq!(compacted.path, repository);
+        assert!(compacted.before_bytes > compacted.after_bytes);
+        assert!(compacted.reclaimed_bytes > 0);
+    }
+
+    #[test]
+    fn gc_reports_documented_skip_when_git_is_unavailable() {
+        let fixture = Fixture::new();
+        let _repository =
+            bare_repository_with_loose_objects(&fixture, "project-retained", "worktree-hash");
+
+        let outcome = gc_retained_with_path(
+            &fixture.snapshot_root,
+            &project_ids(&["project-retained"]),
+            &ProjectIds::new(),
+            Some(OsStr::new("")),
+        )
+        .expect("missing git should be a successful skip");
+
+        let GcSnapshotsOutcome::SkippedGitUnavailable { warning } = outcome else {
+            panic!("missing git should produce the documented skip outcome");
+        };
+        assert!(warning.contains("SKIP"));
+    }
+
+    #[test]
+    fn gc_continues_after_corrupt_repository_and_reports_partial_success() {
+        let fixture = Fixture::new();
+        let corrupt = fixture
+            .snapshot_root
+            .join("project-retained")
+            .join("a-corrupt");
+        fs::create_dir_all(&corrupt).expect("corrupt repository directory should be created");
+        fs::write(corrupt.join("sentinel"), b"not a git repository")
+            .expect("corrupt repository marker should be written");
+        let valid = bare_repository_with_loose_objects(&fixture, "project-retained", "z-valid");
+
+        let GcSnapshotsOutcome::Completed(report) = gc_retained(
+            &fixture.snapshot_root,
+            &project_ids(&["project-retained"]),
+            &ProjectIds::new(),
+        )
+        .expect("one failed repository should not abort snapshot gc") else {
+            panic!("git should be available");
+        };
+
+        assert_eq!(report.compacted_repositories.len(), 1);
+        assert_eq!(report.compacted_repositories[0].path, valid);
+        assert_eq!(report.repository_failures.len(), 1);
+        assert_eq!(report.repository_failures[0].path, corrupt);
+        assert!(
+            !report
+                .compacted_repositories
+                .iter()
+                .any(|compacted| compacted.path == corrupt)
+        );
+        let partial = report
+            .partial_success_error()
+            .expect("an attempted gc failure should map to partial success");
+        assert_eq!(partial.exit_code(), 10);
+    }
+
+    #[test]
+    fn gc_never_runs_for_project_slated_for_deletion() {
+        let fixture = Fixture::new();
+        let doomed = fixture.snapshot_root.join("project-doomed").join("corrupt");
+        fs::create_dir_all(&doomed).expect("doomed repository directory should be created");
+        fs::write(doomed.join("sentinel"), b"not a git repository")
+            .expect("doomed repository marker should be written");
+        let retained =
+            bare_repository_with_loose_objects(&fixture, "project-retained", "worktree-hash");
+
+        let GcSnapshotsOutcome::Completed(report) = gc_retained(
+            &fixture.snapshot_root,
+            &project_ids(&["project-doomed", "project-retained"]),
+            &project_ids(&["project-doomed"]),
+        )
+        .expect("snapshot gc should complete") else {
+            panic!("git should be available");
+        };
+
+        assert_eq!(report.skipped_deleting_project_directories, 1);
+        assert_eq!(report.compacted_repositories.len(), 1);
+        assert_eq!(report.compacted_repositories[0].path, retained);
+        assert_eq!(report.repository_failures, Vec::new());
+        assert!(doomed.join("sentinel").exists());
     }
 }
