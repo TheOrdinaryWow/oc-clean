@@ -1,6 +1,6 @@
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
-use crate::error::Error;
+use crate::{db::sqlite_error, error::Error};
 
 pub mod orphans;
 pub mod projects;
@@ -81,9 +81,53 @@ impl<'connection> TempIdBatcher<'connection> {
     }
 }
 
-fn sqlite_error(context: &str, source: rusqlite::Error) -> Error {
-    Error::Sqlite {
-        context: context.to_owned(),
-        source,
+#[cfg(test)]
+#[allow(clippy::duplicate_mod, dead_code)]
+#[path = "../../tests/support/fixture.rs"]
+mod fixture;
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::fixture::{Fixture, FixtureConfig};
+    use super::sessions::{DeleteOptions, delete};
+    use crate::db::{ConnectionOptions, open_read_write};
+    use crate::error::Error;
+    use crate::paths::Target;
+    use crate::select::predicates::SessionIds;
+
+    #[test]
+    fn lock_contention_during_delete_returns_database_busy() {
+        let fixture = Fixture::build(&FixtureConfig::default()).expect("fixture should build");
+        let database = open_read_write(
+            &Target::File(fixture.database_path.clone()),
+            ConnectionOptions {
+                busy_timeout: Duration::ZERO,
+                ..ConnectionOptions::default()
+            },
+        )
+        .expect("fixture should open read-write");
+        let lock_holder = fixture.connect().expect("lock holder should connect");
+        lock_holder
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("lock holder should acquire a write lock");
+        let selected = fixture.session_ids[..1]
+            .iter()
+            .cloned()
+            .collect::<SessionIds>();
+
+        let error = delete(
+            &database,
+            &selected,
+            DeleteOptions {
+                batch_size: 1,
+                batch_time_limit: Duration::from_secs(30),
+            },
+        )
+        .expect_err("delete should report lock contention");
+
+        assert!(matches!(error, Error::DatabaseBusy { .. }));
+        assert_eq!(error.exit_code(), 5);
     }
 }

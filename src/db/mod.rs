@@ -286,7 +286,7 @@ fn ensure_exists(path: &Path) -> Result<(), Error> {
     }
 }
 
-fn sqlite_error(context: &str, source: rusqlite::Error) -> Error {
+pub(crate) fn sqlite_error(context: &str, source: rusqlite::Error) -> Error {
     if matches!(
         source.sqlite_error_code(),
         Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
