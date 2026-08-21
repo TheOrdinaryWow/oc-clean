@@ -83,9 +83,9 @@ pub enum CommandMode {
     /// Read-only diagnostics.
     Doctor,
     /// Cleanup preview or application.
-    Clean { apply: bool },
+    Clean { dry_run: bool },
     /// Vacuum preview or application.
-    Vacuum { apply: bool },
+    Vacuum { dry_run: bool },
 }
 
 /// Action selected by the holder gating matrix.
@@ -237,7 +237,7 @@ fn decide(
     }
     let destructive = matches!(
         command,
-        CommandMode::Clean { apply: true } | CommandMode::Vacuum { apply: true }
+        CommandMode::Clean { dry_run: false } | CommandMode::Vacuum { dry_run: false }
     );
     let decision = match &inspection.verdict {
         Verdict::NotHeld => GateDecision::Proceed,
@@ -682,7 +682,7 @@ mod tests {
         let (inspection, decision) = inspect_and_decide(
             &RetargetingInspector { link: link.clone() },
             &link,
-            CommandMode::Vacuum { apply: true },
+            CommandMode::Vacuum { dry_run: false },
             true,
         );
 
@@ -715,7 +715,7 @@ mod tests {
                 database_name,
             },
             &database_path,
-            CommandMode::Vacuum { apply: true },
+            CommandMode::Vacuum { dry_run: false },
             true,
         );
 
@@ -813,10 +813,10 @@ mod tests {
         let commands = [
             CommandMode::Analyze,
             CommandMode::Doctor,
-            CommandMode::Clean { apply: false },
-            CommandMode::Vacuum { apply: false },
-            CommandMode::Clean { apply: true },
-            CommandMode::Vacuum { apply: true },
+            CommandMode::Clean { dry_run: true },
+            CommandMode::Vacuum { dry_run: true },
+            CommandMode::Clean { dry_run: false },
+            CommandMode::Vacuum { dry_run: false },
         ];
 
         for state in states {
@@ -826,7 +826,7 @@ mod tests {
                     inspect_and_decide(&fake, Path::new("opencode.db"), command, false);
                 let destructive = matches!(
                     command,
-                    CommandMode::Clean { apply: true } | CommandMode::Vacuum { apply: true }
+                    CommandMode::Clean { dry_run: false } | CommandMode::Vacuum { dry_run: false }
                 );
                 match (&state.verdict, destructive) {
                     (Verdict::Held(_), true) => {
@@ -849,8 +849,8 @@ mod tests {
     #[test]
     fn permission_limited_scan_warns_instead_of_refusing_destructive_work() {
         for command in [
-            CommandMode::Clean { apply: true },
-            CommandMode::Vacuum { apply: true },
+            CommandMode::Clean { dry_run: false },
+            CommandMode::Vacuum { dry_run: false },
         ] {
             let (inspection, decision) = inspect_and_decide(
                 &FakeInspector(unknown()),
@@ -874,7 +874,7 @@ mod tests {
         let (_, decision) = inspect_and_decide(
             &FakeInspector(unsupported()),
             Path::new("opencode.db"),
-            CommandMode::Clean { apply: true },
+            CommandMode::Clean { dry_run: false },
             false,
         );
 
@@ -893,8 +893,8 @@ mod tests {
         for state in [held(), unsupported()] {
             let fake = FakeInspector(state);
             for command in [
-                CommandMode::Clean { apply: true },
-                CommandMode::Vacuum { apply: true },
+                CommandMode::Clean { dry_run: false },
+                CommandMode::Vacuum { dry_run: false },
             ] {
                 let (_, decision) =
                     inspect_and_decide(&fake, Path::new("opencode.db"), command, true);
@@ -908,7 +908,7 @@ mod tests {
         let held_error = inspect_and_decide(
             &FakeInspector(held()),
             Path::new("opencode.db"),
-            CommandMode::Clean { apply: true },
+            CommandMode::Clean { dry_run: false },
             false,
         )
         .1
@@ -917,7 +917,7 @@ mod tests {
         let unknown_error = inspect_and_decide(
             &FakeInspector(unsupported()),
             Path::new("opencode.db"),
-            CommandMode::Vacuum { apply: true },
+            CommandMode::Vacuum { dry_run: false },
             false,
         )
         .1

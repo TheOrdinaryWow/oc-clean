@@ -31,7 +31,6 @@ fn sigint_after_a_committed_delete_batch_stops_safely() {
         .args([
             "--db",
             fixture.database_path.to_str().expect("UTF-8 fixture path"),
-            "--apply",
             "--dangerously-skip-confirm",
             "--skip-backup",
             // Diagnostics are off by default; this test observes the committed-batch marker.

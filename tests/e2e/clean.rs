@@ -27,7 +27,6 @@ fn full_clean_pipeline_leaves_doctor_clean_and_zero_orphans() {
             "--keep-recent",
             "1",
             "--json",
-            "--apply",
             "--dangerously-skip-confirm",
         ])
         .output()
@@ -70,7 +69,6 @@ fn repeated_clean_is_idempotent() {
             "0",
             "--no-vacuum",
             "--json",
-            "--apply",
             "--dangerously-skip-confirm",
         ])
         .output()
@@ -82,7 +80,6 @@ fn repeated_clean_is_idempotent() {
             "0",
             "--no-vacuum",
             "--json",
-            "--apply",
             "--dangerously-skip-confirm",
         ])
         .output()
@@ -112,18 +109,50 @@ fn keep_recent_alone_exits_two_without_mutation() {
     let before_ids = session_ids(&fixture.database_path);
 
     let output = command(&fixture, "clean")
-        .args([
-            "--keep-recent",
-            "3",
-            "--apply",
-            "--dangerously-skip-confirm",
-        ])
+        .args(["--keep-recent", "3", "--dangerously-skip-confirm"])
         .output()
         .expect("invalid clean should run");
 
     assert_code(&output, 2);
     assert_eq!(file_hash(&fixture.database_path), before_hash);
     assert_eq!(session_ids(&fixture.database_path), before_ids);
+}
+
+#[test]
+fn deletion_without_confirmation_refuses_and_leaves_the_database_untouched() {
+    let fixture = Fixture::build(&FixtureConfig {
+        session_count: 5,
+        archived_session_count: 3,
+        ..FixtureConfig::default()
+    })
+    .expect("fixture should build");
+    let before_hash = file_hash(&fixture.database_path);
+
+    // A pipe is not a terminal, so the confirmation cannot be answered and must refuse.
+    let refused = command(&fixture, "clean")
+        .args(["--archived", "--no-vacuum"])
+        .output()
+        .expect("unconfirmed clean should run");
+
+    assert_code(&refused, 2);
+    assert_eq!(file_hash(&fixture.database_path), before_hash);
+    assert_eq!(row_count(&fixture.database_path, "session"), 5);
+
+    let previewed = command(&fixture, "clean")
+        .args(["--archived", "--no-vacuum", "--dry-run"])
+        .output()
+        .expect("previewed clean should run");
+
+    assert_code(&previewed, 0);
+    assert_eq!(file_hash(&fixture.database_path), before_hash);
+
+    let confirmed = command(&fixture, "clean")
+        .args(["--archived", "--no-vacuum", "--dangerously-skip-confirm"])
+        .output()
+        .expect("confirmed clean should run");
+
+    assert_code(&confirmed, 0);
+    assert_eq!(row_count(&fixture.database_path, "session"), 2);
 }
 
 #[test]
@@ -136,7 +165,7 @@ fn apply_without_any_predicate_exits_two_without_mutation() {
     let before_hash = file_hash(&fixture.database_path);
 
     let output = command(&fixture, "clean")
-        .args(["--apply", "--dangerously-skip-confirm"])
+        .arg("--dangerously-skip-confirm")
         .output()
         .expect("invalid clean should run");
 
@@ -159,7 +188,6 @@ fn keep_recent_protects_a_dangling_retention_root_from_orphan_sweep() {
             "1",
             "--no-vacuum",
             "--json",
-            "--apply",
             "--dangerously-skip-confirm",
         ])
         .output()

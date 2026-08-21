@@ -57,8 +57,8 @@ The `--no-tests=pass` flag is not decorative. Several test binaries are feature-
 |---|---|---|
 | `analyze` | `src/report/command.rs` | no |
 | `doctor` | `src/doctor/command.rs` | no |
-| `clean` | `src/clean/command.rs` | only with `--apply` |
-| `vacuum` | `src/reclaim/command.rs` | only with `--apply` |
+| `clean` | `src/clean/command.rs` | after confirmation |
+| `vacuum` | `src/reclaim/command.rs` | after confirmation |
 
 The supporting modules divide by responsibility: `select/` chooses sessions through predicates, retention, subtree expansion, and orphan detection; `delete/` performs bounded deletion; `assets/` handles external storage and snapshot directories; `reclaim/` implements `VACUUM INTO`, incremental vacuum, and headroom arithmetic; `safety/` covers holder detection and confirmation; `db/` owns connections and schema tiering; `paths/` resolves the database and its sibling directories.
 

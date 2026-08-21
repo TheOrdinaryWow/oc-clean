@@ -140,7 +140,7 @@ fn cli(path: &Path, incremental: bool) -> Cli {
         db: Some(path.to_owned()),
         channel: None,
         log: LogMode::Off,
-        apply: true,
+        dry_run: false,
         force: false,
         force_schema: false,
         dangerously_skip_confirm: true,
@@ -260,7 +260,7 @@ fn p9_precedes_impact_summary_work() {
 
     let fixture = fixture(false);
     let mut cli = cli(&fixture.database_path, false);
-    cli.apply = false;
+    cli.dry_run = true;
     let mut arguments = arguments(false);
     arguments.json = true;
     let storage_path = fixture
@@ -338,7 +338,7 @@ fn selection_operations_are_attributed_to_the_normative_phases() {
 fn read_only_phase_failures_surface_in_declaration_order() {
     let fixture = fixture(false);
     let mut cli = cli(&fixture.database_path, false);
-    cli.apply = true;
+    cli.dry_run = false;
     let mut arguments = arguments(false);
     arguments.archived = false;
     arguments.orphans = false;
@@ -369,7 +369,7 @@ fn read_only_phase_failures_surface_in_declaration_order() {
 fn independent_read_only_phases_are_entered_before_results_are_joined() {
     let fixture = fixture(false);
     let mut cli = cli(&fixture.database_path, false);
-    cli.apply = false;
+    cli.dry_run = true;
     let mut arguments = arguments(false);
     arguments.archived = false;
     arguments.orphans = false;
@@ -403,7 +403,7 @@ fn independent_read_only_phases_are_entered_before_results_are_joined() {
 fn dry_run_and_apply_report_identical_selection_impact() {
     fn report(fixture: &Fixture, apply: bool) -> serde_json::Value {
         let mut cli = cli(&fixture.database_path, false);
-        cli.apply = apply;
+        cli.dry_run = !apply;
         let mut arguments = arguments(false);
         arguments.orphans = false;
         arguments.no_vacuum = true;
@@ -648,7 +648,6 @@ fn run_project_pruning(prune_empty_projects: bool) -> (Fixture, Vec<String>) {
         OsString::from("oc-clean"),
         OsString::from("--db"),
         fixture.database_path.as_os_str().to_owned(),
-        OsString::from("--apply"),
         OsString::from("--dangerously-skip-confirm"),
         OsString::from("clean"),
         OsString::from("--archived"),
@@ -769,7 +768,7 @@ fn p9_refuses_when_the_full_delete_batch_wal_exceeds_available_space() {
     drop(database);
 
     let mut cli = cli(&fixture.database_path, false);
-    cli.apply = false;
+    cli.dry_run = true;
     let mut arguments = arguments(false);
     arguments.json = true;
     let signals = SignalController::new();

@@ -137,7 +137,9 @@ where
     let (_, holder_decision) = inspect_and_decide(
         holder_inspector,
         database_path,
-        CommandMode::Vacuum { apply: cli.apply },
+        CommandMode::Vacuum {
+            dry_run: cli.dry_run,
+        },
         cli.force,
     );
     if matches!(holder_decision, GateDecision::Warn) {
@@ -151,7 +153,7 @@ where
         } else {
             Strategy::VacuumInto
         },
-        applied: cli.apply,
+        applied: !cli.dry_run,
         current_size,
         live_bytes: file_space.live_bytes,
         freelist_bytes: file_space.freelist_bytes,
@@ -198,7 +200,7 @@ where
 {
     let database = db::open_read_write(target, ConnectionOptions::default())?;
     check_auto_vacuum(&database).map_err(incremental_error)?;
-    if !cli.apply {
+    if cli.dry_run {
         return write_report(arguments, &report, output);
     }
     ensure_confirmed(cli, arguments, input, output, runtime, &report)?;
@@ -269,7 +271,7 @@ where
             available_bytes: headroom.available_bytes,
         });
     }
-    if !cli.apply {
+    if cli.dry_run {
         return write_report(arguments, &report, output);
     }
     ensure_confirmed(cli, arguments, input, output, runtime, &report)?;
@@ -337,10 +339,10 @@ where
     match decision {
         ConfirmationDecision::Proceed => Ok(()),
         ConfirmationDecision::Refuse => Err(Error::InvalidArgument {
-            argument: "--apply".to_owned(),
-            reason:
-                "vacuum application requires interactive confirmation or --dangerously-skip-confirm"
-                    .to_owned(),
+            argument: "confirmation".to_owned(),
+            reason: "vacuum requires an interactive `yes` or --dangerously-skip-confirm; \
+                     use --dry-run to preview without reclaiming"
+                .to_owned(),
         }),
     }
 }
@@ -630,7 +632,7 @@ mod tests {
             db: Some(path.to_owned()),
             channel: None,
             log: LogMode::Off,
-            apply,
+            dry_run: !apply,
             force: false,
             force_schema: false,
             dangerously_skip_confirm,

@@ -10,7 +10,7 @@ OpenCode 把会话、消息、片段、事件及相关状态存放在 SQLite 中
 
 仅仅删除行只会把页面放进 SQLite 的空闲列表，通常并不会缩小数据库文件。`oc-clean` 会删除选中的关系数据，并可以用 `VACUUM INTO` 重建数据库，或者在数据库已配置为 `auto_vacuum=INCREMENTAL` 时使用增量 vacuum。
 
-> `clean` 和 `vacuum` 默认都是试运行。在加上 `--apply` 之前请先检查它们的报告，在独立核对结果之前请保留生成的备份，并在执行破坏性操作前停止 OpenCode。
+> `clean` 和 `vacuum` 会修改数据库。两者都会先打印影响范围，等待交互式输入 `yes` 之后才动手；`--dry-run` 打印同样的报告后直接退出。在独立核对结果之前请保留生成的备份，并在执行破坏性操作前停止 OpenCode。
 
 ## 从源码安装
 
@@ -39,16 +39,16 @@ OPENCODE_DB=opencode-beta.db oc-clean analyze --quick
 
 ## 快速开始
 
-先运行完整报告，诊断安全状况，预览一次保守的清理，然后用 `--apply` 重复执行完全相同的清理：
+先运行完整报告，诊断安全状况，用 `--dry-run` 预览一次保守的清理，然后去掉它重复执行完全相同的命令来确认并执行：
 
 ```sh
 oc-clean analyze
 oc-clean doctor
+oc-clean clean --older-than 90D --dry-run
 oc-clean clean --older-than 90D
-oc-clean clean --older-than 90D --apply
 ```
 
-带 `--apply` 的命令需要交互式输入 `yes` 确认。自动化场景必须在检查过同样的试运行选择结果之后，显式加上 `--dangerously-skip-confirm`。
+第二条命令会打印同样的影响范围，询问 `Proceed? [y/N]`，只有输入 `y` 或 `yes` 之后才执行删除。自动化场景必须在检查过同样的 `--dry-run` 选择结果之后，显式加上 `--dangerously-skip-confirm`。
 
 ## 命令
 
@@ -77,46 +77,46 @@ OCC_DB=/var/lib/opencode/opencode.db oc-clean doctor
 
 ### `clean`
 
-`clean` 至少需要一个选择器：`--older-than`、`--project`、`--larger-than`、`--archived` 或 `--orphans`。多个会话谓词之间取交集，子树选择会保持父子一致性，`--keep-recent 100` 默认保护每个项目中最近活跃的 100 个根会话。
+`clean` 至少需要一个选择器：`--older-than`、`--project`、`--larger-than`、`--archived` 或 `--orphans`。多个会话谓词之间取交集，子树选择会保持父子一致性。`--keep-recent N` 保护每个项目中最近活跃的 N 个根会话，按项目分别计数，数的是根会话而不是全部会话；默认值为 0，即不保留任何会话，选择结果就是选择器所描述的内容。
 
 ```sh
 # 预览至少 90 天无活动的根会话子树。
-oc-clean clean --older-than 90D
+oc-clean clean --older-than 90D --dry-run
 
 # 预览大于 250 十进制 MB 的已归档子树。
-oc-clean clean --archived --larger-than 250MB
+oc-clean clean --archived --larger-than 250MB --dry-run
 
 # 预览 glob 选中的项目路径下所有匹配的会话。
-oc-clean clean --project '/work/legacy-*' --keep-recent 20
+oc-clean clean --project '/work/legacy-*' --keep-recent 20 --dry-run
 
 # 预览会话形态的孤儿事件、悬空会话和外部孤儿文件。
-oc-clean clean --orphans
+oc-clean clean --orphans --dry-run
 
-# 应用已检查过的选择结果，并交互式确认。
-oc-clean clean --older-than 6M --gc-snapshots --apply
+# 删除已检查过的选择结果，并交互式确认。
+oc-clean clean --older-than 6M --gc-snapshots
 
-# 在检查过等价的试运行之后，从非交互任务中应用。
-oc-clean clean --older-than 1Y --apply --dangerously-skip-confirm --json
+# 在检查过等价的试运行之后，从非交互任务中执行。
+oc-clean clean --older-than 1Y --dangerously-skip-confirm --json
 ```
 
-试运行会在任何删除之前列出体积最大的待删会话及其标题，条数由 `--top` 限制，让选择结果可以被辨认而不只是被计数。
+影响报告会在任何删除之前列出体积最大的待删会话及其标题，条数由 `--top` 限制，让选择结果可以被辨认而不只是被计数。
 
-应用清理时，会以每批 2,500 个候选的有界事务删除会话，显式删除匹配的事件聚合，清理受影响的空项目，移除对应的存储和快照产物，运行完整性检查，并默认重建数据库。`--no-vacuum` 会提交删除但把空闲页留在数据库文件中。`--incremental` 使用增量 auto-vacuum，要求源数据库此前已按 `auto_vacuum=INCREMENTAL` 配置并重建过。`--gc-snapshots` 还会压缩保留下来的快照仓库。
+确认之后的清理会以每批 2,500 个候选的有界事务删除会话，显式删除匹配的事件聚合，清理受影响的空项目，移除对应的存储和快照产物，运行完整性检查，并默认重建数据库。`--no-vacuum` 会提交删除但把空闲页留在数据库文件中。`--incremental` 使用增量 auto-vacuum，要求源数据库此前已按 `auto_vacuum=INCREMENTAL` 配置并重建过。`--gc-snapshots` 还会压缩保留下来的快照仓库。
 
 ### `vacuum`
 
-`vacuum` 回收 SQLite 已有的空闲列表空间，不选择也不删除应用数据行。默认模式使用经过校验的 `VACUUM INTO` 重建加原子替换；`--incremental` 则在已经使用增量 auto-vacuum 的数据库上请求有界的增量 vacuum 批次。
+`vacuum` 回收 SQLite 已有的空闲列表空间，不选择也不删除应用数据行。默认模式使用经过校验的 `VACUUM INTO` 重建加原子替换；`--incremental` 则在已经使用增量 auto-vacuum 的数据库上请求有界的增量 vacuum 批次。与 `clean` 一样，它会打印报告并要求交互式输入 `yes`，`--dry-run` 则在报告之后停止。
 
 ```sh
 # 预览重建策略、预计压缩后的体积和所需余量。
-oc-clean vacuum
+oc-clean vacuum --dry-run
 
 # 重建、交互式确认，并保留带时间戳的备份。
-oc-clean vacuum --apply
+oc-clean vacuum
 
-# 在数据库支持的情况下预览并应用增量回收。
+# 在数据库支持的情况下预览并执行增量回收。
+oc-clean vacuum --incremental --dry-run
 oc-clean vacuum --incremental
-oc-clean vacuum --incremental --apply
 ```
 
 ## 选项
@@ -128,7 +128,7 @@ oc-clean vacuum --incremental --apply
 | Global | `--db <PATH>` | `OCC_DB` | 选择数据库路径，或用 `:memory:` 指定一个全新的内存分析目标。优先级高于 `OPENCODE_DB` 和平台发现。 |
 | Global | `--channel <NAME>` | `OCC_CHANNEL` | 选择用于推导默认数据库文件名的 OpenCode 通道。 |
 | Global | `--log <MODE>` | `OCC_LOG` | 选择 stderr 诊断输出：`off`、`text` 或 `json`，默认 `off`。设置 `RUST_LOG` 会隐式选择 `text`。 |
-| Global | `--apply` | 仅命令行 | 为 `clean` 或 `vacuum` 启用实际修改；不加时两者都保持试运行。 |
+| Global | `--dry-run` | `OCC_DRY_RUN` | 打印 `clean` 或 `vacuum` 的报告后退出，不做任何修改，也不提示确认。 |
 | Global | `--force` | 仅命令行 | 对已应用的 `clean` 或 `vacuum`，把「存在持有者」或「无法判定」的持有者关卡降级为警告。 |
 | Global | `--force-schema` | 仅命令行 | 把第 3 层 schema 语义发现降级为警告；第 1 层仍然强制，第 2 层本就被容忍。 |
 | Global | `--dangerously-skip-confirm` | 仅命令行 | 跳过已应用的 `clean` 和 `vacuum` 所需的交互式确认，包括 JSON 输出和管道执行场景。 |
@@ -142,7 +142,7 @@ oc-clean vacuum --incremental --apply
 | clean | `--larger-than <SIZE>` | `OCC_LARGER_THAN` | 选择可归属负载达到该十进制体积的会话子树。 |
 | clean | `--archived` | `OCC_ARCHIVED` | 选择已归档的会话。 |
 | clean | `--orphans` | `OCC_ORPHANS` | 纳入会话形态的孤儿事件、悬空会话和孤儿外部存储。 |
-| clean | `--keep-recent <N>` | `OCC_KEEP_RECENT` | 每个项目保留这么多最近活跃的根会话，默认 `100`。 |
+| clean | `--keep-recent <N>` | `OCC_KEEP_RECENT` | 每个项目保留这么多最近活跃的根会话，默认 `0`，即不保留任何会话。 |
 | clean | `--incremental` | `OCC_INCREMENTAL` | 在已使用 `auto_vacuum=INCREMENTAL` 的数据库上用增量 vacuum 回收空闲页。 |
 | clean | `--no-vacuum` | `OCC_NO_VACUUM` | 提交选中的删除，跳过页面回收。 |
 | clean | `--gc-snapshots` | `OCC_GC_SNAPSHOTS` | 清理之后压缩保留下来的快照仓库。 |
@@ -170,15 +170,15 @@ oc-clean vacuum --incremental --apply
 
 ### 试运行与确认
 
-`analyze` 和 `doctor` 是只读的。`clean` 和 `vacuum` 在没有 `--apply` 时都是试运行；它们的预览会完成选择、兼容性、持有者和余量检查，同时保持数据库字节不变。带 `--apply` 的命令会在修改前获取 SQLite 的排他锁。交互式的应用命令会展示影响范围，且只接受 `y` 或 `yes`；管道输入、JSON 输出或缺少终端都会导致拒绝执行，除非提供 `--dangerously-skip-confirm`。
+`analyze` 和 `doctor` 是只读的。`clean` 和 `vacuum` 会修改数据，两者都会停在交互式确认上，展示完整影响范围，且只接受 `y` 或 `yes`，忽略大小写和首尾空白。`--dry-run` 会完成同样的选择、兼容性、持有者和余量检查，打印报告后退出，同时保持数据库字节不变。会修改数据的运行在动手前获取 SQLite 的排他锁。管道输入、JSON 输出或缺少终端都无法回答确认提示，因此会以退出码 2 拒绝执行，除非提供 `--dangerously-skip-confirm`。
 
-`--dangerously-skip-confirm` 只绕过确认环节。它仍然需要 `--apply`，并且持有者、schema、锁、余量和完整性关卡全部保持有效。因此一个写错的选择器或数据库路径依然可能在无人值守时执行并删除错误的数据。
+`--dangerously-skip-confirm` 只绕过确认环节，持有者、schema、锁、余量和完整性关卡全部保持有效。因此一个写错的选择器或数据库路径依然可能在无人值守时执行并删除错误的数据。
 
 ### 持有者检测
 
 在清理或回收之前，平台检查器会扫描数据库、WAL 和 SHM 路径，并报告 `CompleteForVisibleProcesses`、`PartialDueToPermissions` 或 `Unsupported` 之一。Linux 使用可见的 `/proc` 文件描述符，macOS 使用 `libproc`，Windows 使用 Restart Manager。该扫描是一次时间点观测，只能看到当前账户和平台 API 可见的进程，并且无法阻止扫描之后有其他进程再连接上来。`CompleteForVisibleProcesses` 只覆盖可见进程，并不证明数据库处于静默状态。
 
-带 `--apply` 的 `clean` 和 `vacuum` 会拒绝「观测到持有者」，而「扫描结果无法判定」只在平台完全无法扫描（`Unsupported`）时才拒绝。报告为 `PartialDueToPermissions` 的扫描仍然覆盖了当前账户可见的每个进程，因此只发出警告并继续：非特权账户永远读不到其他用户的描述符表，仅凭这一点拒绝会挡住所有非 root 调用，却证明不了任何事情。`--force` 绕过剩余的前置拒绝，把它们变成警告；SQLite 锁获取、`data_version` 检查、schema 策略、磁盘余量、确认和完整性检查依然有效。对着活跃进程强制执行可能干扰 OpenCode、与外部文件清理产生竞态，或让写入仍附着在被替换数据库 inode 的句柄上。
+会修改数据的 `clean` 和 `vacuum` 会拒绝「观测到持有者」，而「扫描结果无法判定」只在平台完全无法扫描（`Unsupported`）时才拒绝。报告为 `PartialDueToPermissions` 的扫描仍然覆盖了当前账户可见的每个进程，因此只发出警告并继续：非特权账户永远读不到其他用户的描述符表，仅凭这一点拒绝会挡住所有非 root 调用，却证明不了任何事情。`--force` 绕过剩余的前置拒绝，把它们变成警告；SQLite 锁获取、`data_version` 检查、schema 策略、磁盘余量、确认和完整性检查依然有效。对着活跃进程强制执行可能干扰 OpenCode、与外部文件清理产生竞态，或让写入仍附着在被替换数据库 inode 的句柄上。
 
 ### Schema 严格程度
 
@@ -210,8 +210,8 @@ oc-clean vacuum --incremental --apply
 
 ```sh
 oc-clean analyze --json > analysis.json
-oc-clean clean --older-than 120D --json > preview.json
-oc-clean clean --older-than 120D --apply --dangerously-skip-confirm --json > result.json
+oc-clean clean --older-than 120D --dry-run --json > preview.json
+oc-clean clean --older-than 120D --dangerously-skip-confirm --json > result.json
 ```
 
 JSON 报告契约记录在 [docs/json-report.md](docs/json-report.md)（英文）。

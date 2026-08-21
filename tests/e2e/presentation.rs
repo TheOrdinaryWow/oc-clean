@@ -67,11 +67,26 @@ fn a_clean_dry_run_previews_the_sessions_it_would_delete() {
     let fixture = fixture();
 
     let human = command(&fixture, "clean")
-        .args(["--archived", "--keep-recent", "0", "--top", "3"])
+        .args([
+            "--archived",
+            "--keep-recent",
+            "0",
+            "--top",
+            "3",
+            "--dry-run",
+        ])
         .output()
         .expect("human dry run should run");
     let machine = command(&fixture, "clean")
-        .args(["--archived", "--keep-recent", "0", "--top", "3", "--json"])
+        .args([
+            "--archived",
+            "--keep-recent",
+            "0",
+            "--top",
+            "3",
+            "--json",
+            "--dry-run",
+        ])
         .output()
         .expect("JSON dry run should run");
 
@@ -104,7 +119,15 @@ fn the_preview_never_exceeds_the_requested_cap() {
     let fixture = fixture();
 
     let output = command(&fixture, "clean")
-        .args(["--archived", "--keep-recent", "0", "--top", "1", "--json"])
+        .args([
+            "--archived",
+            "--keep-recent",
+            "0",
+            "--top",
+            "1",
+            "--json",
+            "--dry-run",
+        ])
         .output()
         .expect("dry run should run");
 

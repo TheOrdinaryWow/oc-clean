@@ -10,7 +10,7 @@ OpenCode stores sessions, messages, parts, events, and related state in SQLite. 
 
 Deleting rows alone places pages on SQLite's freelist; it does not normally shrink the database file. `oc-clean` deletes the selected relational data and can rebuild the database with `VACUUM INTO`, or use incremental vacuum when the database was already configured for `auto_vacuum=INCREMENTAL`.
 
-> `clean` and `vacuum` are dry runs by default. Review their reports before adding `--apply`, keep the generated backup until the result has been independently checked, and stop OpenCode before destructive work.
+> `clean` and `vacuum` mutate the database. Each one prints its impact and waits for an interactive `yes` before doing anything; `--dry-run` prints the same report and exits instead. Keep the generated backup until the result has been independently checked, and stop OpenCode before destructive work.
 
 ## Installation From Source
 
@@ -39,16 +39,16 @@ OPENCODE_DB=opencode-beta.db oc-clean analyze --quick
 
 ## Quick Start
 
-Run a full report, diagnose safety conditions, preview a conservative cleanup, and then repeat the exact cleanup with `--apply`:
+Run a full report, diagnose safety conditions, preview a conservative cleanup with `--dry-run`, and then repeat the exact command without it to confirm and execute:
 
 ```sh
 oc-clean analyze
 oc-clean doctor
+oc-clean clean --older-than 90D --dry-run
 oc-clean clean --older-than 90D
-oc-clean clean --older-than 90D --apply
 ```
 
-The applied command requires an interactive `yes` confirmation. Automation must add `--dangerously-skip-confirm` explicitly after reviewing the same dry-run selection.
+The second command prints the same impact, asks `Proceed? [y/N]`, and deletes only after `y` or `yes`. Automation must add `--dangerously-skip-confirm` explicitly after reviewing the same `--dry-run` selection.
 
 ## Commands
 
@@ -77,46 +77,46 @@ OCC_DB=/var/lib/opencode/opencode.db oc-clean doctor
 
 ### `clean`
 
-`clean` requires at least one selector: `--older-than`, `--project`, `--larger-than`, `--archived`, or `--orphans`. Multiple session predicates are intersected, subtree selection preserves parent-child consistency, and `--keep-recent 100` protects the 100 most recently active root sessions per project by default.
+`clean` requires at least one selector: `--older-than`, `--project`, `--larger-than`, `--archived`, or `--orphans`. Multiple session predicates are intersected and subtree selection preserves parent-child consistency. `--keep-recent N` protects the `N` most recently active root sessions per project, counted per project against root sessions rather than against every session; it retains nothing by default, so the selection is exactly what the selectors describe.
 
 ```sh
 # Preview root session subtrees inactive for at least 90 days.
-oc-clean clean --older-than 90D
+oc-clean clean --older-than 90D --dry-run
 
 # Preview archived subtrees larger than 250 decimal megabytes.
-oc-clean clean --archived --larger-than 250MB
+oc-clean clean --archived --larger-than 250MB --dry-run
 
 # Preview all matching sessions for project paths selected by the glob.
-oc-clean clean --project '/work/legacy-*' --keep-recent 20
+oc-clean clean --project '/work/legacy-*' --keep-recent 20 --dry-run
 
 # Preview session-shaped orphan events, dangling sessions, and external orphans.
-oc-clean clean --orphans
+oc-clean clean --orphans --dry-run
 
-# Apply the reviewed selection and confirm interactively.
-oc-clean clean --older-than 6M --gc-snapshots --apply
+# Delete the reviewed selection, confirming interactively.
+oc-clean clean --older-than 6M --gc-snapshots
 
-# Apply from a non-interactive job after an equivalent dry run was reviewed.
-oc-clean clean --older-than 1Y --apply --dangerously-skip-confirm --json
+# Run from a non-interactive job after an equivalent dry run was reviewed.
+oc-clean clean --older-than 1Y --dangerously-skip-confirm --json
 ```
 
-The dry run lists the largest selected sessions with their titles before any deletion, capped by `--top`, so a selection can be recognized rather than only counted.
+The impact report lists the largest selected sessions with their titles before any deletion, capped by `--top`, so a selection can be recognized rather than only counted.
 
-Applied cleanup deletes sessions in bounded transactions of 2,500 candidates, deletes matching event aggregates explicitly, prunes affected empty projects, removes corresponding storage and snapshot artifacts, runs integrity checks, and rebuilds the database by default. `--no-vacuum` commits deletion while leaving free pages in the database file. `--incremental` uses incremental auto-vacuum and requires the source database to have been configured and rebuilt previously with `auto_vacuum=INCREMENTAL`. `--gc-snapshots` also compacts retained snapshot repositories.
+Confirmed cleanup deletes sessions in bounded transactions of 2,500 candidates, deletes matching event aggregates explicitly, prunes affected empty projects, removes corresponding storage and snapshot artifacts, runs integrity checks, and rebuilds the database by default. `--no-vacuum` commits deletion while leaving free pages in the database file. `--incremental` uses incremental auto-vacuum and requires the source database to have been configured and rebuilt previously with `auto_vacuum=INCREMENTAL`. `--gc-snapshots` also compacts retained snapshot repositories.
 
 ### `vacuum`
 
-`vacuum` reclaims existing SQLite freelist space without selecting or deleting application rows. Default mode uses a verified `VACUUM INTO` rebuild and atomic swap; `--incremental` requests bounded incremental-vacuum batches on a database already using incremental auto-vacuum.
+`vacuum` reclaims existing SQLite freelist space without selecting or deleting application rows. Default mode uses a verified `VACUUM INTO` rebuild and atomic swap; `--incremental` requests bounded incremental-vacuum batches on a database already using incremental auto-vacuum. Like `clean`, it prints its report and requires an interactive `yes`, and `--dry-run` stops after the report.
 
 ```sh
 # Preview rebuild strategy, estimated compacted size, and required headroom.
-oc-clean vacuum
+oc-clean vacuum --dry-run
 
 # Rebuild, confirm interactively, and retain a timestamped backup.
-oc-clean vacuum --apply
+oc-clean vacuum
 
-# Preview and then apply incremental reclamation where supported by the database.
+# Preview and then run incremental reclamation where supported by the database.
+oc-clean vacuum --incremental --dry-run
 oc-clean vacuum --incremental
-oc-clean vacuum --incremental --apply
 ```
 
 ## Options
@@ -128,7 +128,7 @@ The table is the complete set of long flags defined by the current clap interfac
 | Global | `--db <PATH>` | `OCC_DB` | Select the database path or `:memory:` for a fresh in-memory analysis target. This takes precedence over `OPENCODE_DB` and platform discovery. |
 | Global | `--channel <NAME>` | `OCC_CHANNEL` | Select the OpenCode channel used for the discovered database filename. |
 | Global | `--log <MODE>` | `OCC_LOG` | Select stderr diagnostics: `off`, `text`, or `json`; default is `off`. Setting `RUST_LOG` implicitly selects `text`. |
-| Global | `--apply` | CLI only | Enable mutation for `clean` or `vacuum`; both remain dry runs without it. |
+| Global | `--dry-run` | `OCC_DRY_RUN` | Print the `clean` or `vacuum` report and exit without mutating anything or prompting. |
 | Global | `--force` | CLI only | Downgrade a held or indeterminate holder gate to a warning for applied `clean` or `vacuum`. |
 | Global | `--force-schema` | CLI only | Downgrade Tier 3 schema-semantic findings to warnings; Tier 1 remains mandatory and Tier 2 is already tolerated. |
 | Global | `--dangerously-skip-confirm` | CLI only | Bypass the interactive confirmation required by applied `clean` and `vacuum`, including JSON and piped execution. |
@@ -142,7 +142,7 @@ The table is the complete set of long flags defined by the current clap interfac
 | clean | `--larger-than <SIZE>` | `OCC_LARGER_THAN` | Select session subtrees whose attributable payload reaches this decimal size. |
 | clean | `--archived` | `OCC_ARCHIVED` | Select archived sessions. |
 | clean | `--orphans` | `OCC_ORPHANS` | Include session-shaped orphan events, dangling sessions, and orphan external storage. |
-| clean | `--keep-recent <N>` | `OCC_KEEP_RECENT` | Retain this many recently active root sessions per project; default is `100`. |
+| clean | `--keep-recent <N>` | `OCC_KEEP_RECENT` | Retain this many most recently active root sessions per project; default is `0`, which retains nothing. |
 | clean | `--incremental` | `OCC_INCREMENTAL` | Reclaim free pages with incremental vacuum on a database already using `auto_vacuum=INCREMENTAL`. |
 | clean | `--no-vacuum` | `OCC_NO_VACUUM` | Commit selected deletion and skip page reclamation. |
 | clean | `--gc-snapshots` | `OCC_GC_SNAPSHOTS` | Compact retained snapshot repositories after cleanup. |
@@ -170,9 +170,9 @@ Sub-day duration units and binary size units are explicitly rejected. Incrementa
 
 ### Dry Runs And Confirmation
 
-`analyze` and `doctor` are read-only. `clean` and `vacuum` are dry runs unless `--apply` is present; their previews perform selection, compatibility, holder, and headroom work while preserving database bytes. Applied commands acquire SQLite's exclusive lock before mutation. Interactive applied commands display impact and accept only `y` or `yes`; piped input, JSON output, or a missing terminal causes refusal unless `--dangerously-skip-confirm` is supplied.
+`analyze` and `doctor` are read-only. `clean` and `vacuum` mutate, and both stop at an interactive confirmation that displays the full impact and accepts only `y` or `yes`, ignoring case and surrounding whitespace. `--dry-run` performs the same selection, compatibility, holder, and headroom work, prints the report, and exits while preserving database bytes. Mutating runs acquire SQLite's exclusive lock before touching data. Piped input, JSON output, or a missing terminal cannot answer the prompt and therefore refuse with exit code 2 unless `--dangerously-skip-confirm` is supplied.
 
-`--dangerously-skip-confirm` bypasses confirmation only. It still requires `--apply` and leaves holder, schema, lock, headroom, and integrity gates active. A mistaken selector or database path can therefore execute unattended and delete the wrong data.
+`--dangerously-skip-confirm` bypasses the confirmation only, and leaves holder, schema, lock, headroom, and integrity gates active. A mistaken selector or database path can therefore execute unattended and delete the wrong data.
 
 ### Holder Detection
 
@@ -210,8 +210,8 @@ Failures never depend on `--log`. A failed command writes an `error:` line to st
 
 ```sh
 oc-clean analyze --json > analysis.json
-oc-clean clean --older-than 120D --json > preview.json
-oc-clean clean --older-than 120D --apply --dangerously-skip-confirm --json > result.json
+oc-clean clean --older-than 120D --dry-run --json > preview.json
+oc-clean clean --older-than 120D --dangerously-skip-confirm --json > result.json
 ```
 
 ## Measured Performance

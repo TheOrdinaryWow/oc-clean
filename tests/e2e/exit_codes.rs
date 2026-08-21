@@ -31,7 +31,7 @@ fn clean_with_real_holder_preserves_preview_and_refuses_apply() {
     let _holder = HoldingChild::spawn(&fixture.database_path);
 
     let preview = command(&fixture, "clean")
-        .args(["--archived", "--keep-recent", "0", "--json"])
+        .args(["--archived", "--keep-recent", "0", "--json", "--dry-run"])
         .output()
         .expect("clean preview should run");
 
@@ -47,7 +47,6 @@ fn clean_with_real_holder_preserves_preview_and_refuses_apply() {
             "--archived",
             "--keep-recent",
             "0",
-            "--apply",
             "--dangerously-skip-confirm",
             "--json",
         ])
@@ -193,7 +192,6 @@ fn incompatible_schema_produces_exit_four_without_mutation() {
             "--archived",
             "--keep-recent",
             "0",
-            "--apply",
             "--dangerously-skip-confirm",
         ])
         .output()
@@ -210,7 +208,7 @@ fn held_database_produces_exit_five() {
     let holder = fixture.connect().expect("fixture holder should connect");
 
     let output = command(&fixture, "vacuum")
-        .args(["--apply", "--dangerously-skip-confirm"])
+        .arg("--dangerously-skip-confirm")
         .output()
         .expect("vacuum should run");
 
@@ -244,12 +242,7 @@ fn incremental_vacuum_lock_contention_produces_exit_five() {
         .expect("holder should acquire a competing write lock");
 
     let output = command(&fixture, "vacuum")
-        .args([
-            "--incremental",
-            "--apply",
-            "--dangerously-skip-confirm",
-            "--force",
-        ])
+        .args(["--incremental", "--dangerously-skip-confirm", "--force"])
         .output()
         .expect("incremental vacuum should run");
 
@@ -275,7 +268,6 @@ fn clean_incremental_on_auto_vacuum_none_produces_exit_six() {
             "--keep-recent",
             "0",
             "--incremental",
-            "--apply",
             "--dangerously-skip-confirm",
         ])
         .output()
@@ -316,7 +308,6 @@ fn interrupt_after_committed_batch_produces_exit_eight() {
             "--keep-recent",
             "0",
             "--no-vacuum",
-            "--apply",
             "--dangerously-skip-confirm",
             "--skip-backup",
             // Diagnostics are off by default; this test observes the committed-batch marker.
@@ -381,7 +372,6 @@ fn filesystem_cleanup_failure_produces_exit_ten() {
             "--keep-recent",
             "0",
             "--no-vacuum",
-            "--apply",
             "--dangerously-skip-confirm",
         ])
         .output()

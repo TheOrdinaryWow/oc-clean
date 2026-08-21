@@ -105,7 +105,14 @@ fn clean_dry_run_and_apply_match_exact_counts_and_identifiers() {
     let selected_ids = super::support::archived_session_ids(&fixture.database_path);
 
     let dry_run = command(&fixture, "clean")
-        .args(["--archived", "--keep-recent", "0", "--no-vacuum", "--json"])
+        .args([
+            "--archived",
+            "--keep-recent",
+            "0",
+            "--no-vacuum",
+            "--json",
+            "--dry-run",
+        ])
         .output()
         .expect("clean dry-run should run");
     let applied = command(&fixture, "clean")
@@ -115,7 +122,6 @@ fn clean_dry_run_and_apply_match_exact_counts_and_identifiers() {
             "0",
             "--no-vacuum",
             "--json",
-            "--apply",
             "--dangerously-skip-confirm",
         ])
         .output()
@@ -172,7 +178,7 @@ fn vacuum_dry_run_is_byte_identical_and_apply_shrinks_without_data_loss() {
     let before_rows = table_counts(&fixture.database_path);
 
     let dry_run = command(&fixture, "vacuum")
-        .arg("--json")
+        .args(["--json", "--dry-run"])
         .output()
         .expect("vacuum dry-run should run");
     assert_code(&dry_run, 0);
@@ -181,7 +187,7 @@ fn vacuum_dry_run_is_byte_identical_and_apply_shrinks_without_data_loss() {
     assert_eq!(preview["mode"], "dry-run");
 
     let applied = command(&fixture, "vacuum")
-        .args(["--json", "--apply", "--dangerously-skip-confirm"])
+        .args(["--json", "--dangerously-skip-confirm"])
         .output()
         .expect("vacuum apply should run");
 

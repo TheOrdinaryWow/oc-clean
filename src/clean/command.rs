@@ -47,7 +47,7 @@ pub fn run(cli: &Cli, arguments: &CleanArgs, output: &mut dyn Write) -> Result<(
     let mut input = stdin.lock();
     let signals = SignalController::new();
     signals.install()?;
-    let observer = ProgressPhaseObserver::new(arguments, cli.apply);
+    let observer = ProgressPhaseObserver::new(arguments, !cli.dry_run);
     let result = run_with(
         cli,
         arguments,
@@ -129,12 +129,12 @@ where
 
     let database = db::open_read_write(&target, ConnectionOptions::default())?;
     signals.set_interrupt_handle(database.interrupt_handle());
-    let locked_data_version = if cli.apply {
+    let locked_data_version = if cli.dry_run {
+        None
+    } else {
         phase(observer, PhaseId::P5);
         database.acquire_exclusive_lock()?;
         Some(database.data_version()?)
-    } else {
-        None
     };
 
     let now_ms = selection::now_ms()?;
@@ -168,7 +168,7 @@ where
         )?;
     }
     phase(observer, PhaseId::P10);
-    if !cli.apply {
+    if cli.dry_run {
         return output::write_dry_run(&impact.summary, arguments.json, report_style(), output)
             .map_err(output_error);
     }
@@ -455,10 +455,10 @@ where
     match decision {
         ConfirmationDecision::Proceed => Ok(()),
         ConfirmationDecision::Refuse => Err(Error::InvalidArgument {
-            argument: "--apply".to_owned(),
-            reason:
-                "clean application requires interactive confirmation or --dangerously-skip-confirm"
-                    .to_owned(),
+            argument: "confirmation".to_owned(),
+            reason: "clean requires an interactive `yes` or --dangerously-skip-confirm; \
+                     use --dry-run to preview without deleting"
+                .to_owned(),
         }),
     }
 }
@@ -596,7 +596,9 @@ fn inspect_holder_decision(
     inspect_and_decide(
         holder_inspector,
         database_path,
-        CommandMode::Clean { apply: cli.apply },
+        CommandMode::Clean {
+            dry_run: cli.dry_run,
+        },
         cli.force,
     )
     .1

@@ -64,8 +64,8 @@ Four subcommands, four entrypoints:
 |---|---|---|
 | `analyze` | `src/report/command.rs` | no |
 | `doctor` | `src/doctor/command.rs` | no |
-| `clean` | `src/clean/command.rs` | with `--apply` |
-| `vacuum` | `src/reclaim/command.rs` | with `--apply` |
+| `clean` | `src/clean/command.rs` | after confirmation |
+| `vacuum` | `src/reclaim/command.rs` | after confirmation |
 
 Supporting modules split by responsibility: `select/` chooses sessions (predicates, retention, subtree expansion, orphans), `delete/` performs bounded deletion, `assets/` handles external storage and snapshot directories, `reclaim/` implements `VACUUM INTO` plus incremental vacuum and headroom math, `safety/` covers holder detection and confirmation, `db/` owns connections and schema tiering, `paths/` resolves the database and its sibling directories.
 
@@ -73,7 +73,7 @@ Supporting modules split by responsibility: `select/` chooses sessions (predicat
 
 Two safety invariants that are easy to violate:
 
-- **Dry run and apply must select identically.** The only difference is whether mutation happens.
+- **Dry run and a confirmed run must select identically.** The only difference is whether mutation happens.
 - **Never call `fs::canonicalize`.** Path identity is anchored through opened handles and openat-style traversal instead, which is what prevents symlink escape during backup and swap. There are currently zero occurrences in `src/`; keep it that way.
 
 ## Schema fixture

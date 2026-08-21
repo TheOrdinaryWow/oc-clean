@@ -40,8 +40,9 @@ pub struct Cli {
     )]
     pub log: LogMode,
 
-    #[arg(long, global = true)]
-    pub apply: bool,
+    /// Preview the selection and exit without mutating anything.
+    #[arg(long, env = "OCC_DRY_RUN", global = true)]
+    pub dry_run: bool,
 
     #[arg(long, global = true)]
     pub force: bool,
@@ -77,7 +78,7 @@ pub enum Commands {
     Doctor(DoctorArgs),
     /// Delete selected sessions and reclaim their database space.
     Clean(CleanArgs),
-    /// Reclaim database freelist space, using a dry-run unless --apply is supplied.
+    /// Reclaim database freelist space after an interactive confirmation.
     Vacuum(VacuumArgs),
 }
 
@@ -105,7 +106,7 @@ pub struct CleanArgs {
     pub orphans: bool,
 
     /// Retain this many most recently active root sessions per project.
-    #[arg(long, env = "OCC_KEEP_RECENT", default_value_t = 100, value_name = "N")]
+    #[arg(long, env = "OCC_KEEP_RECENT", default_value_t = 0, value_name = "N")]
     pub keep_recent: u64,
 
     /// Use incremental auto-vacuum instead of rebuilding the database.
@@ -200,7 +201,7 @@ mod tests {
             "oc-clean",
             "--db",
             "/tmp/opencode.db",
-            "--apply",
+            "--dry-run",
             "--log",
             "json",
             "clean",
@@ -264,8 +265,7 @@ mod tests {
 
     #[test]
     fn every_non_destructive_option_has_an_occ_environment_binding() {
-        const DESTRUCTIVE_OPTIONS: [&str; 5] = [
-            "apply",
+        const DESTRUCTIVE_OPTIONS: [&str; 4] = [
             "force",
             "force-schema",
             "dangerously-skip-confirm",
@@ -317,13 +317,24 @@ mod tests {
     }
 
     #[test]
-    fn clean_defaults_to_one_hundred_recent_sessions_per_project() {
+    fn clean_retains_nothing_unless_keep_recent_is_requested() {
         let cli = Cli::try_parse_from(["oc-clean", "clean"]).expect("clean should parse");
         let Commands::Clean(arguments) = cli.command else {
             panic!("clean command should parse");
         };
 
-        assert_eq!(arguments.keep_recent, 100);
+        assert_eq!(arguments.keep_recent, 0);
         assert_eq!(arguments.top, 10);
+    }
+
+    #[test]
+    fn destructive_work_is_the_default_and_dry_run_is_opt_in() {
+        let default = Cli::try_parse_from(["oc-clean", "clean"]).expect("clean should parse");
+        let previewed =
+            Cli::try_parse_from(["oc-clean", "clean", "--dry-run"]).expect("clean should parse");
+
+        assert!(!default.dry_run);
+        assert!(previewed.dry_run);
+        assert!(Cli::try_parse_from(["oc-clean", "clean", "--apply"]).is_err());
     }
 }
