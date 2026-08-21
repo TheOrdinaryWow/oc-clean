@@ -1,6 +1,7 @@
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File};
+use std::fs::File;
 #[cfg(unix)]
 use std::io::{self, Seek};
 use std::marker::PhantomData;
@@ -189,7 +190,7 @@ fn open_file<Access>(
     finish_open(connection, Some(anchor), options)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn open_read_only_with_hook(
     target: &Target,
     options: ConnectionOptions,
@@ -267,6 +268,11 @@ impl AnchoredDatabaseFile {
     }
 
     #[cfg(not(unix))]
+    #[expect(
+        clippy::unused_self,
+        clippy::unnecessary_wraps,
+        reason = "mirrors the fallible descriptor-anchored unix signature"
+    )]
     pub(crate) fn sibling_path(&self, path: &Path) -> Result<PathBuf, Error> {
         Ok(path.to_path_buf())
     }
@@ -354,11 +360,7 @@ impl AnchoredDatabaseFile {
     }
 
     pub(crate) fn identity(&self) -> Result<FileIdentity, Error> {
-        let metadata = self.descriptor.metadata().map_err(|source| Error::Io {
-            path: self.lexical_path.clone(),
-            source,
-        })?;
-        file_identity_from_metadata(&self.lexical_path, &metadata)
+        file_identity_from_handle(&self.lexical_path, &self.descriptor)
     }
 
     pub(crate) fn ensure_path_matches(&self, path: &Path, reason: &str) -> Result<(), Error> {
@@ -368,10 +370,7 @@ impl AnchoredDatabaseFile {
             .descriptor;
         #[cfg(not(unix))]
         let candidate = File::open(path).map_err(|source| path_open_error(path, source))?;
-        let metadata = candidate
-            .metadata()
-            .map_err(|source| path_open_error(path, source))?;
-        let candidate_identity = file_identity_from_metadata(path, &metadata)?;
+        let candidate_identity = file_identity_from_handle(path, &candidate)?;
         self.ensure_same_file(candidate_identity, reason)
     }
 
@@ -390,13 +389,14 @@ impl AnchoredDatabaseFile {
                     source: source.into(),
                 })?,
             );
-            let metadata = candidate
-                .metadata()
-                .map_err(|source| path_open_error(&self.resolved_path, source))?;
-            file_identity_from_metadata(&self.resolved_path, &metadata)?
+            file_identity_from_handle(&self.resolved_path, &candidate)?
         };
         #[cfg(not(unix))]
-        let candidate_identity = file_identity(&self.resolved_path)?;
+        let candidate_identity = {
+            let candidate = File::open(&self.resolved_path)
+                .map_err(|source| path_open_error(&self.resolved_path, source))?;
+            file_identity_from_handle(&self.resolved_path, &candidate)?
+        };
         self.ensure_same_file(candidate_identity, reason)
     }
 
@@ -662,14 +662,14 @@ fn probe_hard_links(anchor: &AnchoredDatabaseFile) -> Result<bool, Error> {
     #[cfg(unix)]
     let link_result = anchor.hard_link_to(&probe_path);
     #[cfg(not(unix))]
-    let link_result = fs::hard_link(database_path, &probe_path);
+    let link_result = std::fs::hard_link(database_path, &probe_path);
     if link_result.is_err() {
         return Ok(false);
     }
     #[cfg(unix)]
     let remove_result = anchor.remove_sibling(&probe_path);
     #[cfg(not(unix))]
-    let remove_result = fs::remove_file(&probe_path);
+    let remove_result = std::fs::remove_file(&probe_path);
     remove_result.map_err(|source| Error::Io {
         path: probe_path,
         source,
@@ -694,16 +694,13 @@ pub(crate) fn sqlite_error(context: &str, source: rusqlite::Error) -> Error {
 }
 
 #[cfg(unix)]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "Windows metadata conversion shares this fallible cross-platform contract"
-)]
-fn file_identity_from_metadata(
-    _path: &Path,
-    metadata: &fs::Metadata,
-) -> Result<FileIdentity, Error> {
+fn file_identity_from_handle(path: &Path, handle: &File) -> Result<FileIdentity, Error> {
     use std::os::unix::fs::MetadataExt;
 
+    let metadata = handle.metadata().map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
     Ok((
         metadata.size(),
         metadata.mtime(),
@@ -713,19 +710,40 @@ fn file_identity_from_metadata(
     ))
 }
 
+/// Reads Windows file identity straight from an open handle.
+///
+/// `std::os::windows::fs::MetadataExt::file_index` is still unstable, so the identity comes from
+/// `GetFileInformationByHandle`, which is stable Win32 and also supplies the volume serial number
+/// that [`same_file`] needs to tell apart identically indexed files on different volumes.
 #[cfg(windows)]
-fn file_identity_from_metadata(
-    path: &Path,
-    metadata: &fs::Metadata,
-) -> Result<FileIdentity, Error> {
+#[expect(
+    unsafe_code,
+    reason = "GetFileInformationByHandle is the stable Win32 source of volume and file index identity"
+)]
+fn file_identity_from_handle(path: &Path, handle: &File) -> Result<FileIdentity, Error> {
     use std::io;
-    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::io::AsRawHandle;
+
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
 
     const WINDOWS_TO_UNIX_SECONDS: u64 = 11_644_473_600;
     const TICKS_PER_SECOND: u64 = 10_000_000;
     const NANOS_PER_TICK: u64 = 100;
 
-    let modified = metadata.last_write_time();
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `handle` is a live, caller-owned file handle that outlives this call, and
+    // `information` is a writable record of exactly the size the API documents.
+    unsafe { GetFileInformationByHandle(HANDLE(handle.as_raw_handle()), &raw mut information) }
+        .map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source: io::Error::other(format!("GetFileInformationByHandle failed: {source}")),
+        })?;
+
+    let modified = (u64::from(information.ftLastWriteTime.dwHighDateTime) << 32)
+        | u64::from(information.ftLastWriteTime.dwLowDateTime);
     let seconds = modified
         .checked_div(TICKS_PER_SECOND)
         .and_then(|value| value.checked_sub(WINDOWS_TO_UNIX_SECONDS))
@@ -739,25 +757,21 @@ fn file_identity_from_metadata(
         })?;
     let nanoseconds = i64::try_from((modified % TICKS_PER_SECOND) * NANOS_PER_TICK)
         .expect("subsecond Windows timestamp always fits i64");
-    let file_index = metadata.file_index().ok_or_else(|| Error::Io {
-        path: path.to_path_buf(),
-        source: io::Error::new(io::ErrorKind::Unsupported, "file index is unavailable"),
-    })?;
-    Ok((metadata.file_size(), seconds, nanoseconds, 0, file_index))
+    let size = (u64::from(information.nFileSizeHigh) << 32) | u64::from(information.nFileSizeLow);
+    let file_index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+
+    Ok((
+        size,
+        seconds,
+        nanoseconds,
+        u64::from(information.dwVolumeSerialNumber),
+        file_index,
+    ))
 }
 
 #[cfg(not(any(unix, windows)))]
-pub(crate) fn file_identity(path: &Path) -> Result<FileIdentity, Error> {
-    Err(Error::UnsupportedPlatform {
-        platform: format!("{} ({})", std::env::consts::OS, path.display()),
-    })
-}
-
-#[cfg(not(any(unix, windows)))]
-fn file_identity_from_metadata(
-    path: &Path,
-    _metadata: &fs::Metadata,
-) -> Result<FileIdentity, Error> {
+fn file_identity_from_handle(path: &Path, _handle: &File) -> Result<FileIdentity, Error> {
     Err(Error::UnsupportedPlatform {
         platform: format!("{} ({})", std::env::consts::OS, path.display()),
     })
@@ -795,7 +809,7 @@ mod tests {
             &Target::File(link.clone()),
             ConnectionOptions::default(),
             || {
-                fs::remove_file(&link).expect("old database symlink should be removed");
+                std::fs::remove_file(&link).expect("old database symlink should be removed");
                 symlink("replacement.db", &link)
                     .expect("replacement database symlink should be created");
             },
