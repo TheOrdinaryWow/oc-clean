@@ -3,14 +3,22 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
 
 use crate::cli::{CleanArgs, Cli, Commands, LogMode};
+use crate::error::Error;
+use crate::paths::Target;
 use crate::reclaim::headroom::FreeSpaceProvider;
-use crate::safety::holders::{Completeness, HolderInspector, Inspection, Verdict};
+use crate::safety::holders::{Completeness, HolderInfo, HolderInspector, Inspection, Verdict};
 use clap::Parser;
 use rusqlite::Connection;
 
-use super::command::{RuntimeContext, run_with, run_with_git_path};
+use super::command::{
+    RuntimeContext, inspect_read_only_phases_for_test,
+    inspect_read_only_phases_sequential_for_test, run_with, run_with_git_path,
+};
 use super::signal::SignalController;
 use super::{PhaseId, PhaseObserver, PhaseOperation};
 
@@ -26,6 +34,22 @@ impl HolderInspector for NotHeldInspector {
     fn inspect(&self, _database_path: &Path) -> Inspection {
         Inspection {
             verdict: Verdict::NotHeld,
+            completeness: Completeness::CompleteForVisibleProcesses,
+        }
+    }
+}
+
+struct HeldInspector;
+
+impl HolderInspector for HeldInspector {
+    fn inspect(&self, database_path: &Path) -> Inspection {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        Inspection {
+            verdict: Verdict::Held(vec![HolderInfo {
+                pid: 42,
+                process_name: Some("fixture-holder".to_owned()),
+                matched_paths: vec![database_path.to_owned()],
+            }]),
             completeness: Completeness::CompleteForVisibleProcesses,
         }
     }
@@ -68,6 +92,20 @@ impl PhaseObserver for StorageMutationObserver {
 struct Recorder {
     phases: RefCell<Vec<PhaseId>>,
     operations: RefCell<Vec<(PhaseId, PhaseOperation)>>,
+}
+
+#[derive(Default)]
+struct ThreadSafeRecorder {
+    phases: Mutex<Vec<PhaseId>>,
+}
+
+impl PhaseObserver for ThreadSafeRecorder {
+    fn entered(&self, phase: PhaseId) {
+        self.phases
+            .lock()
+            .expect("phase recorder should not be poisoned")
+            .push(phase);
+    }
 }
 
 impl PhaseObserver for Recorder {
@@ -295,6 +333,210 @@ fn selection_operations_are_attributed_to_the_normative_phases() {
             (PhaseId::P13, PhaseOperation::OrphanSelection),
         ]
     );
+}
+
+#[test]
+fn read_only_phase_failures_surface_in_declaration_order() {
+    let fixture = fixture(false);
+    let mut cli = cli(&fixture.database_path, false);
+    cli.apply = true;
+    let mut arguments = arguments(false);
+    arguments.archived = false;
+    arguments.orphans = false;
+
+    for _ in 0..20 {
+        let error = run_with(
+            &cli,
+            &arguments,
+            &mut Cursor::new(Vec::<u8>::new()),
+            &mut Vec::new(),
+            &UnlimitedSpace,
+            &HeldInspector,
+            RuntimeContext {
+                stdin_is_terminal: false,
+                stdout_is_terminal: false,
+            },
+            &SignalController::new(),
+            &ThreadSafeRecorder::default(),
+        )
+        .expect_err("holder and selector phases should both fail");
+
+        assert!(matches!(error, Error::DatabaseBusy { .. }));
+        assert_eq!(error.exit_code(), 5);
+    }
+}
+
+#[test]
+fn independent_read_only_phases_are_entered_before_results_are_joined() {
+    let fixture = fixture(false);
+    let mut cli = cli(&fixture.database_path, false);
+    cli.apply = false;
+    let mut arguments = arguments(false);
+    arguments.archived = false;
+    arguments.orphans = false;
+    let recorder = ThreadSafeRecorder::default();
+
+    let _ = run_with(
+        &cli,
+        &arguments,
+        &mut Cursor::new(Vec::<u8>::new()),
+        &mut Vec::new(),
+        &UnlimitedSpace,
+        &HeldInspector,
+        RuntimeContext {
+            stdin_is_terminal: false,
+            stdout_is_terminal: false,
+        },
+        &SignalController::new(),
+        &recorder,
+    );
+
+    assert_eq!(
+        *recorder
+            .phases
+            .lock()
+            .expect("phase recorder should not be poisoned"),
+        vec![PhaseId::P1, PhaseId::P2, PhaseId::P3, PhaseId::P4]
+    );
+}
+
+#[test]
+fn dry_run_and_apply_report_identical_selection_impact() {
+    fn report(fixture: &Fixture, apply: bool) -> serde_json::Value {
+        let mut cli = cli(&fixture.database_path, false);
+        cli.apply = apply;
+        let mut arguments = arguments(false);
+        arguments.orphans = false;
+        arguments.no_vacuum = true;
+        arguments.gc_snapshots = false;
+        arguments.json = true;
+        let mut output = Vec::new();
+
+        run_with(
+            &cli,
+            &arguments,
+            &mut Cursor::new(Vec::<u8>::new()),
+            &mut output,
+            &UnlimitedSpace,
+            &NotHeldInspector,
+            RuntimeContext {
+                stdin_is_terminal: false,
+                stdout_is_terminal: false,
+            },
+            &SignalController::new(),
+            &ThreadSafeRecorder::default(),
+        )
+        .expect("clean should succeed");
+
+        serde_json::from_slice(&output).expect("clean output should be JSON")
+    }
+
+    let dry_run = report(&fixture(false), false);
+    let applied = report(&fixture(false), true);
+
+    assert_eq!(dry_run["impact"], applied["impact"]);
+    assert_eq!(dry_run["impact"]["total_sessions"], 2);
+    assert_eq!(applied["deleted_sessions"], 2);
+}
+
+#[test]
+fn parallel_read_only_phases_match_the_sequential_reference() {
+    let fixture = fixture(false);
+    let target = Target::File(fixture.database_path.clone());
+    let cli = cli(&fixture.database_path, false);
+    let arguments = arguments(false);
+
+    let sequential = inspect_read_only_phases_sequential_for_test(
+        &target,
+        &fixture.database_path,
+        &cli,
+        &arguments,
+        &NotHeldInspector,
+    )
+    .expect("sequential read-only phases should succeed");
+    let parallel = inspect_read_only_phases_for_test(
+        &target,
+        &fixture.database_path,
+        &cli,
+        &arguments,
+        &NotHeldInspector,
+    )
+    .expect("parallel read-only phases should succeed");
+
+    assert_eq!(parallel, sequential);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+#[ignore = "performance characterization on a large fixture"]
+fn read_only_phase_parallel_benchmark_large_fixture() {
+    let fixture = Fixture::build(&FixtureConfig {
+        project_count: 100,
+        session_count: 5_000,
+        archived_session_count: 5_000,
+        messages_per_session: 2,
+        parts_per_message: 2,
+        blob_size_per_part: 1_024,
+        ..FixtureConfig::default()
+    })
+    .expect("large fixture should build");
+    let target = Target::File(fixture.database_path.clone());
+    let cli = cli(&fixture.database_path, false);
+    let arguments = arguments(false);
+    let holder_inspector = crate::safety::holders::linux::LinuxHolderInspector::default();
+    let mut sequential_times = Vec::with_capacity(9);
+    let mut parallel_times = Vec::with_capacity(9);
+
+    for iteration in 0..9 {
+        let measure_sequential = || {
+            let started = Instant::now();
+            inspect_read_only_phases_sequential_for_test(
+                &target,
+                &fixture.database_path,
+                &cli,
+                &arguments,
+                &holder_inspector,
+            )
+            .expect("sequential read-only phases should succeed");
+            started.elapsed()
+        };
+        let measure_parallel = || {
+            let started = Instant::now();
+            inspect_read_only_phases_for_test(
+                &target,
+                &fixture.database_path,
+                &cli,
+                &arguments,
+                &holder_inspector,
+            )
+            .expect("parallel read-only phases should succeed");
+            started.elapsed()
+        };
+
+        if iteration % 2 == 0 {
+            sequential_times.push(measure_sequential());
+            parallel_times.push(measure_parallel());
+        } else {
+            parallel_times.push(measure_parallel());
+            sequential_times.push(measure_sequential());
+        }
+    }
+
+    sequential_times.sort_unstable();
+    parallel_times.sort_unstable();
+    let sequential = sequential_times[sequential_times.len() / 2];
+    let parallel = parallel_times[parallel_times.len() / 2];
+    let speedup = sequential.as_secs_f64() / parallel.as_secs_f64();
+    println!(
+        "fixture_sessions=10000 fixture_parts=40000 sequential_ms={:.3} parallel_ms={:.3} speedup={speedup:.3}x",
+        duration_ms(sequential),
+        duration_ms(parallel),
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
 }
 
 #[test]

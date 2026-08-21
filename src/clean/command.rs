@@ -12,14 +12,15 @@ use crate::delete::projects::{self, ProjectIds};
 use crate::delete::sessions::{self, DeleteOptions, DeletionReport};
 use crate::doctor::foreign_key_check;
 use crate::error::Error;
+use crate::parallel;
 use crate::paths::{self, DatabaseOptions, DerivedPaths, Environment, Platform, Target};
 use crate::reclaim::headroom::{FreeSpaceProvider, Fs2FreeSpaceProvider};
-use crate::reclaim::incremental::{IncrementalVacuumError, check_auto_vacuum};
+use crate::reclaim::incremental::{check_auto_vacuum, IncrementalVacuumError};
 use crate::report::format::Style;
 use crate::report::impact::{self, Impact};
 use crate::report::progress;
-use crate::safety::confirm::{ConfirmationDecision, ConfirmationOptions, ImpactSummary, confirm};
-use crate::safety::holders::{CommandMode, GateDecision, HolderInspector, inspect_and_decide};
+use crate::safety::confirm::{confirm, ConfirmationDecision, ConfirmationOptions, ImpactSummary};
+use crate::safety::holders::{inspect_and_decide, CommandMode, GateDecision, HolderInspector};
 use crate::select::orphans::RawOrphans;
 use crate::select::predicates::SessionIds;
 
@@ -28,7 +29,7 @@ use super::output::{self, CleanReport};
 use super::progress::ProgressPhaseObserver;
 use super::selection;
 use super::signal::SignalController;
-use super::{PhaseId, PhaseObserver, PhaseOperation, reclaim};
+use super::{reclaim, PhaseId, PhaseObserver, PhaseOperation};
 
 #[derive(Clone, Copy)]
 pub(super) struct RuntimeContext {
@@ -72,7 +73,7 @@ pub(super) fn run_with<R, P>(
     input: &mut R,
     output: &mut dyn Write,
     free_space: &P,
-    holder_inspector: &dyn HolderInspector,
+    holder_inspector: &(dyn HolderInspector + Sync),
     runtime: RuntimeContext,
     signals: &SignalController,
     observer: &dyn PhaseObserver,
@@ -102,7 +103,7 @@ pub(super) fn run_with_git_path<R, P>(
     input: &mut R,
     output: &mut dyn Write,
     free_space: &P,
-    holder_inspector: &dyn HolderInspector,
+    holder_inspector: &(dyn HolderInspector + Sync),
     runtime: RuntimeContext,
     signals: &SignalController,
     observer: &dyn PhaseObserver,
@@ -116,32 +117,15 @@ where
     let target = database_target(cli)?;
     let database_path = file_path(&target)?;
     let paths = derived_paths(database_path)?;
-    let inspection_database = db::open_read_only(&target, ConnectionOptions::default())?;
     phase(observer, PhaseId::P2);
-    db::schema::inspect(inspection_database.connection(), cli.force_schema)?;
-    let pre_delete_space = crate::analyze::space::analyze(&inspection_database)?.file;
-    let hard_links = inspection_database.capabilities().hard_links;
-    drop(inspection_database);
-
     phase(observer, PhaseId::P3);
-    let (_, holder_decision) = inspect_and_decide(
-        holder_inspector,
-        database_path,
-        CommandMode::Clean { apply: cli.apply },
-        cli.force,
-    );
-    if matches!(holder_decision, GateDecision::Warn) {
-        warn!("database holder state requires attention");
-    }
-    holder_decision.into_result()?;
-
     if arguments.incremental {
         phase(observer, PhaseId::P3b);
-        let database = db::open_read_only(&target, ConnectionOptions::default())?;
-        check_auto_vacuum(&database).map_err(incremental_precondition_error)?;
     }
     phase(observer, PhaseId::P4);
-    ensure_selector(arguments)?;
+    let (pre_delete_space, hard_links) =
+        inspect_read_only_phases(&target, database_path, cli, arguments, holder_inspector)?;
+    stop_before_mutation_if_cancelled(signals)?;
 
     let database = db::open_read_write(&target, ConnectionOptions::default())?;
     signals.set_interrupt_handle(database.interrupt_handle());
@@ -510,6 +494,121 @@ fn phase(observer: &dyn PhaseObserver, phase: PhaseId) {
     info!(phase = %phase, "clean phase entered");
 }
 
+fn inspect_read_only_phases(
+    target: &Target,
+    database_path: &Path,
+    cli: &Cli,
+    arguments: &CleanArgs,
+    holder_inspector: &(dyn HolderInspector + Sync),
+) -> Result<(crate::analyze::space::FileSpace, bool), Error> {
+    let job_count = usize::from(arguments.incremental) + 3;
+    parallel::group("clean", job_count, |group| {
+        let database = group.spawn("inspecting schema and space", || {
+            inspect_database(target, cli.force_schema)
+        });
+        let holders = group.spawn("scanning database holders", || {
+            Ok(inspect_holder_decision(
+                holder_inspector,
+                database_path,
+                cli,
+            ))
+        });
+        let incremental = arguments.incremental.then(|| {
+            group.spawn("checking incremental auto-vacuum", || {
+                let database = db::open_read_only(target, ConnectionOptions::default())?;
+                check_auto_vacuum(&database).map_err(incremental_precondition_error)
+            })
+        });
+        let selectors = group.spawn("validating selectors", || ensure_selector(arguments));
+
+        let database = database.join();
+        let holders = holders.join();
+        let incremental = incremental.map(parallel::JobHandle::join);
+        let selectors = selectors.join();
+
+        let database = database?;
+        apply_holder_decision(holders?)?;
+        if let Some(incremental) = incremental {
+            incremental?;
+        }
+        selectors?;
+        Ok(database)
+    })
+}
+
+#[cfg(test)]
+pub(super) fn inspect_read_only_phases_for_test(
+    target: &Target,
+    database_path: &Path,
+    cli: &Cli,
+    arguments: &CleanArgs,
+    holder_inspector: &(dyn HolderInspector + Sync),
+) -> Result<(crate::analyze::space::FileSpace, bool), Error> {
+    inspect_read_only_phases(target, database_path, cli, arguments, holder_inspector)
+}
+
+#[cfg(test)]
+pub(super) fn inspect_read_only_phases_sequential_for_test(
+    target: &Target,
+    database_path: &Path,
+    cli: &Cli,
+    arguments: &CleanArgs,
+    holder_inspector: &(dyn HolderInspector + Sync),
+) -> Result<(crate::analyze::space::FileSpace, bool), Error> {
+    let database = inspect_database(target, cli.force_schema)?;
+    inspect_holders(holder_inspector, database_path, cli)?;
+    if arguments.incremental {
+        let connection = db::open_read_only(target, ConnectionOptions::default())?;
+        check_auto_vacuum(&connection).map_err(incremental_precondition_error)?;
+    }
+    ensure_selector(arguments)?;
+    Ok(database)
+}
+
+fn inspect_database(
+    target: &Target,
+    force_schema: bool,
+) -> Result<(crate::analyze::space::FileSpace, bool), Error> {
+    let database = db::open_read_only(target, ConnectionOptions::default())?;
+    db::schema::inspect(database.connection(), force_schema)?;
+    let file_space = crate::analyze::space::analyze(&database)?.file;
+    Ok((file_space, database.capabilities().hard_links))
+}
+
+#[cfg(test)]
+fn inspect_holders(
+    holder_inspector: &(dyn HolderInspector + Sync),
+    database_path: &Path,
+    cli: &Cli,
+) -> Result<(), Error> {
+    apply_holder_decision(inspect_holder_decision(
+        holder_inspector,
+        database_path,
+        cli,
+    ))
+}
+
+fn inspect_holder_decision(
+    holder_inspector: &(dyn HolderInspector + Sync),
+    database_path: &Path,
+    cli: &Cli,
+) -> GateDecision {
+    inspect_and_decide(
+        holder_inspector,
+        database_path,
+        CommandMode::Clean { apply: cli.apply },
+        cli.force,
+    )
+    .1
+}
+
+fn apply_holder_decision(holder_decision: GateDecision) -> Result<(), Error> {
+    if matches!(holder_decision, GateDecision::Warn) {
+        warn!("database holder state requires attention");
+    }
+    holder_decision.into_result()
+}
+
 fn database_target(cli: &Cli) -> Result<Target, Error> {
     let environment = Environment::from_iter(std::env::vars_os());
     paths::database_target(
@@ -554,17 +653,17 @@ fn current_platform() -> Result<Platform, Error> {
 }
 
 #[cfg(target_os = "linux")]
-fn platform_inspector() -> Box<dyn HolderInspector> {
+fn platform_inspector() -> Box<dyn HolderInspector + Sync> {
     Box::new(crate::safety::holders::linux::LinuxHolderInspector::default())
 }
 
 #[cfg(target_os = "macos")]
-fn platform_inspector() -> Box<dyn HolderInspector> {
+fn platform_inspector() -> Box<dyn HolderInspector + Sync> {
     Box::new(crate::safety::holders::macos::MacosHolderInspector)
 }
 
 #[cfg(windows)]
-fn platform_inspector() -> Box<dyn HolderInspector> {
+fn platform_inspector() -> Box<dyn HolderInspector + Sync> {
     Box::new(crate::safety::holders::windows::WindowsHolderInspector)
 }
 
