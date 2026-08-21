@@ -1,7 +1,7 @@
 use std::fs;
 #[cfg(unix)]
 use std::io::{BufRead, BufReader, Read};
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use std::process::Command;
 #[cfg(unix)]
 use std::process::Stdio;
@@ -62,7 +62,7 @@ fn clean_with_real_holder_preserves_preview_and_refuses_apply() {
     );
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn unsupported_platform_binary_produces_exit_nine() {
     let fixture = Fixture::build(&FixtureConfig::default()).expect("fixture should build");
@@ -90,7 +90,10 @@ fn unsupported_platform_binary_produces_exit_nine() {
     );
 }
 
-#[cfg(target_arch = "x86_64")]
+/// Flips the first platform-match branch so the production fallback sees the real OS.
+///
+/// The byte pattern is this target's codegen, which is why the caller is scoped to it.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn inject_unsupported_platform(path: &std::path::Path) {
     // Rust deduplicates the host OS constant and its first match literal. Flip the copied
     // binary's first equality branch so the unchanged production fallback receives the real OS.
