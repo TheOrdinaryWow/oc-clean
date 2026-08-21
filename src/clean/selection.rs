@@ -4,7 +4,7 @@ use crate::cli::CleanArgs;
 use crate::db::{DatabaseConnection, ReadWrite};
 use crate::error::Error;
 use crate::report::impact::{ImpactSelection, OlderThanSelection, ProjectSelection};
-use crate::select::predicates::{self, CaseSensitivity, SessionIds};
+use crate::select::predicates::{self, CaseSensitivity, PathSelection, SessionIds};
 use crate::select::{retention, subtree};
 
 pub(super) fn retention_set(
@@ -24,8 +24,13 @@ pub(super) fn predicate_candidates(
     if let Some(age) = arguments.older_than {
         sets.push(predicates::older_than(database, age, now_ms)?);
     }
-    if let Some(project) = &arguments.project {
-        sets.push(predicates::project(database, project, case_sensitivity())?);
+    if let Some((path_or_glob, selection)) = path_selection(arguments) {
+        sets.push(predicates::project(
+            database,
+            path_or_glob,
+            case_sensitivity(),
+            selection,
+        )?);
     }
     if let Some(size) = arguments.larger_than {
         sets.push(subtree::larger_than(database, size)?);
@@ -55,19 +60,33 @@ pub(super) fn impact_selection(arguments: &CleanArgs, now_ms: i64) -> ImpactSele
             .older_than
             .map(|age| OlderThanSelection { age, now_ms }),
         archived: arguments.archived,
-        project: arguments
-            .project
-            .as_ref()
-            .map(|path_or_glob| ProjectSelection {
-                path_or_glob: path_or_glob.clone(),
-                case_sensitivity: case_sensitivity(),
-            }),
+        project: path_selection(arguments).map(|(path_or_glob, selection)| ProjectSelection {
+            path_or_glob: path_or_glob.to_owned(),
+            case_sensitivity: case_sensitivity(),
+            selection,
+        }),
         larger_than: arguments.larger_than,
         keep_recent: arguments.keep_recent,
         sweep_orphans: arguments.orphans,
         prune_empty_projects: arguments.prune_empty_projects,
         preview_top: arguments.top,
     }
+}
+
+/// Resolves the mutually exclusive `--include` / `--exclude` pair into one path predicate.
+///
+/// Clap rejects supplying both, so at most one is ever present.
+pub(super) fn path_selection(arguments: &CleanArgs) -> Option<(&str, PathSelection)> {
+    arguments
+        .include
+        .as_deref()
+        .map(|path_or_glob| (path_or_glob, PathSelection::Include))
+        .or_else(|| {
+            arguments
+                .exclude
+                .as_deref()
+                .map(|path_or_glob| (path_or_glob, PathSelection::Exclude))
+        })
 }
 
 pub(super) fn now_ms() -> Result<i64, Error> {

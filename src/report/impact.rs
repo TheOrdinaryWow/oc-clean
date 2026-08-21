@@ -17,7 +17,9 @@ use crate::error::Error;
 use crate::paths::DerivedPaths;
 use crate::report::format::{self, Align, Grid, Style};
 use crate::select::orphans;
-use crate::select::predicates::{self, CaseSensitivity, SessionIds, intersect_candidate_sets};
+use crate::select::predicates::{
+    self, CaseSensitivity, PathSelection, SessionIds, intersect_candidate_sets,
+};
 use crate::select::{retention, subtree};
 
 /// Tables whose rows can be removed by session deletion, event cleanup, or project pruning.
@@ -95,6 +97,7 @@ pub struct OlderThanSelection {
 pub struct ProjectSelection {
     pub path_or_glob: String,
     pub case_sensitivity: CaseSensitivity,
+    pub selection: PathSelection,
 }
 
 /// Predicate, retention, and orphan options used to calculate deletion impact.
@@ -117,6 +120,7 @@ pub struct ImpactSelection {
 pub struct ProjectSelectionImpact {
     pub path_or_glob: String,
     pub matched_sessions: u64,
+    pub selection: PathSelection,
 }
 
 /// User-facing counts and byte projections for one cleanup selection.
@@ -124,6 +128,8 @@ pub struct ProjectSelectionImpact {
 pub struct ImpactSummary {
     pub root_session_count: u64,
     pub total_session_count: u64,
+    /// Every session in the database, so a reviewer can see the selection's share of the whole.
+    pub database_session_count: u64,
     pub table_rows: BTreeMap<String, u64>,
     pub orphan_row_count: u64,
     pub storage_file_count: u64,
@@ -225,6 +231,7 @@ pub fn summarize<Access>(
         summary: ImpactSummary {
             root_session_count: planned.root_count,
             total_session_count: to_u64_len(planned.session_ids.len()),
+            database_session_count: database_session_count(database)?,
             table_rows: database_impact.table_rows,
             orphan_row_count: database_impact.orphan_row_count,
             storage_file_count: to_u64_len(assets.storage_files.len()),
@@ -291,14 +298,17 @@ fn write_section(
         format::bytes(summary.estimated_post_vacuum_bytes),
     )?;
     if let Some(project) = &summary.project_selection {
-        format::note(
-            output,
-            &format!(
-                "Project `{}` selects ALL {} member sessions regardless of each session directory",
+        let note = match project.selection {
+            PathSelection::Include => format!(
+                "--include `{}` selects ALL {} member sessions regardless of each session directory",
                 project.path_or_glob, project.matched_sessions
             ),
-            style,
-        )?;
+            PathSelection::Exclude => format!(
+                "--exclude `{}` selects the {} sessions outside it, regardless of each session directory",
+                project.path_or_glob, project.matched_sessions
+            ),
+        };
+        format::note(output, &note, style)?;
     }
 
     write_preview(summary, output, style)?;
@@ -569,11 +579,16 @@ fn candidate_roots<Access>(
         sets.push(subtree::larger_than(database, threshold)?);
     }
     let project_selection = if let Some(project) = &selection.project {
-        let project_sessions =
-            predicates::project(database, &project.path_or_glob, project.case_sensitivity)?;
+        let project_sessions = predicates::project(
+            database,
+            &project.path_or_glob,
+            project.case_sensitivity,
+            project.selection,
+        )?;
         let impact = ProjectSelectionImpact {
             path_or_glob: project.path_or_glob.clone(),
             matched_sessions: to_u64_len(project_sessions.len()),
+            selection: project.selection,
         };
         sets.push(project_sessions);
         Some(impact)
@@ -618,6 +633,17 @@ fn selection_roots<Access>(
 /// A project is pruned when deleting `session_ids` leaves it with no sessions. When
 /// `prune_preexisting_empty` is set, projects that already hold no session at all are pruned too,
 /// exactly as the applied path does.
+/// Counts every session in the database, the denominator for the selection's share.
+fn database_session_count<Access>(database: &DatabaseConnection<Access>) -> Result<u64, Error> {
+    let count = database
+        .connection()
+        .query_row("SELECT COUNT(*) FROM session", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(|source| sqlite_error("counting database sessions", source))?;
+    Ok(u64::try_from(count).unwrap_or(u64::MAX))
+}
+
 fn projects_emptied_by<Access>(
     database: &DatabaseConnection<Access>,
     session_ids: &SessionIds,
@@ -1215,6 +1241,7 @@ mod tests {
                 project: Some(ProjectSelection {
                     path_or_glob: "/fixture/project-0".to_owned(),
                     case_sensitivity: CaseSensitivity::Sensitive,
+                    selection: PathSelection::Include,
                 }),
                 ..ImpactSelection::default()
             },

@@ -31,6 +31,8 @@ All three are omitted together when the session row could not be read, which hap
 
 `oc-clean clean --json` writes its own object whose `impact` member mirrors the dry-run summary. `impact.preview` is an array of the largest selected sessions, capped by `--top`, using the same entry shape and the same optional description fields as `largest_sessions`.
 
+`impact.total_sessions` counts the selection and `impact.database_sessions` counts every session in the database, so a consumer can compute the selection's share without a second query. An interactive run requires a second confirmation when `total_sessions * 2 >= database_sessions`.
+
 ## Failure objects
 
 A failed command writes one JSON object to **stderr** when `--json` is in effect, leaving stdout carrying either exactly one report object or nothing at all. The failure object contains:

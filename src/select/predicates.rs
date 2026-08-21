@@ -130,7 +130,21 @@ pub fn archived<Access>(database: &DatabaseConnection<Access>) -> Result<Session
     query_session_ids(database, ARCHIVED_SQL, "querying archived sessions")
 }
 
-/// Selects sessions belonging to a project matched by worktree or registered project directory.
+/// Whether a project-path pattern selects the sessions it matches or the sessions it does not.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PathSelection {
+    /// Select sessions whose project path matches the pattern.
+    Include,
+    /// Select sessions whose project path does not match the pattern.
+    Exclude,
+}
+
+/// Selects sessions by project worktree or registered project directory.
+///
+/// A session matches when its project worktree or any of that project's registered directories
+/// matches the pattern. [`PathSelection::Exclude`] returns the complement of that match over every
+/// session the join reaches, evaluated per session rather than per directory row, so a project with
+/// several registered directories is excluded when any one of them matches.
 ///
 /// Glob syntax is activated by `*`, `?`, or `[`. Literal paths have trailing separators removed.
 ///
@@ -142,6 +156,7 @@ pub fn project<Access>(
     database: &DatabaseConnection<Access>,
     path_or_glob: &str,
     case_sensitivity: CaseSensitivity,
+    selection: PathSelection,
 ) -> Result<SessionIds, Error> {
     let matcher = ProjectPathMatcher::new(path_or_glob, case_sensitivity)?;
     let mut statement = database
@@ -152,6 +167,7 @@ pub fn project<Access>(
         .query([])
         .map_err(|source| sqlite_error("querying project sessions", source))?;
     let mut selected = SessionIds::new();
+    let mut visited = SessionIds::new();
 
     while let Some(row) = rows
         .next()
@@ -171,11 +187,18 @@ pub fn project<Access>(
                 .as_deref()
                 .is_some_and(|path| matcher.matches(path))
         {
-            selected.insert(session_id);
+            selected.insert(session_id.clone());
         }
+        visited.insert(session_id);
     }
 
-    Ok(selected)
+    Ok(match selection {
+        PathSelection::Include => selected,
+        PathSelection::Exclude => {
+            visited.retain(|session_id| !selected.contains(session_id));
+            visited
+        }
+    })
 }
 
 /// Applies project path normalization, case policy, and optional glob matching to one stored path.
@@ -575,11 +598,23 @@ mod tests {
         let database = open_fixture(&fixture);
 
         assert_eq!(
-            project(&database, "/fixture/project-0", CaseSensitivity::Sensitive,).unwrap(),
+            project(
+                &database,
+                "/fixture/project-0",
+                CaseSensitivity::Sensitive,
+                PathSelection::Include,
+            )
+            .unwrap(),
             ids(&["ses_0", "ses_2"])
         );
         assert_eq!(
-            project(&database, "/aliases/mono", CaseSensitivity::Sensitive).unwrap(),
+            project(
+                &database,
+                "/aliases/mono",
+                CaseSensitivity::Sensitive,
+                PathSelection::Include,
+            )
+            .unwrap(),
             ids(&["ses_1", "ses_3"])
         );
     }
@@ -654,6 +689,7 @@ mod tests {
                 &open_fixture(&fixture),
                 "/fixture/project-[02]",
                 CaseSensitivity::Sensitive,
+                PathSelection::Include,
             )
             .unwrap(),
             ids(&["ses_0", "ses_2", "ses_3", "ses_5"])

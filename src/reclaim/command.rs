@@ -325,6 +325,7 @@ where
         &ImpactSummary {
             operation: "Vacuum",
             details: &details,
+            escalation: None,
         },
         ConfirmationOptions {
             stdin_is_terminal: runtime.stdin_is_terminal,

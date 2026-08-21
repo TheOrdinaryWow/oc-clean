@@ -111,7 +111,8 @@ mod tests {
     fn arguments() -> CleanArgs {
         CleanArgs {
             older_than: None,
-            project: None,
+            include: None,
+            exclude: None,
             larger_than: None,
             archived: true,
             orphans: false,

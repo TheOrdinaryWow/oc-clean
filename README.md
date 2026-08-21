@@ -77,7 +77,7 @@ OCC_DB=/var/lib/opencode/opencode.db oc-clean doctor
 
 ### `clean`
 
-`clean` requires at least one selector: `--older-than`, `--project`, `--larger-than`, `--archived`, or `--orphans`. Multiple session predicates are intersected and subtree selection preserves parent-child consistency. `--keep-recent N` protects the `N` most recently active root sessions per project, counted per project against root sessions rather than against every session; it retains nothing by default, so the selection is exactly what the selectors describe.
+`clean` requires at least one selector: `--older-than`, `--include`, `--exclude`, `--larger-than`, `--archived`, or `--orphans`. Multiple session predicates are intersected and subtree selection preserves parent-child consistency. `--include` and `--exclude` are two directions of the same project-path predicate and cannot be combined; supplying both is a usage error. `--keep-recent N` protects the `N` most recently active root sessions per project, counted per project against root sessions rather than against every session; it retains nothing by default, so the selection is exactly what the selectors describe.
 
 ```sh
 # Preview root session subtrees inactive for at least 90 days.
@@ -87,7 +87,10 @@ oc-clean clean --older-than 90D --dry-run
 oc-clean clean --archived --larger-than 250MB --dry-run
 
 # Preview all matching sessions for project paths selected by the glob.
-oc-clean clean --project '/work/legacy-*' --keep-recent 20 --dry-run
+oc-clean clean --include '/work/legacy-*' --keep-recent 20 --dry-run
+
+# Preview everything outside one project, which is the complement of the same glob.
+oc-clean clean --exclude '/work/keep-this' --older-than 30D --dry-run
 
 # Preview session-shaped orphan events, dangling sessions, and external orphans.
 oc-clean clean --orphans --dry-run
@@ -125,6 +128,7 @@ The table is the complete set of long flags defined by the current clap interfac
 
 | Scope | Flag | Environment | Purpose |
 |---|---|---|---|
+| Global | `--version` | CLI only | Print the version recorded in `Cargo.toml` and exit. `-V` is the short form. |
 | Global | `--db <PATH>` | `OCC_DB` | Select the database path or `:memory:` for a fresh in-memory analysis target. This takes precedence over `OPENCODE_DB` and platform discovery. |
 | Global | `--channel <NAME>` | `OCC_CHANNEL` | Select the OpenCode channel used for the discovered database filename. |
 | Global | `--log <MODE>` | `OCC_LOG` | Select stderr diagnostics: `off`, `text`, or `json`; default is `off`. Setting `RUST_LOG` implicitly selects `text`. |
@@ -138,7 +142,8 @@ The table is the complete set of long flags defined by the current clap interfac
 | analyze | `--quick` | `OCC_QUICK` | Emit file accounting and row counts without full distributions and rollups. |
 | doctor | `--json` | `OCC_JSON` | Emit one stable JSON diagnostic report on stdout. |
 | clean | `--older-than <AGE>` | `OCC_OLDER_THAN` | Select session subtrees whose latest activity is at least this coarse age. |
-| clean | `--project <PATH_OR_GLOB>` | `OCC_PROJECT` | Select sessions belonging to an exact project path or glob. |
+| clean | `--include <PATH_OR_GLOB>` | `OCC_INCLUDE` | Select sessions belonging to a matching project path or glob. Conflicts with `--exclude`. |
+| clean | `--exclude <PATH_OR_GLOB>` | `OCC_EXCLUDE` | Select sessions whose project path or glob does not match. Conflicts with `--include`. |
 | clean | `--larger-than <SIZE>` | `OCC_LARGER_THAN` | Select session subtrees whose attributable payload reaches this decimal size. |
 | clean | `--archived` | `OCC_ARCHIVED` | Select archived sessions. |
 | clean | `--orphans` | `OCC_ORPHANS` | Include session-shaped orphan events, dangling sessions, and orphan external storage. |
@@ -166,13 +171,15 @@ The executable is named `oc-clean`, while its own environment-variable prefix is
 
 Sub-day duration units and binary size units are explicitly rejected. Incremental vacuum's internal page batches are unrelated to these user-facing grammars.
 
+`--include` and `--exclude` accept a literal path or a glob. Glob mode activates when the value contains `*`, `?`, or `[`: `*` matches any sequence including separators, `?` matches one character, `[abc]` and `[a-z]` match a character class, and a leading `!` inside the brackets negates it. Trailing separators are stripped before matching, so `/work/repo/` and `/work/repo` are the same pattern. Matching follows the platform's filesystem case policy, so it is case-insensitive on macOS and Windows and case-sensitive on Linux. A pattern is compared against each project's worktree and against every directory registered for that project, and matching either one selects all of that project's sessions regardless of each session's own working directory.
+
 ## Safety Model
 
 ### Dry Runs And Confirmation
 
 `analyze` and `doctor` are read-only. `clean` and `vacuum` mutate, and both stop at an interactive confirmation that displays the full impact and accepts only `y` or `yes`, ignoring case and surrounding whitespace. `--dry-run` performs the same selection, compatibility, holder, and headroom work, prints the report, and exits while preserving database bytes. Mutating runs acquire SQLite's exclusive lock before touching data. Piped input, JSON output, or a missing terminal cannot answer the prompt and therefore refuse with exit code 2 unless `--dangerously-skip-confirm` is supplied.
 
-`--dangerously-skip-confirm` bypasses the confirmation only, and leaves holder, schema, lock, headroom, and integrity gates active. A mistaken selector or database path can therefore execute unattended and delete the wrong data.
+A `clean` selecting at least half of the sessions in the database asks a second, independent question after the first, naming the selected count against the database total; both answers must be affirmative. `--dangerously-skip-confirm` bypasses both prompts, and leaves holder, schema, lock, headroom, and integrity gates active. A mistaken selector or database path can therefore execute unattended and delete the wrong data.
 
 ### Holder Detection
 

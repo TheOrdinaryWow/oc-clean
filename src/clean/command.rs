@@ -19,7 +19,9 @@ use crate::reclaim::incremental::{IncrementalVacuumError, check_auto_vacuum};
 use crate::report::format::Style;
 use crate::report::impact::{self, Impact};
 use crate::report::progress;
-use crate::safety::confirm::{ConfirmationDecision, ConfirmationOptions, ImpactSummary, confirm};
+use crate::safety::confirm::{
+    ConfirmationDecision, ConfirmationOptions, ImpactSummary, confirm, warrants_escalation,
+};
 use crate::safety::holders::{CommandMode, GateDecision, HolderInspector, inspect_and_decide};
 use crate::select::orphans::RawOrphans;
 use crate::select::predicates::SessionIds;
@@ -437,10 +439,21 @@ where
         "Delete {} sessions and {} attributable bytes",
         impact.summary.total_session_count, impact.summary.total_bytes
     );
+    let escalation = warrants_escalation(
+        impact.summary.total_session_count,
+        impact.summary.database_session_count,
+    )
+    .then(|| {
+        format!(
+            "This deletes {} of the {} sessions in the database.",
+            impact.summary.total_session_count, impact.summary.database_session_count
+        )
+    });
     let decision = confirm(
         &ImpactSummary {
             operation: "Clean",
             details: &details,
+            escalation: escalation.as_deref(),
         },
         ConfirmationOptions {
             stdin_is_terminal: runtime.stdin_is_terminal,
@@ -465,7 +478,8 @@ where
 
 fn ensure_selector(arguments: &CleanArgs) -> Result<(), Error> {
     if arguments.older_than.is_some()
-        || arguments.project.is_some()
+        || arguments.include.is_some()
+        || arguments.exclude.is_some()
         || arguments.larger_than.is_some()
         || arguments.archived
         || arguments.orphans
@@ -474,8 +488,9 @@ fn ensure_selector(arguments: &CleanArgs) -> Result<(), Error> {
     } else {
         Err(Error::InvalidArgument {
             argument: "clean selection".to_owned(),
-            reason: "supply --older-than, --project, --larger-than, --archived, or --orphans"
-                .to_owned(),
+            reason:
+                "supply --older-than, --include, --exclude, --larger-than, --archived, or --orphans"
+                    .to_owned(),
         })
     }
 }

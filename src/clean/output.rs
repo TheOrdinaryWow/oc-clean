@@ -121,6 +121,7 @@ fn write_json(
             "impact": {
                 "root_sessions": summary.root_session_count,
                 "total_sessions": summary.total_session_count,
+                "database_sessions": summary.database_session_count,
                 "table_rows": summary.table_rows,
                 "orphan_rows": summary.orphan_row_count,
                 "storage_files": summary.storage_file_count,

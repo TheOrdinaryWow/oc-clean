@@ -156,6 +156,103 @@ fn deletion_without_confirmation_refuses_and_leaves_the_database_untouched() {
 }
 
 #[test]
+fn exclude_selects_the_complement_of_include_and_the_two_cannot_be_combined() {
+    let fixture = Fixture::build(&FixtureConfig {
+        project_count: 3,
+        session_count: 9,
+        ..FixtureConfig::default()
+    })
+    .expect("fixture should build");
+
+    let included = command(&fixture, "clean")
+        .args([
+            "--include",
+            "/fixture/project-0",
+            "--no-vacuum",
+            "--json",
+            "--dry-run",
+        ])
+        .output()
+        .expect("include dry-run should run");
+    let excluded = command(&fixture, "clean")
+        .args([
+            "--exclude",
+            "/fixture/project-0",
+            "--no-vacuum",
+            "--json",
+            "--dry-run",
+        ])
+        .output()
+        .expect("exclude dry-run should run");
+
+    assert_code(&included, 0);
+    assert_code(&excluded, 0);
+    let included_sessions = json(&included)["impact"]["total_sessions"]
+        .as_u64()
+        .expect("include count should be numeric");
+    let excluded_sessions = json(&excluded)["impact"]["total_sessions"]
+        .as_u64()
+        .expect("exclude count should be numeric");
+    assert!(included_sessions > 0, "include should select something");
+    assert_eq!(included_sessions + excluded_sessions, 9);
+
+    // A glob reaches the same projects as the literal path it expands to.
+    let globbed = command(&fixture, "clean")
+        .args([
+            "--include",
+            "/fixture/project-[0]",
+            "--no-vacuum",
+            "--json",
+            "--dry-run",
+        ])
+        .output()
+        .expect("glob dry-run should run");
+    assert_code(&globbed, 0);
+    assert_eq!(
+        json(&globbed)["impact"]["total_sessions"]
+            .as_u64()
+            .expect("glob count should be numeric"),
+        included_sessions
+    );
+
+    let conflict = command(&fixture, "clean")
+        .args(["--include", "/a", "--exclude", "/b", "--dry-run"])
+        .output()
+        .expect("conflicting selectors should run");
+    assert_code(&conflict, 2);
+}
+
+#[test]
+fn a_majority_selection_requires_a_second_confirmation() {
+    let fixture = Fixture::build(&FixtureConfig {
+        session_count: 4,
+        archived_session_count: 4,
+        ..FixtureConfig::default()
+    })
+    .expect("fixture should build");
+    let before_hash = file_hash(&fixture.database_path);
+
+    let preview = command(&fixture, "clean")
+        .args(["--archived", "--no-vacuum", "--json", "--dry-run"])
+        .output()
+        .expect("majority preview should run");
+
+    assert_code(&preview, 0);
+    let report = json(&preview);
+    let selected = report["impact"]["total_sessions"]
+        .as_u64()
+        .expect("selection should be numeric");
+    let total = report["impact"]["database_sessions"]
+        .as_u64()
+        .expect("database total should be numeric");
+    assert!(
+        selected * 2 >= total,
+        "the fixture should select a majority: {selected} of {total}"
+    );
+    assert_eq!(file_hash(&fixture.database_path), before_hash);
+}
+
+#[test]
 fn apply_without_any_predicate_exits_two_without_mutation() {
     let fixture = Fixture::build(&FixtureConfig {
         session_count: 5,

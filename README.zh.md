@@ -77,7 +77,7 @@ OCC_DB=/var/lib/opencode/opencode.db oc-clean doctor
 
 ### `clean`
 
-`clean` 至少需要一个选择器：`--older-than`、`--project`、`--larger-than`、`--archived` 或 `--orphans`。多个会话谓词之间取交集，子树选择会保持父子一致性。`--keep-recent N` 保护每个项目中最近活跃的 N 个根会话，按项目分别计数，数的是根会话而不是全部会话；默认值为 0，即不保留任何会话，选择结果就是选择器所描述的内容。
+`clean` 至少需要一个选择器：`--older-than`、`--include`、`--exclude`、`--larger-than`、`--archived` 或 `--orphans`。多个会话谓词之间取交集，子树选择会保持父子一致性。`--include` 和 `--exclude` 是同一个项目路径谓词的两个方向，不能同时使用，同时给出会被判为用法错误。`--keep-recent N` 保护每个项目中最近活跃的 N 个根会话，按项目分别计数，数的是根会话而不是全部会话；默认值为 0，即不保留任何会话，选择结果就是选择器所描述的内容。
 
 ```sh
 # 预览至少 90 天无活动的根会话子树。
@@ -87,7 +87,10 @@ oc-clean clean --older-than 90D --dry-run
 oc-clean clean --archived --larger-than 250MB --dry-run
 
 # 预览 glob 选中的项目路径下所有匹配的会话。
-oc-clean clean --project '/work/legacy-*' --keep-recent 20 --dry-run
+oc-clean clean --include '/work/legacy-*' --keep-recent 20 --dry-run
+
+# 预览某个项目之外的全部会话，也就是同一个 glob 的补集。
+oc-clean clean --exclude '/work/keep-this' --older-than 30D --dry-run
 
 # 预览会话形态的孤儿事件、悬空会话和外部孤儿文件。
 oc-clean clean --orphans --dry-run
@@ -125,6 +128,7 @@ oc-clean vacuum --incremental
 
 | 作用域 | 选项 | 环境变量 | 用途 |
 |---|---|---|---|
+| Global | `--version` | 仅命令行 | 打印 `Cargo.toml` 中记录的版本号后退出，短选项为 `-V`。 |
 | Global | `--db <PATH>` | `OCC_DB` | 选择数据库路径，或用 `:memory:` 指定一个全新的内存分析目标。优先级高于 `OPENCODE_DB` 和平台发现。 |
 | Global | `--channel <NAME>` | `OCC_CHANNEL` | 选择用于推导默认数据库文件名的 OpenCode 通道。 |
 | Global | `--log <MODE>` | `OCC_LOG` | 选择 stderr 诊断输出：`off`、`text` 或 `json`，默认 `off`。设置 `RUST_LOG` 会隐式选择 `text`。 |
@@ -138,7 +142,8 @@ oc-clean vacuum --incremental
 | analyze | `--quick` | `OCC_QUICK` | 只输出文件统计和行数，不做完整分布与汇总。 |
 | doctor | `--json` | `OCC_JSON` | 在 stdout 输出一个稳定的 JSON 诊断报告。 |
 | clean | `--older-than <AGE>` | `OCC_OLDER_THAN` | 选择最近活动时间至少达到该粗粒度年龄的会话子树。 |
-| clean | `--project <PATH_OR_GLOB>` | `OCC_PROJECT` | 选择属于某个精确项目路径或 glob 的会话。 |
+| clean | `--include <PATH_OR_GLOB>` | `OCC_INCLUDE` | 选择项目路径或 glob 匹配的会话。与 `--exclude` 互斥。 |
+| clean | `--exclude <PATH_OR_GLOB>` | `OCC_EXCLUDE` | 选择项目路径或 glob 不匹配的会话。与 `--include` 互斥。 |
 | clean | `--larger-than <SIZE>` | `OCC_LARGER_THAN` | 选择可归属负载达到该十进制体积的会话子树。 |
 | clean | `--archived` | `OCC_ARCHIVED` | 选择已归档的会话。 |
 | clean | `--orphans` | `OCC_ORPHANS` | 纳入会话形态的孤儿事件、悬空会话和孤儿外部存储。 |
@@ -166,13 +171,15 @@ oc-clean vacuum --incremental
 
 小于一天的时长单位和二进制体积单位都被明确拒绝。增量 vacuum 内部的页面批次与这些面向用户的语法无关。
 
+`--include` 和 `--exclude` 接受字面路径或 glob。当取值包含 `*`、`?` 或 `[` 时进入 glob 模式：`*` 匹配任意字符序列（含路径分隔符），`?` 匹配单个字符，`[abc]` 和 `[a-z]` 匹配字符类，方括号内以 `!` 开头表示取反。匹配前会去掉结尾的路径分隔符，因此 `/work/repo/` 和 `/work/repo` 是同一个模式。大小写策略跟随平台文件系统，macOS 和 Windows 上不区分大小写，Linux 上区分。模式会同时与每个项目的 worktree 和该项目登记的每个目录比较，只要命中其中之一，该项目的全部会话都会被选中，与每个会话自身的工作目录无关。
+
 ## 安全模型
 
 ### 试运行与确认
 
 `analyze` 和 `doctor` 是只读的。`clean` 和 `vacuum` 会修改数据，两者都会停在交互式确认上，展示完整影响范围，且只接受 `y` 或 `yes`，忽略大小写和首尾空白。`--dry-run` 会完成同样的选择、兼容性、持有者和余量检查，打印报告后退出，同时保持数据库字节不变。会修改数据的运行在动手前获取 SQLite 的排他锁。管道输入、JSON 输出或缺少终端都无法回答确认提示，因此会以退出码 2 拒绝执行，除非提供 `--dangerously-skip-confirm`。
 
-`--dangerously-skip-confirm` 只绕过确认环节，持有者、schema、锁、余量和完整性关卡全部保持有效。因此一个写错的选择器或数据库路径依然可能在无人值守时执行并删除错误的数据。
+当一次 `clean` 选中的会话达到数据库全部会话的一半或更多时，第一个提示之后还会问第二个独立的问题，并列出选中数量与数据库总数的对比，两个回答都必须是肯定的才会执行。`--dangerously-skip-confirm` 会同时绕过这两个提示，持有者、schema、锁、余量和完整性关卡全部保持有效。因此一个写错的选择器或数据库路径依然可能在无人值守时执行并删除错误的数据。
 
 ### 持有者检测
 
