@@ -301,10 +301,28 @@ impl AnchoredDatabaseFile {
         self.resolved_path.clone()
     }
 
-    #[cfg(unix)]
+    /// Resolves a sibling of the database, pinned to the anchored parent where possible.
+    ///
+    /// Only Linux resolves a descriptor path to the directory itself, so only Linux can name a
+    /// sibling relative to the pinned parent. Elsewhere the validated name is rejoined to the
+    /// resolved parent path.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(crate) fn sibling_path(&self, path: &Path) -> Result<PathBuf, Error> {
         let name = self.sibling_name(path)?;
         Ok(descriptor_path(&self.parent_descriptor).join(name))
+    }
+
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    pub(crate) fn sibling_path(&self, path: &Path) -> Result<PathBuf, Error> {
+        let name = self.sibling_name(path)?;
+        let parent = self
+            .resolved_path
+            .parent()
+            .ok_or_else(|| Error::InvalidArgument {
+                argument: self.resolved_path.display().to_string(),
+                reason: "database path has no parent directory".to_owned(),
+            })?;
+        Ok(parent.join(name))
     }
 
     #[cfg(not(unix))]
