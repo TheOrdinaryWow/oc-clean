@@ -722,6 +722,22 @@ mod tests {
         assert!(matches!(inspection.verdict, Verdict::Held(_)));
     }
 
+    /// Counts the symlink hops the resolver spends walking to `directory`.
+    #[cfg(unix)]
+    fn symlink_hops_in_prefix(directory: &Path) -> usize {
+        let mut hops = 0;
+        let mut walked = PathBuf::from("/");
+        for component in directory.components().skip(1) {
+            walked.push(component);
+            if std::fs::symlink_metadata(&walked)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                hops += 1;
+            }
+        }
+        hops
+    }
+
     #[cfg(unix)]
     #[test]
     fn database_target_resolution_allows_forty_and_rejects_more_symlink_hops() {
@@ -729,9 +745,15 @@ mod tests {
         let target = directory.path().join("real.db");
         std::fs::write(&target, []).expect("database fixture should be created");
 
-        for index in (0..=40).rev() {
+        // The directory prefix may itself contain symlinks, and those hops come out of the same
+        // budget. macOS resolves the temporary directory through /var -> /private/var, so build
+        // the chain relative to whatever the prefix already spent.
+        let prefix_hops = symlink_hops_in_prefix(directory.path());
+        let chain_length = 40 - prefix_hops;
+
+        for index in (0..=chain_length).rev() {
             let link = directory.path().join(format!("link-{index}.db"));
-            let target_name = if index == 40 {
+            let target_name = if index == chain_length {
                 OsString::from("real.db")
             } else {
                 OsString::from(format!("link-{}.db", index + 1))

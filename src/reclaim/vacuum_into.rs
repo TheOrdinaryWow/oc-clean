@@ -826,11 +826,14 @@ fn sync_parent_directory(path: &Path) -> Result<(), Error> {
         argument: path.display().to_string(),
         reason: "database path has no parent directory".to_owned(),
     })?;
+    // Opening the directory confirms it is still reachable. Flushing it is neither possible nor
+    // needed: Windows refuses FlushFileBuffers on a directory handle, and the swap already used
+    // MOVEFILE_WRITE_THROUGH, which commits the directory entry before returning.
     fs::OpenOptions::new()
         .read(true)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(parent)
-        .and_then(|directory| directory.sync_all())
+        .map(drop)
         .map_err(|source| io_error(parent, source))
 }
 
