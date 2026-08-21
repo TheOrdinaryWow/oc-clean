@@ -19,7 +19,7 @@ pub fn run(cli: &Cli, arguments: &DoctorArgs, output: &mut dyn Write) -> Result<
     let data_directory = database_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new(":memory:"));
+        .unwrap_or(Path::new(paths::MEMORY_DATA_DIR));
     let derived_paths = paths::derived_paths(data_directory);
     let database = db::open_read_only(&target, ConnectionOptions::default())?;
     let connection = database.connection();

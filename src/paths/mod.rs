@@ -104,6 +104,13 @@ pub fn database_target(
     ))
 }
 
+/// Placeholder data directory for an in-memory database, which owns no external storage.
+///
+/// It must stay a syntactically valid relative path. Deriving siblings from the SQLite keyword
+/// `:memory:` yields `:memory:\\storage`, which Windows rejects as malformed rather than
+/// reporting as absent, turning "no external storage" into a command failure.
+pub const MEMORY_DATA_DIR: &str = "oc-clean-memory-target";
+
 #[must_use]
 pub fn derived_paths(data_dir: &Path) -> DerivedPaths {
     DerivedPaths {
