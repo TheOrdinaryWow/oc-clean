@@ -235,12 +235,12 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
-    use rusqlite::{params, Connection};
+    use rusqlite::{Connection, params};
 
-    use super::fixture::{Fixture, FixtureConfig, BASE_TIME_MS, TABLES as ALL_TABLES};
+    use super::fixture::{BASE_TIME_MS, Fixture, FixtureConfig, TABLES as ALL_TABLES};
     use super::*;
-    use crate::db::{open_read_write, ConnectionOptions, ReadWriteConnection};
-    use crate::paths::{derived_paths, Target};
+    use crate::db::{ConnectionOptions, ReadWriteConnection, open_read_write};
+    use crate::paths::{Target, derived_paths};
     use crate::select::orphans;
 
     const SESSION_TABLES: &[&str] = &["session", "event_sequence", "event"];
@@ -374,11 +374,13 @@ mod tests {
         assert_eq!(report.deletion.table_rows["event_sequence"], 10);
         assert_eq!(report.deletion.table_rows["event"], 10);
         assert_eq!(report.deletion.deleted_session_ids.len(), 3);
-        assert!(report
-            .deletion
-            .deleted_session_ids
-            .iter()
-            .all(|id| !id.starts_with("ses_Orphan")));
+        assert!(
+            report
+                .deletion
+                .deleted_session_ids
+                .iter()
+                .all(|id| !id.starts_with("ses_Orphan"))
+        );
     }
 
     #[test]
@@ -438,14 +440,16 @@ mod tests {
         assert_eq!(report.deletion.transactions, 1);
         assert_eq!(report.deletion.table_rows["event_sequence"], 2);
         assert_eq!(report.dangling_passes, 0);
-        assert!(database
-            .connection()
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM session WHERE id = 'ses_DanglingAfterCancel')",
-                [],
-                |row| row.get::<_, bool>(0),
-            )
-            .expect("dangling session existence should query"));
+        assert!(
+            database
+                .connection()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM session WHERE id = 'ses_DanglingAfterCancel')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .expect("dangling session existence should query")
+        );
     }
 
     #[test]
@@ -514,14 +518,18 @@ mod tests {
             .map(|detail| detail.to_ascii_lowercase())
             .collect::<Vec<_>>();
 
-        assert!(normalized
-            .iter()
-            .any(|detail| detail.starts_with("scan candidate")));
+        assert!(
+            normalized
+                .iter()
+                .any(|detail| detail.starts_with("scan candidate"))
+        );
         assert!(normalized.iter().any(|detail| {
             detail.contains("search child") && detail.contains("sqlite_autoindex_session_1")
         }));
-        assert!(normalized
-            .iter()
-            .all(|detail| !detail.starts_with("scan child")));
+        assert!(
+            normalized
+                .iter()
+                .all(|detail| !detail.starts_with("scan child"))
+        );
     }
 }
