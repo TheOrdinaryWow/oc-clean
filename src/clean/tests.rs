@@ -4,7 +4,7 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "bench-large"))]
 use std::time::{Duration, Instant};
 
 use crate::cli::{CleanArgs, Cli, Commands, LogMode};
@@ -16,8 +16,8 @@ use clap::Parser;
 use rusqlite::Connection;
 
 use super::command::{
-    RuntimeContext, inspect_read_only_phases_for_test,
-    inspect_read_only_phases_sequential_for_test, run_with, run_with_git_path,
+    RuntimeContext, inspect_read_only_phases, inspect_read_only_phases_sequential, run_with,
+    run_with_git_path,
 };
 use super::signal::SignalController;
 use super::{PhaseId, PhaseObserver, PhaseOperation};
@@ -43,7 +43,6 @@ struct HeldInspector;
 
 impl HolderInspector for HeldInspector {
     fn inspect(&self, database_path: &Path) -> Inspection {
-        std::thread::sleep(std::time::Duration::from_millis(10));
         Inspection {
             verdict: Verdict::Held(vec![HolderInfo {
                 pid: 42,
@@ -446,7 +445,7 @@ fn parallel_read_only_phases_match_the_sequential_reference() {
     let cli = cli(&fixture.database_path, false);
     let arguments = arguments(false);
 
-    let sequential = inspect_read_only_phases_sequential_for_test(
+    let sequential = inspect_read_only_phases_sequential(
         &target,
         &fixture.database_path,
         &cli,
@@ -454,7 +453,7 @@ fn parallel_read_only_phases_match_the_sequential_reference() {
         &NotHeldInspector,
     )
     .expect("sequential read-only phases should succeed");
-    let parallel = inspect_read_only_phases_for_test(
+    let parallel = inspect_read_only_phases(
         &target,
         &fixture.database_path,
         &cli,
@@ -467,7 +466,7 @@ fn parallel_read_only_phases_match_the_sequential_reference() {
 }
 
 #[test]
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "bench-large"))]
 #[ignore = "performance characterization on a large fixture"]
 fn read_only_phase_parallel_benchmark_large_fixture() {
     let fixture = Fixture::build(&FixtureConfig {
@@ -490,7 +489,7 @@ fn read_only_phase_parallel_benchmark_large_fixture() {
     for iteration in 0..9 {
         let measure_sequential = || {
             let started = Instant::now();
-            inspect_read_only_phases_sequential_for_test(
+            inspect_read_only_phases_sequential(
                 &target,
                 &fixture.database_path,
                 &cli,
@@ -502,7 +501,7 @@ fn read_only_phase_parallel_benchmark_large_fixture() {
         };
         let measure_parallel = || {
             let started = Instant::now();
-            inspect_read_only_phases_for_test(
+            inspect_read_only_phases(
                 &target,
                 &fixture.database_path,
                 &cli,
@@ -534,7 +533,7 @@ fn read_only_phase_parallel_benchmark_large_fixture() {
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "bench-large"))]
 fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
 }

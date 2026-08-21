@@ -1,4 +1,10 @@
-use super::*;
+use super::command::{
+    inspect, join_independent_checks, run_independent_checks, run_independent_checks_sequential,
+};
+use crate::error::Error;
+use crate::paths::{self, Target};
+
+use std::path::Path;
 
 #[allow(clippy::duplicate_mod, dead_code)]
 #[path = "../../tests/support/fixture.rs"]
@@ -43,17 +49,16 @@ fn parallel_checks_match_the_sequential_reference() {
 
     let mut parallel_json = Vec::new();
     let mut sequential_json = Vec::new();
-    super::super::json::write(&parallel, &mut parallel_json).expect("parallel JSON should render");
-    super::super::json::write(&sequential, &mut sequential_json)
-        .expect("sequential JSON should render");
+    super::json::write(&parallel, &mut parallel_json).expect("parallel JSON should render");
+    super::json::write(&sequential, &mut sequential_json).expect("sequential JSON should render");
     assert_eq!(parallel_json, sequential_json);
 
     let style = crate::report::format::Style::resolve(false, false);
     let mut parallel_human = Vec::new();
     let mut sequential_human = Vec::new();
-    super::super::human::write(&parallel, &mut parallel_human, style)
+    super::human::write(&parallel, &mut parallel_human, style)
         .expect("parallel human report should render");
-    super::super::human::write(&sequential, &mut sequential_human, style)
+    super::human::write(&sequential, &mut sequential_human, style)
         .expect("sequential human report should render");
     assert_eq!(parallel_human, sequential_human);
 }

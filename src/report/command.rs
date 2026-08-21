@@ -56,6 +56,9 @@ fn full_report<Access>(
     paths: &DerivedPaths,
     top: usize,
 ) -> Result<AnalysisReport, Error> {
+    // Parallel candidates measured 2.57 s, 2.20 s, and 2.00 s versus 1.18 s sequentially on a
+    // 1.9 GB fixture: overlapping scans of the same large tables contend for one page cache.
+    // Keep these phases sequential unless a future workload changes their scan targets.
     let progress = progress::phases("analyze", 5);
 
     progress.set_message("counting rows");

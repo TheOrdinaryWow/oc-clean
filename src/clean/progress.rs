@@ -39,7 +39,10 @@ impl PhaseObserver for ProgressPhaseObserver {
         // is an upper bound rather than a promise. Growing the bar keeps the ratio honest
         // instead of rendering a position beyond its length.
         self.bar.set_position(*entered);
-        self.bar.set_message(phase.label());
+        self.bar.set_message(match phase {
+            PhaseId::P2 | PhaseId::P3 | PhaseId::P3b | PhaseId::P4 => "running independent checks",
+            _ => phase.label(),
+        });
     }
 }
 

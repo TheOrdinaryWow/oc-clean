@@ -7,6 +7,9 @@ mod human;
 mod json;
 mod model;
 
+#[cfg(test)]
+mod tests;
+
 pub(crate) use checks::{foreign_key_check, integrity_check};
 pub use model::DoctorReport;
 

@@ -43,20 +43,23 @@ pub fn run(cli: &Cli, arguments: &DoctorArgs, output: &mut dyn Write) -> Result<
     ensure_report_health(&report)
 }
 
-fn inspect(
+pub(super) fn inspect(
     target: &Target,
     database_path: &Path,
     derived_paths: &paths::DerivedPaths,
     independent_checks: impl FnOnce(&Target, &Path) -> Result<IndependentChecks, Error>,
 ) -> Result<DoctorReport, Error> {
+    let progress = progress::phases("doctor", 5);
+    progress.set_position(1);
+    progress.set_message("inspecting the schema");
     let database = db::open_read_only(target, ConnectionOptions::default())?;
     let connection = database.connection();
 
-    let bar = progress::spinner("doctor", "inspecting the schema");
     let schema = db::schema::inspect_report(connection)?;
-    bar.finish();
     ensure_schema_compatible(&schema)?;
 
+    progress.set_position(2);
+    progress.set_message("running independent checks");
     let IndependentChecks {
         integrity_check,
         foreign_key_check,
@@ -64,20 +67,21 @@ fn inspect(
         holders,
     } = independent_checks(target, database_path)?;
 
-    let bar = progress::spinner("doctor", "counting orphans");
+    progress.set_position(3);
+    progress.set_message("counting orphans");
     let orphans = orphans::analyze(&database, derived_paths)?;
-    bar.finish();
 
-    let bar = progress::spinner("doctor", "estimating rebuild headroom");
+    progress.set_position(4);
+    progress.set_message("estimating rebuild headroom");
     let vacuum_headroom = vacuum_headroom(
         target,
         database_path,
         file_space.live_bytes,
         database.capabilities().hard_links,
     )?;
-    bar.finish();
 
-    let bar = progress::spinner("doctor", "reading auto-vacuum and timestamp state");
+    progress.set_position(5);
+    progress.set_message("reading auto-vacuum and timestamp state");
     let report = DoctorReport {
         database_path: database_path.to_owned(),
         schema,
@@ -89,19 +93,19 @@ fn inspect(
         auto_vacuum: super::checks::auto_vacuum(connection)?,
         timestamp_sanity: super::checks::timestamp_sanity(connection)?,
     };
-    bar.finish();
+    progress.finish();
     Ok(report)
 }
 
 #[derive(Debug, PartialEq)]
-struct IndependentChecks {
-    integrity_check: CheckReport,
-    foreign_key_check: ForeignKeyReport,
-    file_space: FileSpace,
-    holders: HolderReport,
+pub(super) struct IndependentChecks {
+    pub(super) integrity_check: CheckReport,
+    pub(super) foreign_key_check: ForeignKeyReport,
+    pub(super) file_space: FileSpace,
+    pub(super) holders: HolderReport,
 }
 
-fn run_independent_checks(
+pub(super) fn run_independent_checks(
     target: &Target,
     database_path: &Path,
 ) -> Result<IndependentChecks, Error> {
@@ -126,7 +130,7 @@ fn run_independent_checks(
     })
 }
 
-fn join_independent_checks(
+pub(super) fn join_independent_checks(
     integrity_check: JobHandle<'_, CheckReport>,
     foreign_key_check: JobHandle<'_, ForeignKeyReport>,
     file_space: JobHandle<'_, FileSpace>,
@@ -148,7 +152,7 @@ fn join_independent_checks(
 }
 
 #[cfg(test)]
-fn run_independent_checks_sequential(
+pub(super) fn run_independent_checks_sequential(
     target: &Target,
     database_path: &Path,
 ) -> Result<IndependentChecks, Error> {
@@ -243,7 +247,3 @@ fn current_platform() -> Result<Platform, Error> {
         }),
     }
 }
-
-#[cfg(test)]
-#[path = "command_tests.rs"]
-mod tests;

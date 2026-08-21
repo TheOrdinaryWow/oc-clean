@@ -12,7 +12,7 @@ use crate::delete::projects::{self, ProjectIds};
 use crate::delete::sessions::{self, DeleteOptions, DeletionReport};
 use crate::doctor::foreign_key_check;
 use crate::error::Error;
-use crate::parallel;
+use crate::parallel::{self, JobHandle};
 use crate::paths::{self, DatabaseOptions, DerivedPaths, Environment, Platform, Target};
 use crate::reclaim::headroom::{FreeSpaceProvider, Fs2FreeSpaceProvider};
 use crate::reclaim::incremental::{IncrementalVacuumError, check_auto_vacuum};
@@ -494,7 +494,7 @@ fn phase(observer: &dyn PhaseObserver, phase: PhaseId) {
     info!(phase = %phase, "clean phase entered");
 }
 
-fn inspect_read_only_phases(
+pub(super) fn inspect_read_only_phases(
     target: &Target,
     database_path: &Path,
     cli: &Cli,
@@ -506,7 +506,7 @@ fn inspect_read_only_phases(
         let database = group.spawn("inspecting schema and space", || {
             inspect_database(target, cli.force_schema)
         });
-        let holders = group.spawn("scanning database holders", || {
+        let holders = group.spawn("scanning for database holders", || {
             Ok(inspect_holder_decision(
                 holder_inspector,
                 database_path,
@@ -521,34 +521,34 @@ fn inspect_read_only_phases(
         });
         let selectors = group.spawn("validating selectors", || ensure_selector(arguments));
 
-        let database = database.join();
-        let holders = holders.join();
-        let incremental = incremental.map(parallel::JobHandle::join);
-        let selectors = selectors.join();
-
-        let database = database?;
-        apply_holder_decision(holders?)?;
-        if let Some(incremental) = incremental {
-            incremental?;
-        }
-        selectors?;
-        Ok(database)
+        join_read_only_phases(database, holders, incremental, selectors)
     })
 }
 
-#[cfg(test)]
-pub(super) fn inspect_read_only_phases_for_test(
-    target: &Target,
-    database_path: &Path,
-    cli: &Cli,
-    arguments: &CleanArgs,
-    holder_inspector: &(dyn HolderInspector + Sync),
+fn join_read_only_phases(
+    database: JobHandle<'_, (crate::analyze::space::FileSpace, bool)>,
+    holders: JobHandle<'_, GateDecision>,
+    incremental: Option<JobHandle<'_, ()>>,
+    selectors: JobHandle<'_, ()>,
 ) -> Result<(crate::analyze::space::FileSpace, bool), Error> {
-    inspect_read_only_phases(target, database_path, cli, arguments, holder_inspector)
+    // Joining every handle before propagating errors lets scoped workers finish while preserving
+    // declaration order as the stable error-priority contract.
+    let database = database.join();
+    let holders = holders.join();
+    let incremental = incremental.map(JobHandle::join);
+    let selectors = selectors.join();
+
+    let database = database?;
+    apply_holder_decision(holders?)?;
+    if let Some(incremental) = incremental {
+        incremental?;
+    }
+    selectors?;
+    Ok(database)
 }
 
 #[cfg(test)]
-pub(super) fn inspect_read_only_phases_sequential_for_test(
+pub(super) fn inspect_read_only_phases_sequential(
     target: &Target,
     database_path: &Path,
     cli: &Cli,
