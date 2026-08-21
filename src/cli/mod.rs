@@ -42,6 +42,8 @@ pub enum Commands {
     Analyze(AnalyzeArgs),
     /// Diagnose schema, integrity, holders, and reclaim readiness without modifying the database.
     Doctor(DoctorArgs),
+    /// Reclaim database freelist space, using a dry-run unless --apply is supplied.
+    Vacuum(VacuumArgs),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -74,4 +76,19 @@ pub struct DoctorArgs {
     /// Emit the report as one stable JSON object on stdout.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct VacuumArgs {
+    /// Emit the report as one stable JSON object on stdout.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Select the tracing diagnostic format written to stderr.
+    #[arg(long, value_enum, default_value_t = LogFormat::Text)]
+    pub log_format: LogFormat,
+
+    /// Reclaim freelist pages from a database already using incremental auto-vacuum.
+    #[arg(long)]
+    pub incremental: bool,
 }
