@@ -3,7 +3,6 @@ use std::path::Path;
 use crate::analyze::space::{self, FileSpace};
 use crate::cli::{CleanArgs, Cli};
 use crate::db::ReadWriteConnection;
-use crate::delete::sessions::DEFAULT_BATCH_SIZE;
 use crate::error::Error;
 use crate::reclaim::headroom::{
     FreeSpaceProvider, HeadroomInput, HeadroomVerdict, evaluate_headroom,
@@ -137,16 +136,16 @@ fn ensure_headroom(
     }
 }
 
+/// Bounds one delete batch when only aggregate candidate bytes are available.
+///
+/// Every ID-sorted delete batch is a subset of the selected candidates, so its attributable bytes
+/// cannot exceed `selected_bytes`, regardless of how skewed their sizes or ordering are. Adding one
+/// page preserves the allowance for SQLite's page-granular WAL accounting.
 fn one_batch_wal_allowance(selected_bytes: u64, selected_count: usize, page_size: u32) -> u64 {
     if selected_count == 0 {
         return u64::from(page_size);
     }
-    let count = u64::try_from(selected_count).unwrap_or(u64::MAX);
-    let batch = count.min(u64::try_from(DEFAULT_BATCH_SIZE).unwrap_or(u64::MAX));
-    selected_bytes
-        .div_ceil(count)
-        .saturating_mul(batch)
-        .saturating_add(u64::from(page_size))
+    selected_bytes.saturating_add(u64::from(page_size))
 }
 
 fn incremental_error(error: IncrementalVacuumError) -> Error {
@@ -179,17 +178,31 @@ mod tests {
     use crate::delete::sessions::DEFAULT_BATCH_SIZE;
 
     #[test]
-    fn wal_allowance_scales_to_the_session_delete_batch_size() {
+    fn wal_allowance_covers_all_selected_candidate_bytes() {
         let selected_count = DEFAULT_BATCH_SIZE.saturating_mul(2);
         let selected_bytes = u64::try_from(selected_count)
             .expect("test count should fit u64")
             .saturating_mul(10);
         assert_eq!(
             one_batch_wal_allowance(selected_bytes, selected_count, 4_096),
-            u64::try_from(DEFAULT_BATCH_SIZE)
-                .expect("batch size should fit u64")
-                .saturating_mul(10)
-                .saturating_add(4_096)
+            selected_bytes.saturating_add(4_096)
+        );
+    }
+
+    #[test]
+    fn wal_allowance_bounds_a_skewed_id_sorted_batch() {
+        let mut candidate_bytes = vec![1_u64; DEFAULT_BATCH_SIZE.saturating_mul(2)];
+        candidate_bytes[DEFAULT_BATCH_SIZE..].fill(1_000);
+        let selected_bytes = candidate_bytes.iter().copied().sum::<u64>();
+        let actual_peak = candidate_bytes
+            .chunks(DEFAULT_BATCH_SIZE)
+            .map(|batch| batch.iter().copied().sum::<u64>())
+            .max()
+            .expect("test fixture should contain candidates")
+            .saturating_add(4_096);
+
+        assert!(
+            one_batch_wal_allowance(selected_bytes, candidate_bytes.len(), 4_096) >= actual_peak
         );
     }
 }
