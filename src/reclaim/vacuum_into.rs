@@ -1,0 +1,1429 @@
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
+use rusqlite::{Connection, ErrorCode, OptionalExtension};
+use tracing::warn;
+
+use crate::db::{FileIdentity, ReadWriteConnection};
+use crate::error::Error;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VacuumIntoOptions {
+    pub skip_backup: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VacuumIntoReport {
+    pub original_bytes: u64,
+    pub compacted_bytes: u64,
+    pub bytes_reclaimed: u64,
+    pub backup_path: Option<PathBuf>,
+}
+
+/// Rebuilds a locked database into a verified sibling file and atomically replaces the source.
+///
+/// `locked_data_version` must have been read from `database` immediately after the caller acquired
+/// its exclusive lock. The connection is consumed so this function can close it before entering
+/// the filesystem swap critical section.
+///
+/// # Errors
+///
+/// Returns a typed database, integrity, or filesystem error while preserving the canonical source
+/// path on every pre-swap and rename failure.
+pub fn vacuum_into(
+    database: ReadWriteConnection,
+    database_path: &Path,
+    locked_data_version: i64,
+    options: VacuumIntoOptions,
+) -> Result<VacuumIntoReport, Error> {
+    vacuum_into_with_runtime(
+        database,
+        database_path,
+        locked_data_version,
+        options,
+        &SystemFileOperations,
+        &NoopHooks,
+    )
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SourceSnapshot {
+    page_size: i64,
+    auto_vacuum: i64,
+    journal_mode: String,
+    user_version: i64,
+    application_id: i64,
+    table_counts: Vec<(String, i64)>,
+}
+
+trait FileOperations {
+    fn remove_file(&self, path: &Path) -> io::Result<()>;
+    fn hard_link(&self, source: &Path, destination: &Path) -> io::Result<()>;
+    fn copy(&self, source: &Path, destination: &Path) -> io::Result<u64>;
+    fn rename(&self, source: &Path, destination: &Path) -> io::Result<()>;
+}
+
+struct SystemFileOperations;
+
+impl FileOperations for SystemFileOperations {
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        fs::remove_file(path)
+    }
+
+    fn hard_link(&self, source: &Path, destination: &Path) -> io::Result<()> {
+        fs::hard_link(source, destination)
+    }
+
+    fn copy(&self, source: &Path, destination: &Path) -> io::Result<u64> {
+        fs::copy(source, destination)
+    }
+
+    fn rename(&self, source: &Path, destination: &Path) -> io::Result<()> {
+        rename_over(source, destination)
+    }
+}
+
+#[cfg(not(windows))]
+fn rename_over(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn rename_over(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+
+    unsafe extern "system" {
+        fn MoveFileExW(
+            existing_file_name: *const u16,
+            new_file_name: *const u16,
+            flags: u32,
+        ) -> i32;
+    }
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // SAFETY: both pointers reference live, NUL-terminated UTF-16 buffers for the duration of
+    // this synchronous call, and the declaration matches the documented MoveFileExW ABI.
+    let succeeded = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if succeeded == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+trait SwapHooks {
+    fn timestamp(&self) -> Option<String> {
+        None
+    }
+    fn after_vacuum(&self, _source: &Path, _temporary: &Path) {}
+    fn after_lock_closed(&self, _source: &Path, _temporary: &Path) {}
+    fn backup_created(&self, _backup: &Path) {}
+    fn after_rename(&self, _database: &Path) {}
+}
+
+struct NoopHooks;
+
+impl SwapHooks for NoopHooks {}
+
+struct TemporaryDatabase<'ops, Ops: FileOperations> {
+    path: PathBuf,
+    operations: &'ops Ops,
+}
+
+impl<Ops: FileOperations> Drop for TemporaryDatabase<'_, Ops> {
+    fn drop(&mut self) {
+        remove_if_present(self.operations, &self.path);
+        remove_if_present(self.operations, &sidecar_path(&self.path, "-wal"));
+        remove_if_present(self.operations, &sidecar_path(&self.path, "-shm"));
+    }
+}
+
+fn vacuum_into_with_runtime<Ops: FileOperations, Hooks: SwapHooks>(
+    database: ReadWriteConnection,
+    database_path: &Path,
+    locked_data_version: i64,
+    options: VacuumIntoOptions,
+    operations: &Ops,
+    hooks: &Hooks,
+) -> Result<VacuumIntoReport, Error> {
+    validate_file_target(database_path)?;
+    let original_bytes = file_size(database_path)?;
+    checkpoint_source(database.connection())?;
+    let snapshot = source_snapshot(database.connection())?;
+    let timestamp = match hooks.timestamp() {
+        Some(timestamp) => timestamp,
+        None => utc_compact_timestamp(database.connection())?,
+    };
+    let temporary_path = generated_path(database_path, ".oc-clean-tmp-", &timestamp)?;
+    ensure_available_path(&temporary_path)?;
+    let temporary = TemporaryDatabase {
+        path: temporary_path,
+        operations,
+    };
+
+    vacuum_to(database.connection(), &temporary.path)?;
+    hooks.after_vacuum(database_path, &temporary.path);
+    verify_output(&temporary.path, &snapshot)?;
+    restore_wal_and_verify_auto_vacuum(&temporary.path, snapshot.auto_vacuum)?;
+
+    if database.data_version()? != locked_data_version {
+        return Err(database_busy("source data_version changed before swap"));
+    }
+    let identity = database.file_identity()?;
+    ensure_wal_truncated(database_path)?;
+    let hard_links = database.capabilities().hard_links;
+    drop(database);
+    hooks.after_lock_closed(database_path, &temporary.path);
+
+    let backup_path = generated_path(database_path, ".bak.", &timestamp)?;
+    let backup_created = swap_critical_section(
+        database_path,
+        &temporary.path,
+        &backup_path,
+        identity,
+        hard_links,
+        options.skip_backup,
+        operations,
+        hooks,
+    )?;
+
+    hooks.after_rename(database_path);
+    sync_file_and_parent(database_path)?;
+    if let Err(verification_error) = verify_swapped_database(database_path) {
+        rollback_after_verification_failure(
+            operations,
+            database_path,
+            &backup_path,
+            backup_created,
+        )?;
+        return Err(verification_error);
+    }
+    let compacted_bytes = file_size(database_path)?;
+    cleanup_temporary_sidecars(operations, &temporary.path);
+    if options.skip_backup && backup_created {
+        operations
+            .remove_file(&backup_path)
+            .map_err(|source| io_error(&backup_path, source))?;
+    }
+
+    Ok(VacuumIntoReport {
+        original_bytes,
+        compacted_bytes,
+        bytes_reclaimed: original_bytes.saturating_sub(compacted_bytes),
+        backup_path: (!options.skip_backup && backup_created).then_some(backup_path),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn swap_critical_section<Ops: FileOperations, Hooks: SwapHooks>(
+    database_path: &Path,
+    temporary_path: &Path,
+    backup_path: &Path,
+    expected_identity: FileIdentity,
+    hard_links: bool,
+    skip_backup: bool,
+    operations: &Ops,
+    hooks: &Hooks,
+) -> Result<bool, Error> {
+    if identity_for_path(database_path)? != expected_identity {
+        return Err(database_busy("source file identity changed before swap"));
+    }
+    ensure_sidecars_quiescent(database_path)?;
+    remove_quiescent_sidecars(operations, database_path)?;
+
+    let backup_created = create_recovery_link(
+        operations,
+        database_path,
+        backup_path,
+        hard_links,
+        skip_backup,
+    )?;
+    if backup_created {
+        hooks.backup_created(backup_path);
+    }
+    if let Err(source) = operations.rename(temporary_path, database_path) {
+        if backup_created && operations.remove_file(backup_path).is_err() {
+            return Err(Error::SwapRollbackFailed {
+                database_path: database_path.to_path_buf(),
+                backup_path: backup_path.to_path_buf(),
+            });
+        }
+        return Err(io_error(database_path, source));
+    }
+    Ok(backup_created)
+}
+
+fn checkpoint_source(connection: &Connection) -> Result<(), Error> {
+    let busy = connection
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(|source| sqlite_error("checkpointing source WAL", source))?;
+    if busy == 0 {
+        Ok(())
+    } else {
+        Err(database_busy("source WAL checkpoint reported busy"))
+    }
+}
+
+fn source_snapshot(connection: &Connection) -> Result<SourceSnapshot, Error> {
+    Ok(SourceSnapshot {
+        page_size: pragma_i64(connection, "page_size")?,
+        auto_vacuum: pragma_i64(connection, "auto_vacuum")?,
+        journal_mode: pragma_string(connection, "journal_mode")?,
+        user_version: pragma_i64(connection, "user_version")?,
+        application_id: pragma_i64(connection, "application_id")?,
+        table_counts: table_counts(connection)?,
+    })
+}
+
+fn verify_output(path: &Path, source: &SourceSnapshot) -> Result<(), Error> {
+    let connection = open_output(path)?;
+    verify_integrity(&connection)?;
+    verify_foreign_keys(&connection)?;
+    let output_journal_mode = pragma_string(&connection, "journal_mode")?;
+    if !output_journal_mode.eq_ignore_ascii_case("delete") {
+        return Err(integrity_error(
+            "journal_mode",
+            format!(
+                "VACUUM output expected delete before restoring source mode {}, found {output_journal_mode}",
+                source.journal_mode
+            ),
+        ));
+    }
+    compare_value(
+        "page_size",
+        pragma_i64(&connection, "page_size")?,
+        source.page_size,
+    )?;
+    compare_value(
+        "auto_vacuum",
+        pragma_i64(&connection, "auto_vacuum")?,
+        source.auto_vacuum,
+    )?;
+    compare_value(
+        "user_version",
+        pragma_i64(&connection, "user_version")?,
+        source.user_version,
+    )?;
+    compare_value(
+        "application_id",
+        pragma_i64(&connection, "application_id")?,
+        source.application_id,
+    )?;
+    let counts = table_counts(&connection)?;
+    if counts != source.table_counts {
+        return Err(integrity_error(
+            "table row counts",
+            format!("source {:?}, output {counts:?}", source.table_counts),
+        ));
+    }
+    Ok(())
+}
+
+fn restore_wal_and_verify_auto_vacuum(path: &Path, expected_auto_vacuum: i64) -> Result<(), Error> {
+    let connection = open_output(path)?;
+    let journal_mode: String = connection
+        .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+        .map_err(|source| sqlite_error("restoring output journal_mode=WAL", source))?;
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        return Err(integrity_error(
+            "journal_mode",
+            format!("expected wal, found {journal_mode}"),
+        ));
+    }
+    compare_value(
+        "auto_vacuum",
+        pragma_i64(&connection, "auto_vacuum")?,
+        expected_auto_vacuum,
+    )
+}
+
+fn verify_swapped_database(path: &Path) -> Result<(), Error> {
+    let connection = open_output(path)?;
+    let journal_mode = pragma_string(&connection, "journal_mode")?;
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        return Err(integrity_error(
+            "journal_mode",
+            format!("expected wal after swap, found {journal_mode}"),
+        ));
+    }
+    verify_integrity(&connection)
+}
+
+fn verify_integrity(connection: &Connection) -> Result<(), Error> {
+    let result = pragma_string(connection, "integrity_check")?;
+    if result == "ok" {
+        Ok(())
+    } else {
+        Err(integrity_error("integrity_check", result))
+    }
+}
+
+fn verify_foreign_keys(connection: &Connection) -> Result<(), Error> {
+    let finding = connection
+        .query_row("PRAGMA foreign_key_check", [], |row| {
+            let table: String = row.get(0)?;
+            let row_id: Option<i64> = row.get(1)?;
+            Ok(format!("table {table}, row {row_id:?}"))
+        })
+        .optional()
+        .map_err(|source| sqlite_error("running output foreign_key_check", source))?;
+    match finding {
+        Some(message) => Err(integrity_error("foreign_key_check", message)),
+        None => Ok(()),
+    }
+}
+
+fn table_counts(connection: &Connection) -> Result<Vec<(String, i64)>, Error> {
+    let mut statement = connection
+        .prepare(
+            "SELECT name FROM sqlite_schema
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+             ORDER BY name",
+        )
+        .map_err(|source| sqlite_error("preparing table enumeration", source))?;
+    let names = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|source| sqlite_error("enumerating database tables", source))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| sqlite_error("reading database table name", source))?;
+    names
+        .into_iter()
+        .map(|name| {
+            let sql = format!("SELECT count(*) FROM {}", quote_identifier(&name));
+            connection
+                .query_row(&sql, [], |row| row.get::<_, i64>(0))
+                .map(|count| (name, count))
+                .map_err(|source| sqlite_error("counting table rows", source))
+        })
+        .collect()
+}
+
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn vacuum_to(connection: &Connection, path: &Path) -> Result<(), Error> {
+    let path_value = path.to_str().ok_or_else(|| Error::InvalidArgument {
+        argument: path.display().to_string(),
+        reason: "SQLite VACUUM INTO requires a UTF-8 path".to_owned(),
+    })?;
+    connection
+        .execute("VACUUM INTO ?1", [path_value])
+        .map(|_| ())
+        .map_err(|source| match source.sqlite_error_code() {
+            Some(ErrorCode::CannotOpen | ErrorCode::ReadOnly) => io_error(
+                path,
+                io::Error::new(io::ErrorKind::PermissionDenied, source.to_string()),
+            ),
+            _ => sqlite_error("running VACUUM INTO", source),
+        })
+}
+
+fn utc_compact_timestamp(connection: &Connection) -> Result<String, Error> {
+    connection
+        .query_row("SELECT strftime('%Y%m%dT%H%M%SZ', 'now')", [], |row| {
+            row.get(0)
+        })
+        .map_err(|source| sqlite_error("generating compact UTC timestamp", source))
+}
+
+fn generated_path(
+    database_path: &Path,
+    separator: &str,
+    timestamp: &str,
+) -> Result<PathBuf, Error> {
+    let filename = database_path
+        .file_name()
+        .ok_or_else(|| Error::InvalidArgument {
+            argument: database_path.display().to_string(),
+            reason: "database path has no filename".to_owned(),
+        })?;
+    let mut generated = OsString::from(filename);
+    generated.push(separator);
+    generated.push(timestamp);
+    Ok(database_path.with_file_name(generated))
+}
+
+fn sidecar_path(database_path: &Path, suffix: &str) -> PathBuf {
+    let mut value = OsString::from(database_path.as_os_str());
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn ensure_sidecars_quiescent(database_path: &Path) -> Result<(), Error> {
+    for path in [
+        sidecar_path(database_path, "-wal"),
+        sidecar_path(database_path, "-shm"),
+    ] {
+        match fs::metadata(&path) {
+            Ok(metadata) if metadata.len() > 0 => {
+                return Err(database_busy("source sidecar is not empty before swap"));
+            }
+            Ok(_) => {}
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(io_error(&path, source)),
+        }
+    }
+    Ok(())
+}
+
+fn ensure_wal_truncated(database_path: &Path) -> Result<(), Error> {
+    let path = sidecar_path(database_path, "-wal");
+    match fs::metadata(&path) {
+        Ok(metadata) if metadata.len() > 0 => {
+            Err(database_busy("source WAL is not empty before closing lock"))
+        }
+        Ok(_) => Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(io_error(&path, source)),
+    }
+}
+
+fn remove_quiescent_sidecars<Ops: FileOperations>(
+    operations: &Ops,
+    database_path: &Path,
+) -> Result<(), Error> {
+    for path in [
+        sidecar_path(database_path, "-wal"),
+        sidecar_path(database_path, "-shm"),
+    ] {
+        match operations.remove_file(&path) {
+            Ok(()) => {}
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(io_error(&path, source)),
+        }
+    }
+    Ok(())
+}
+
+fn create_recovery_link<Ops: FileOperations>(
+    operations: &Ops,
+    database_path: &Path,
+    backup_path: &Path,
+    hard_links: bool,
+    skip_backup: bool,
+) -> Result<bool, Error> {
+    if hard_links {
+        operations
+            .hard_link(database_path, backup_path)
+            .map_err(|source| io_error(backup_path, source))?;
+        Ok(true)
+    } else if skip_backup {
+        Ok(false)
+    } else {
+        operations
+            .copy(database_path, backup_path)
+            .map_err(|source| io_error(backup_path, source))?;
+        Ok(true)
+    }
+}
+
+fn cleanup_temporary_sidecars<Ops: FileOperations>(operations: &Ops, temporary_path: &Path) {
+    for path in [
+        sidecar_path(temporary_path, "-wal"),
+        sidecar_path(temporary_path, "-shm"),
+    ] {
+        if let Err(source) = operations.remove_file(&path)
+            && source.kind() != io::ErrorKind::NotFound
+        {
+            warn!(path = %path.display(), error = %source, "failed to remove temporary database sidecar");
+        }
+    }
+}
+
+fn rollback_after_verification_failure<Ops: FileOperations>(
+    operations: &Ops,
+    database_path: &Path,
+    backup_path: &Path,
+    backup_created: bool,
+) -> Result<(), Error> {
+    let sidecars_removed = [
+        sidecar_path(database_path, "-wal"),
+        sidecar_path(database_path, "-shm"),
+    ]
+    .into_iter()
+    .all(|path| match operations.remove_file(&path) {
+        Ok(()) => true,
+        Err(source) => source.kind() == io::ErrorKind::NotFound,
+    });
+    if !backup_created
+        || !sidecars_removed
+        || operations.copy(backup_path, database_path).is_err()
+        || operations.remove_file(backup_path).is_err()
+        || sync_file_and_parent(database_path).is_err()
+    {
+        return Err(Error::SwapRollbackFailed {
+            database_path: database_path.to_path_buf(),
+            backup_path: backup_path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+fn sync_file_and_parent(path: &Path) -> Result<(), Error> {
+    fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|source| io_error(path, source))?;
+    sync_parent_directory(path)
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<(), Error> {
+    let parent = path.parent().ok_or_else(|| Error::InvalidArgument {
+        argument: path.display().to_string(),
+        reason: "database path has no parent directory".to_owned(),
+    })?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| io_error(parent, source))
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(path: &Path) -> Result<(), Error> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let parent = path.parent().ok_or_else(|| Error::InvalidArgument {
+        argument: path.display().to_string(),
+        reason: "database path has no parent directory".to_owned(),
+    })?;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| io_error(parent, source))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_parent_directory(_path: &Path) -> Result<(), Error> {
+    Err(Error::UnsupportedPlatform {
+        platform: std::env::consts::OS.to_owned(),
+    })
+}
+
+fn remove_if_present<Ops: FileOperations>(operations: &Ops, path: &Path) {
+    if let Err(source) = operations.remove_file(path)
+        && source.kind() != io::ErrorKind::NotFound
+    {
+        warn!(path = %path.display(), error = %source, "failed to clean temporary database file");
+    }
+}
+
+fn identity_for_path(path: &Path) -> Result<FileIdentity, Error> {
+    identity_for_path_platform(path)
+}
+
+#[cfg(unix)]
+fn identity_for_path_platform(path: &Path) -> Result<FileIdentity, Error> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::metadata(path).map_err(|source| io_error(path, source))?;
+    Ok((
+        metadata.size(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ino(),
+    ))
+}
+
+#[cfg(windows)]
+fn identity_for_path_platform(path: &Path) -> Result<FileIdentity, Error> {
+    use std::os::windows::fs::MetadataExt;
+
+    const WINDOWS_TO_UNIX_SECONDS: u64 = 11_644_473_600;
+    const TICKS_PER_SECOND: u64 = 10_000_000;
+    const NANOS_PER_TICK: u64 = 100;
+
+    let metadata = fs::metadata(path).map_err(|source| io_error(path, source))?;
+    let modified = metadata.last_write_time();
+    let seconds = modified
+        .checked_div(TICKS_PER_SECOND)
+        .and_then(|value| value.checked_sub(WINDOWS_TO_UNIX_SECONDS))
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or_else(|| {
+            io_error(
+                path,
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid Windows modification time",
+                ),
+            )
+        })?;
+    let nanoseconds = i64::try_from((modified % TICKS_PER_SECOND) * NANOS_PER_TICK)
+        .expect("subsecond Windows timestamp always fits i64");
+    let file_index = metadata.file_index().ok_or_else(|| {
+        io_error(
+            path,
+            io::Error::new(io::ErrorKind::Unsupported, "file index is unavailable"),
+        )
+    })?;
+    Ok((metadata.file_size(), seconds, nanoseconds, file_index))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn identity_for_path_platform(_path: &Path) -> Result<FileIdentity, Error> {
+    Err(Error::UnsupportedPlatform {
+        platform: std::env::consts::OS.to_owned(),
+    })
+}
+
+fn open_output(path: &Path) -> Result<Connection, Error> {
+    Connection::open(path).map_err(|source| sqlite_error("opening VACUUM output", source))
+}
+
+fn pragma_i64(connection: &Connection, pragma: &str) -> Result<i64, Error> {
+    connection
+        .pragma_query_value(None, pragma, |row| row.get(0))
+        .map_err(|source| sqlite_error(&format!("reading PRAGMA {pragma}"), source))
+}
+
+fn pragma_string(connection: &Connection, pragma: &str) -> Result<String, Error> {
+    connection
+        .pragma_query_value(None, pragma, |row| row.get(0))
+        .map_err(|source| sqlite_error(&format!("reading PRAGMA {pragma}"), source))
+}
+
+fn compare_value(name: &str, actual: i64, expected: i64) -> Result<(), Error> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(integrity_error(
+            name,
+            format!("expected {expected}, found {actual}"),
+        ))
+    }
+}
+
+fn validate_file_target(path: &Path) -> Result<(), Error> {
+    if path == Path::new(OsStr::new(":memory:")) {
+        Err(Error::InvalidArgument {
+            argument: ":memory:".to_owned(),
+            reason: "VACUUM INTO requires a resolved file-backed database".to_owned(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_available_path(path: &Path) -> Result<(), Error> {
+    if path.exists() {
+        Err(io_error(
+            path,
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "generated path already exists",
+            ),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn file_size(path: &Path) -> Result<u64, Error> {
+    fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .map_err(|source| io_error(path, source))
+}
+
+fn database_busy(reason: &str) -> Error {
+    Error::DatabaseBusy {
+        holders: vec![reason.to_owned()],
+    }
+}
+
+fn integrity_error(check: &str, message: String) -> Error {
+    Error::IntegrityCheckFailed {
+        check: check.to_owned(),
+        message,
+    }
+}
+
+fn io_error(path: &Path, source: io::Error) -> Error {
+    Error::Io {
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+fn sqlite_error(context: &str, source: rusqlite::Error) -> Error {
+    if matches!(
+        source.sqlite_error_code(),
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    ) {
+        database_busy(context)
+    } else {
+        Error::Sqlite {
+            context: context.to_owned(),
+            source,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::hash_map::DefaultHasher;
+    use std::fs;
+    use std::hash::{Hash, Hasher};
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, mpsc};
+    use std::thread;
+    use std::time::Duration;
+
+    use rusqlite::{Connection, params};
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::db::{ConnectionOptions, open_read_write};
+    use crate::paths::Target;
+
+    const USER_VERSION: i64 = 42;
+    const APPLICATION_ID: i64 = 0x0C_C1_EA;
+
+    struct Fixture {
+        _directory: TempDir,
+        path: PathBuf,
+        original_bytes: Vec<u8>,
+        original_len: u64,
+    }
+
+    impl Fixture {
+        fn new(filename: &str) -> Self {
+            let directory = tempfile::tempdir().expect("temporary directory should be created");
+            let path = directory.path().join(filename);
+            let connection = Connection::open(&path).expect("fixture database should open");
+            connection
+                .execute_batch(
+                    "PRAGMA page_size = 4096;
+                     PRAGMA auto_vacuum = INCREMENTAL;
+                     PRAGMA journal_mode = WAL;
+                     PRAGMA user_version = 42;
+                     PRAGMA application_id = 836074;
+                     CREATE TABLE alpha (id INTEGER PRIMARY KEY, payload BLOB NOT NULL);
+                     CREATE TABLE beta (id INTEGER PRIMARY KEY, alpha_id INTEGER NOT NULL, label TEXT NOT NULL);",
+                )
+                .expect("fixture schema should be created");
+            let payload = vec![0x5a_u8; 16 * 1024];
+            for id in 0..96_i64 {
+                connection
+                    .execute(
+                        "INSERT INTO alpha (id, payload) VALUES (?1, ?2)",
+                        params![id, payload],
+                    )
+                    .expect("fixture payload should be inserted");
+                connection
+                    .execute(
+                        "INSERT INTO beta (id, alpha_id, label) VALUES (?1, ?1, printf('row-%d', ?1))",
+                        [id],
+                    )
+                    .expect("fixture label should be inserted");
+            }
+            connection
+                .execute("DELETE FROM alpha WHERE id % 2 = 0", [])
+                .expect("fixture bloat should be created");
+            connection
+                .execute("DELETE FROM beta WHERE id % 2 = 0", [])
+                .expect("fixture bloat should be created");
+            connection
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+                .expect("fixture WAL should checkpoint");
+            drop(connection);
+            let original_bytes = fs::read(&path).expect("fixture bytes should be readable");
+            let original_len =
+                u64::try_from(original_bytes.len()).expect("fixture size should fit");
+            Self {
+                _directory: directory,
+                path,
+                original_bytes,
+                original_len,
+            }
+        }
+
+        fn locked(&self) -> (ReadWriteConnection, i64) {
+            let database = open_read_write(
+                &Target::File(self.path.clone()),
+                ConnectionOptions::default(),
+            )
+            .expect("fixture should open read-write");
+            database
+                .acquire_exclusive_lock()
+                .expect("fixture should acquire an exclusive lock");
+            let data_version = database
+                .data_version()
+                .expect("fixture data version should be readable");
+            (database, data_version)
+        }
+    }
+
+    fn run(fixture: &Fixture, skip_backup: bool) -> VacuumIntoReport {
+        let (database, data_version) = fixture.locked();
+        vacuum_into(
+            database,
+            &fixture.path,
+            data_version,
+            VacuumIntoOptions { skip_backup },
+        )
+        .expect("VACUUM INTO should succeed")
+    }
+
+    fn pragma_i64(connection: &Connection, pragma: &str) -> i64 {
+        connection
+            .pragma_query_value(None, pragma, |row| row.get(0))
+            .expect("pragma should be readable")
+    }
+
+    fn assert_verified_database(path: &Path) {
+        let connection = Connection::open(path).expect("swapped database should open");
+        let integrity: String = connection
+            .pragma_query_value(None, "integrity_check", |row| row.get(0))
+            .expect("integrity check should run");
+        let journal_mode: String = connection
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .expect("journal mode should be readable");
+        assert_eq!(integrity, "ok");
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        assert_eq!(pragma_i64(&connection, "user_version"), USER_VERSION);
+        assert_eq!(pragma_i64(&connection, "application_id"), APPLICATION_ID);
+        assert_eq!(pragma_i64(&connection, "auto_vacuum"), 2);
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM alpha", [], |row| row.get::<_, i64>(0))
+                .expect("alpha count should be readable"),
+            48
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM beta", [], |row| row.get::<_, i64>(0))
+                .expect("beta count should be readable"),
+            48
+        );
+    }
+
+    fn content_hash(path: &Path) -> u64 {
+        let bytes = fs::read(path).expect("file should be hashable");
+        let mut hasher = DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn directory_names(path: &Path) -> Vec<String> {
+        let mut names = fs::read_dir(path)
+            .expect("directory should be readable")
+            .map(|entry| {
+                entry
+                    .expect("entry should be readable")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    fn run_with<Ops: FileOperations, Hooks: SwapHooks>(
+        fixture: &Fixture,
+        options: VacuumIntoOptions,
+        operations: &Ops,
+        hooks: &Hooks,
+    ) -> Result<VacuumIntoReport, Error> {
+        let (database, data_version) = fixture.locked();
+        vacuum_into_with_runtime(
+            database,
+            &fixture.path,
+            data_version,
+            options,
+            operations,
+            hooks,
+        )
+    }
+
+    #[derive(Default)]
+    struct RecordingHooks {
+        temporary_path: Mutex<Option<PathBuf>>,
+        backup_path: Mutex<Option<PathBuf>>,
+    }
+
+    impl SwapHooks for RecordingHooks {
+        fn after_vacuum(&self, _source: &Path, temporary: &Path) {
+            *self.temporary_path.lock().expect("temporary path lock") =
+                Some(temporary.to_path_buf());
+        }
+
+        fn backup_created(&self, backup: &Path) {
+            *self.backup_path.lock().expect("backup path lock") = Some(backup.to_path_buf());
+        }
+    }
+
+    struct CorruptOutputHooks {
+        temporary_path: Mutex<Option<PathBuf>>,
+    }
+
+    impl SwapHooks for CorruptOutputHooks {
+        fn after_vacuum(&self, _source: &Path, temporary: &Path) {
+            *self.temporary_path.lock().expect("temporary path lock") =
+                Some(temporary.to_path_buf());
+            corrupt_btree_page(temporary);
+        }
+    }
+
+    fn corrupt_btree_page(path: &Path) {
+        let connection = Connection::open(path).expect("output should open before corruption");
+        let page_size = pragma_i64(&connection, "page_size");
+        let page_number: i64 = connection
+            .query_row(
+                "SELECT pageno FROM dbstat
+                 WHERE name = 'alpha' AND pagetype IN ('internal', 'leaf') AND pageno > 1
+                 ORDER BY pageno LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("a non-root alpha b-tree page should exist");
+        drop(connection);
+        let offset =
+            u64::try_from((page_number - 1) * page_size).expect("fixture page offset should fit");
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("output should open for corruption");
+        file.seek(SeekFrom::Start(offset))
+            .expect("corruption offset should seek");
+        let mut original = [0_u8; 1];
+        file.read_exact(&mut original)
+            .expect("page type should be readable");
+        file.seek(SeekFrom::Start(offset))
+            .expect("corruption offset should seek again");
+        file.write_all(&[0xff])
+            .expect("page type should be corrupted");
+        file.sync_all().expect("corruption should reach disk");
+    }
+
+    struct ConcurrentWriterHooks {
+        source: PathBuf,
+        writer: Mutex<Option<thread::JoinHandle<()>>>,
+    }
+
+    impl ConcurrentWriterHooks {
+        fn new(source: PathBuf) -> Self {
+            Self {
+                source,
+                writer: Mutex::new(None),
+            }
+        }
+    }
+
+    impl SwapHooks for ConcurrentWriterHooks {
+        fn after_vacuum(&self, _source: &Path, _temporary: &Path) {
+            let path = self.source.clone();
+            let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+            let writer = thread::spawn(move || {
+                let connection = Connection::open(path).expect("writer should open source");
+                connection
+                    .busy_timeout(Duration::from_secs(10))
+                    .expect("writer timeout should configure");
+                ready_tx.send(()).expect("writer should signal readiness");
+                connection
+                    .execute(
+                        "INSERT INTO alpha (id, payload) VALUES (999, zeroblob(32))",
+                        [],
+                    )
+                    .expect("writer should commit after lock closes");
+            });
+            ready_rx.recv().expect("writer should become ready");
+            *self.writer.lock().expect("writer lock") = Some(writer);
+        }
+
+        fn after_lock_closed(&self, _source: &Path, _temporary: &Path) {
+            self.writer
+                .lock()
+                .expect("writer lock")
+                .take()
+                .expect("writer should exist")
+                .join()
+                .expect("writer should finish");
+        }
+    }
+
+    struct WriterAfterCloseHooks;
+
+    impl SwapHooks for WriterAfterCloseHooks {
+        fn after_lock_closed(&self, source: &Path, _temporary: &Path) {
+            let connection = Connection::open(source).expect("writer should open source");
+            connection
+                .execute(
+                    "INSERT INTO alpha (id, payload) VALUES (1000, zeroblob(32))",
+                    [],
+                )
+                .expect("writer should commit in close-to-swap window");
+        }
+    }
+
+    struct FailingRenameOperations {
+        hard_link_called: AtomicBool,
+        canonical_existed_at_rename: AtomicBool,
+        rename_source_was_canonical: AtomicBool,
+    }
+
+    impl FailingRenameOperations {
+        fn new() -> Self {
+            Self {
+                hard_link_called: AtomicBool::new(false),
+                canonical_existed_at_rename: AtomicBool::new(false),
+                rename_source_was_canonical: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl FileOperations for FailingRenameOperations {
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            fs::remove_file(path)
+        }
+
+        fn hard_link(&self, source: &Path, destination: &Path) -> io::Result<()> {
+            self.hard_link_called.store(true, Ordering::SeqCst);
+            fs::hard_link(source, destination)
+        }
+
+        fn copy(&self, source: &Path, destination: &Path) -> io::Result<u64> {
+            fs::copy(source, destination)
+        }
+
+        fn rename(&self, source: &Path, destination: &Path) -> io::Result<()> {
+            self.canonical_existed_at_rename
+                .store(destination.exists(), Ordering::SeqCst);
+            self.rename_source_was_canonical
+                .store(source == destination, Ordering::SeqCst);
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected rename failure",
+            ))
+        }
+    }
+
+    struct FixedTimestampHooks(&'static str);
+
+    impl SwapHooks for FixedTimestampHooks {
+        fn timestamp(&self) -> Option<String> {
+            Some(self.0.to_owned())
+        }
+    }
+
+    struct CorruptAfterRenameHooks;
+
+    impl SwapHooks for CorruptAfterRenameHooks {
+        fn after_rename(&self, database: &Path) {
+            corrupt_btree_page(database);
+        }
+    }
+
+    #[test]
+    fn verified_swap_shrinks_database_and_preserves_every_database_invariant() {
+        let fixture = Fixture::new("opencode-nightly.db");
+        let report = run(&fixture, false);
+
+        assert_verified_database(&fixture.path);
+        assert!(report.compacted_bytes < fixture.original_len);
+        assert_eq!(report.original_bytes, fixture.original_len);
+        assert_eq!(
+            report.bytes_reclaimed,
+            fixture.original_len - report.compacted_bytes
+        );
+        let backup = report.backup_path.expect("backup should be retained");
+        assert_eq!(
+            fs::read(backup).expect("backup should be readable"),
+            fixture.original_bytes
+        );
+    }
+
+    #[test]
+    fn skip_backup_removes_backup_only_after_verified_success() {
+        let fixture = Fixture::new("custom.db");
+        let report = run(&fixture, true);
+
+        assert_verified_database(&fixture.path);
+        assert_eq!(report.backup_path, None);
+        let names = fs::read_dir(fixture.path.parent().expect("fixture has a parent"))
+            .expect("fixture directory should be readable")
+            .map(|entry| entry.expect("entry should be readable").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [fixture.path.file_name().expect("fixture has a filename")]
+        );
+    }
+
+    #[test]
+    fn generated_siblings_use_resolved_filename_and_windows_legal_timestamp() {
+        let fixture = Fixture::new("opencode-nightly.db");
+        let hooks = RecordingHooks::default();
+        let report = run_with(
+            &fixture,
+            VacuumIntoOptions::default(),
+            &SystemFileOperations,
+            &hooks,
+        )
+        .expect("custom filename swap should succeed");
+        let backup = report.backup_path.expect("backup should be retained");
+        let backup_name = backup
+            .file_name()
+            .expect("backup should have a filename")
+            .to_string_lossy();
+        let suffix = backup_name
+            .strip_prefix("opencode-nightly.db.bak.")
+            .expect("backup should derive from resolved filename");
+        assert_eq!(suffix.len(), 16);
+        assert_eq!(&suffix[8..9], "T");
+        assert_eq!(&suffix[15..16], "Z");
+        assert!(suffix[..8].bytes().all(|byte| byte.is_ascii_digit()));
+        assert!(suffix[9..15].bytes().all(|byte| byte.is_ascii_digit()));
+        assert!(!backup_name.bytes().any(|byte| b":*?\"<>|".contains(&byte)));
+
+        let temporary = hooks
+            .temporary_path
+            .lock()
+            .expect("temporary path lock")
+            .clone()
+            .expect("temporary path should be recorded");
+        assert_eq!(temporary.parent(), fixture.path.parent());
+        assert!(
+            temporary
+                .file_name()
+                .expect("temporary path should have a filename")
+                .to_string_lossy()
+                .starts_with("opencode-nightly.db.oc-clean-tmp-")
+        );
+        assert_eq!(
+            directory_names(fixture.path.parent().expect("fixture parent")),
+            vec!["opencode-nightly.db".to_owned(), backup_name.into_owned()]
+        );
+    }
+
+    #[test]
+    fn failed_output_integrity_preserves_source_and_removes_temporary_file() {
+        let fixture = Fixture::new("integrity.db");
+        let hooks = CorruptOutputHooks {
+            temporary_path: Mutex::new(None),
+        };
+        let source_hash = content_hash(&fixture.path);
+        let error = run_with(
+            &fixture,
+            VacuumIntoOptions::default(),
+            &SystemFileOperations,
+            &hooks,
+        )
+        .expect_err("corrupt output should fail verification");
+
+        assert!(matches!(
+            error,
+            Error::IntegrityCheckFailed { .. } | Error::Sqlite { .. }
+        ));
+        assert_eq!(content_hash(&fixture.path), source_hash);
+        let temporary = hooks
+            .temporary_path
+            .lock()
+            .expect("temporary path lock")
+            .clone()
+            .expect("temporary path should be recorded");
+        assert!(!temporary.exists());
+    }
+
+    #[test]
+    fn writer_started_after_copy_causes_busy_abort_and_retains_commit() {
+        let fixture = Fixture::new("copy-window.db");
+        let hooks = ConcurrentWriterHooks::new(fixture.path.clone());
+        let error = run_with(
+            &fixture,
+            VacuumIntoOptions::default(),
+            &SystemFileOperations,
+            &hooks,
+        )
+        .expect_err("concurrent write should abort swap");
+
+        assert!(matches!(error, Error::DatabaseBusy { .. }));
+        let connection = Connection::open(&fixture.path).expect("source should remain readable");
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM alpha WHERE id = 999", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("concurrent row count should be readable"),
+            1
+        );
+        assert!(
+            !directory_names(fixture.path.parent().expect("fixture parent"))
+                .iter()
+                .any(|name| name.contains("oc-clean-tmp"))
+        );
+    }
+
+    #[test]
+    fn writer_after_lock_close_is_detected_before_sidecar_deletion() {
+        let fixture = Fixture::new("identity-window.db");
+        let error = run_with(
+            &fixture,
+            VacuumIntoOptions::default(),
+            &SystemFileOperations,
+            &WriterAfterCloseHooks,
+        )
+        .expect_err("close-window write should abort swap");
+
+        assert!(matches!(error, Error::DatabaseBusy { .. }));
+        let connection = Connection::open(&fixture.path).expect("source should remain readable");
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM alpha WHERE id = 1000", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("concurrent row count should be readable"),
+            1
+        );
+    }
+
+    #[test]
+    fn rename_failure_under_skip_backup_keeps_canonical_original_and_cleans_link() {
+        let fixture = Fixture::new("rename-failure.db");
+        let operations = FailingRenameOperations::new();
+        let source_hash = content_hash(&fixture.path);
+        let error = run_with(
+            &fixture,
+            VacuumIntoOptions { skip_backup: true },
+            &operations,
+            &NoopHooks,
+        )
+        .expect_err("injected rename should fail");
+
+        assert!(matches!(error, Error::Io { .. }));
+        assert!(operations.hard_link_called.load(Ordering::SeqCst));
+        assert!(
+            operations
+                .canonical_existed_at_rename
+                .load(Ordering::SeqCst)
+        );
+        assert!(
+            !operations
+                .rename_source_was_canonical
+                .load(Ordering::SeqCst)
+        );
+        assert_eq!(content_hash(&fixture.path), source_hash);
+        assert_eq!(
+            directory_names(fixture.path.parent().expect("fixture parent")),
+            vec!["rename-failure.db".to_owned()]
+        );
+    }
+
+    #[test]
+    fn unavailable_temporary_path_returns_typed_io_without_partial_output() {
+        let fixture = Fixture::new("unwritable.db");
+        let timestamp = "20260821T123456Z";
+        let temporary = fixture
+            .path
+            .with_file_name(format!("unwritable.db.oc-clean-tmp-{timestamp}"));
+        fs::create_dir(&temporary).expect("blocking directory should be created");
+        let source_hash = content_hash(&fixture.path);
+        let error = run_with(
+            &fixture,
+            VacuumIntoOptions::default(),
+            &SystemFileOperations,
+            &FixedTimestampHooks(timestamp),
+        )
+        .expect_err("unavailable temporary path should fail");
+
+        assert!(matches!(error, Error::Io { .. }));
+        assert_eq!(content_hash(&fixture.path), source_hash);
+        assert!(temporary.is_dir());
+        assert_eq!(
+            directory_names(fixture.path.parent().expect("fixture parent")),
+            vec![
+                "unwritable.db".to_owned(),
+                format!("unwritable.db.oc-clean-tmp-{timestamp}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn post_swap_verification_failure_restores_original_from_recovery_link() {
+        let fixture = Fixture::new("post-swap-failure.db");
+        let source_hash = content_hash(&fixture.path);
+        let error = run_with(
+            &fixture,
+            VacuumIntoOptions::default(),
+            &SystemFileOperations,
+            &CorruptAfterRenameHooks,
+        )
+        .expect_err("post-swap corruption should fail verification");
+
+        assert!(matches!(
+            error,
+            Error::IntegrityCheckFailed { .. } | Error::Sqlite { .. }
+        ));
+        assert_eq!(content_hash(&fixture.path), source_hash);
+        assert_eq!(
+            directory_names(fixture.path.parent().expect("fixture parent")),
+            vec!["post-swap-failure.db".to_owned()]
+        );
+        let connection = Connection::open(&fixture.path).expect("restored source should open");
+        assert_eq!(pragma_i64(&connection, "user_version"), USER_VERSION);
+    }
+
+    #[test]
+    fn stale_same_connection_data_version_aborts_before_swap() {
+        let fixture = Fixture::new("data-version.db");
+        let source_hash = content_hash(&fixture.path);
+        let (database, data_version) = fixture.locked();
+        let error = vacuum_into_with_runtime(
+            database,
+            &fixture.path,
+            data_version + 1,
+            VacuumIntoOptions::default(),
+            &SystemFileOperations,
+            &NoopHooks,
+        )
+        .expect_err("stale data_version should abort");
+
+        assert!(matches!(error, Error::DatabaseBusy { .. }));
+        assert_eq!(content_hash(&fixture.path), source_hash);
+        assert!(
+            !directory_names(fixture.path.parent().expect("fixture parent"))
+                .iter()
+                .any(|name| name.contains("oc-clean-tmp"))
+        );
+    }
+
+    #[test]
+    fn auto_vacuum_is_verified_without_an_output_setting_statement() {
+        let source = include_str!("vacuum_into.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source should precede test module");
+        let pragma_assignment = ["PRAGMA auto", "_vacuum ="].concat();
+        let pragma_update = ["pragma_update(None, \"auto", "_vacuum\""].concat();
+        assert!(!source.contains(&pragma_assignment));
+        assert!(!source.contains(&pragma_update));
+    }
+}
