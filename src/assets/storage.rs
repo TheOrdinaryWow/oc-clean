@@ -1,4 +1,4 @@
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -201,6 +201,10 @@ mod tests {
     ];
 
     struct Fixture {
+        #[cfg_attr(
+            not(unix),
+            expect(dead_code, reason = "kept alive so the fixture tree outlives the test")
+        )]
         directory: TempDir,
         database_path: PathBuf,
         storage_root: PathBuf,

@@ -941,7 +941,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::db::{ConnectionOptions, anchor_for_holder_scan, open_read_write};
+    #[cfg(unix)]
+    use crate::db::anchor_for_holder_scan;
+    use crate::db::{ConnectionOptions, open_read_write};
     use crate::paths::Target;
 
     const USER_VERSION: i64 = 42;
