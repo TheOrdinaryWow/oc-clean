@@ -95,18 +95,13 @@ cargo test --release --features bench-large --test perf performance_budgets_hold
 
 `benchmarks.json` holds committed measurements used as the regression reference for that test. Update it from an actual run, never by editing numbers.
 
-## Documentation Is Tested
+## Documentation
 
-`tests/readme.rs` includes `README.md` at compile time and asserts it against the source, so careless documentation edits fail the build:
-
-- The **Options** table must match the clap interface exactly in both directions, covering every long flag, its `<VALUE_NAME>`, and either its environment binding or the literal `CLI only`.
-- The **Exit Codes** table must cover every variant of `Error` in `src/error.rs` with matching codes.
-- README prose must be ASCII and must not soft-wrap. Two consecutive prose lines fail the test.
-- The **Roadmap** section must keep naming AFT and Magic Context.
-
-Adding or renaming a CLI flag or an error variant therefore requires a README change in the same commit.
+The README's **Options** table mirrors the clap interface and its **Exit Codes** table mirrors the `Error` enum in `src/error.rs`. Nothing checks this automatically, so adding or renaming a CLI flag or an error variant requires a README change in the same commit.
 
 `docs/json-report.md` documents the `--json` contract. Its `schema_version` is the compatibility boundary: additive fields are acceptable within a version, while removals, renames, and semantic changes require an increment.
+
+`.gitattributes` normalizes every text file to LF, so a Windows checkout receives the same bytes as a unix one.
 
 Markdown in this repository is not soft-wrapped. Write each paragraph as one long line and let the editor wrap it; line breaks belong only between paragraphs, list items, and code blocks.
 

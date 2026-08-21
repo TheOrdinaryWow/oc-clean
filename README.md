@@ -289,7 +289,7 @@ Tests create disposable SQLite fixtures under temporary directories. Development
 
 Continuous integration runs the fmt, lint, build, test, and doctest sequence natively on Ubuntu, macOS, and Windows, because holder detection has a distinct implementation per platform. Separate jobs enforce the coverage floor and scan dependencies for advisories.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the commit format, the branch and pull request workflow, release automation, and the documentation tests that gate changes to this file.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the commit format, the branch and pull request workflow, and release automation.
 
 ## License
 

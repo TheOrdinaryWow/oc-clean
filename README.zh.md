@@ -291,7 +291,7 @@ cargo llvm-cov --all-features nextest --no-tests=pass --fail-under-lines 80
 
 持续集成会在 Ubuntu、macOS 和 Windows 上原生执行 fmt、lint、build、test 和文档测试序列，因为持有者检测在每个平台上都有各自的实现。另有独立作业负责强制覆盖率下限和扫描依赖公告。
 
-提交格式、分支与合并请求流程、发布自动化，以及约束本文件改动的文档测试，都记录在 [CONTRIBUTING.md](CONTRIBUTING.md)（英文）中。
+提交格式、分支与合并请求流程，以及发布自动化，都记录在 [CONTRIBUTING.md](CONTRIBUTING.md)（英文）中。
 
 ## 许可证
 

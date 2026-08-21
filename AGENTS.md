@@ -100,18 +100,15 @@ cargo test --release --features bench-large --test perf performance_budgets_hold
 
 Coverage is a floor, not a goal — do not pad it with tests that assert nothing.
 
-## Documentation is tested
+## Documentation
 
-`tests/readme.rs` compiles `README.md` in and asserts against the source. Editing the README carelessly breaks the build:
-
-- The **Options** table must match the clap interface exactly, in both directions — every long flag, its `<VALUE_NAME>`, and its env binding or `CLI only`.
-- The **Exit Codes** table must cover every variant of `Error` in `src/error.rs`, with the same codes.
-- README prose must be **ASCII** and must not soft-wrap; two consecutive prose lines fail the test.
-- The **Roadmap** section must keep naming AFT and Magic Context.
-
-Adding or renaming a CLI flag or an error variant therefore requires a README edit in the same change.
+The README's **Options** table mirrors the clap interface and its **Exit Codes** table mirrors the `Error` enum in `src/error.rs`. Nothing enforces this automatically, so adding or renaming a CLI flag or an error variant means editing the README in the same change.
 
 `docs/json-report.md` documents the `--json` contract. `schema_version` is the compatibility boundary: additive fields are fine within a version, while removals, renames, and semantic changes require an increment.
+
+## Line endings
+
+`.gitattributes` normalizes every text file to LF, so a Windows checkout gets the same bytes as a unix one. Do not add CRLF files or per-file `eol` overrides.
 
 ## Markdown
 
