@@ -12,6 +12,28 @@ Deleting rows alone places pages on SQLite's freelist; it does not normally shri
 
 > `clean` and `vacuum` mutate the database. Each one prints its impact and waits for an interactive `yes` before doing anything; `--dry-run` prints the same report and exits instead. Keep the generated backup until the result has been independently checked, and stop OpenCode before destructive work.
 
+## OpenCode Version Compatibility
+
+`oc-clean` is bound to one OpenCode schema. It targets **OpenCode 1.18.19**, whose schema is extracted from the release binary and committed as `src/db/opencode_schema.sql`; that file's header records the source version, its sha256, and the extraction commands. Every SQL statement the tool issues names those tables and columns directly, so the binding is real rather than nominal.
+
+The binding is not exact-version equality. OpenCode releases that leave the tables and typed columns `oc-clean` reads unchanged will work, and OpenCode's own schema differs between a fresh install and an upgraded database, so both shapes are supported. What matters is whether the objects the tool depends on are still present and still typed the same way.
+
+`doctor` answers that question without touching data, and it is the first thing to run after an OpenCode upgrade:
+
+```sh
+oc-clean doctor
+```
+
+Its `Schema Compatibility` section reports all three tiers described under [Schema Strictness](#schema-strictness), and it is deliberately more permissive than the other commands: only a Tier 1 failure stops it, so a database the other commands refuse can still be diagnosed.
+
+| What `doctor` reports | `doctor` | `analyze`, `clean`, `vacuum` | What it means |
+|---|---|---|---|
+| Tier 1 required — findings | exit 4 | exit 4 | A table or typed column the SQL requires is missing or has an incompatible type. No flag bypasses it, including `--force-schema`. |
+| Tier 2 extensions — findings | exit 0 | exit 0 | Unknown tables, columns, or indexes the tool never reads. This is the normal shape of an OpenCode release that added something. |
+| Tier 3 semantics — findings | exit 0 | exit 4 | A foreign key, trigger, or view exists that the verified contract does not describe, so deletion semantics may differ from what was measured. `--force-schema` downgrades it to a warning. |
+
+A Tier 1 failure names the exact object, for example `missing required column session.time_archived`. Until multi-version support exists, treat it as "this build does not support that OpenCode" rather than something to work around: use an `oc-clean` release built for that OpenCode version, or wait for one. `analyze` and `doctor` are read-only in every case, so diagnosing an unknown database is always safe.
+
 ## Installation From Source
 
 The project uses Rust edition 2024, declares Rust 1.85 as its minimum version, and develops against nightly. `rust-toolchain.toml` pins that toolchain, so rustup selects and installs it automatically for commands run inside the checkout. Install the binary from a checked-out source tree with:
@@ -268,12 +290,14 @@ Exit codes are a stable process contract. Several error variants intentionally s
 - Database quiescence remains an operator responsibility; holder detection provides a point-in-time, visibility-limited safety signal.
 - Incremental vacuum remains a bounded freelist-reclamation strategy for databases already configured for it; a full rebuild provides separate compaction and verification behavior.
 - Schema migration remains outside scope; incompatible Tier 1 databases require a compatible release or a separately reviewed migration.
+- Supporting several OpenCode schema versions from one binary remains roadmap work; a given build targets the single version named under [OpenCode Version Compatibility](#opencode-version-compatibility).
 - Backup lifecycle management remains outside scope; default `.bak` files persist until the operator removes them.
 - Live OpenCode process shutdown remains outside scope; stop OpenCode before applied cleanup or reclamation.
 - AFT and Magic Context cleanup integrations remain roadmap work.
 
 ## Roadmap
 
+- Multi-version OpenCode support is wanted but not built. One build currently targets one schema, so an OpenCode release that changes a table or column `oc-clean` reads requires a matching `oc-clean` release. Supporting several schema revisions from a single binary would remove that coupling.
 - AFT cleanup integration is wanted but not built.
 - Magic Context cleanup integration is wanted but not built.
 

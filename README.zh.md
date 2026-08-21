@@ -12,6 +12,28 @@ OpenCode 把会话、消息、片段、事件及相关状态存放在 SQLite 中
 
 > `clean` 和 `vacuum` 会修改数据库。两者都会先打印影响范围，等待交互式输入 `yes` 之后才动手；`--dry-run` 打印同样的报告后直接退出。在独立核对结果之前请保留生成的备份，并在执行破坏性操作前停止 OpenCode。
 
+## OpenCode 版本兼容性
+
+`oc-clean` 与一份 OpenCode schema 强绑定，当前面向的是 **OpenCode 1.18.19**。该 schema 从发行二进制中提取并提交为 `src/db/opencode_schema.sql`，文件头记录了来源版本、sha256 以及提取命令。工具发出的每一条 SQL 都直接引用这些表和列，所以这个绑定是实质性的，不只是名义上的。
+
+绑定并不要求版本号完全相等。只要 OpenCode 的新版本没有改动 `oc-clean` 读取的那些表和带类型的列，就能正常工作；OpenCode 自身的 schema 在全新安装和升级过的数据库之间本来就有差异，两种形态都受支持。真正决定成败的是工具依赖的对象是否仍然存在、类型是否仍然一致。
+
+`doctor` 不触碰数据就能回答这个问题，升级 OpenCode 之后应当首先运行它：
+
+```sh
+oc-clean doctor
+```
+
+它的 `Schema Compatibility` 一节会报告 [Schema 严格程度](#schema-严格程度) 描述的全部三个层级，并且刻意比其他命令宽松：只有第 1 层失败才会中止它，因此其他命令拒绝执行的数据库仍然可以被诊断。
+
+| `doctor` 报告的内容 | `doctor` | `analyze`、`clean`、`vacuum` | 含义 |
+|---|---|---|---|
+| Tier 1 required — findings | 退出码 4 | 退出码 4 | SQL 所需的某张表或某个带类型的列缺失或类型不兼容。没有任何开关可以绕过，包括 `--force-schema`。 |
+| Tier 2 extensions — findings | 退出码 0 | 退出码 0 | 出现了工具从不读取的未知表、列或索引。这是 OpenCode 新版本增加了东西时的正常形态。 |
+| Tier 3 semantics — findings | 退出码 0 | 退出码 4 | 存在已验证契约未描述的外键、触发器或视图，删除语义可能与实测行为不同。`--force-schema` 可以把它降级为警告。 |
+
+第 1 层失败会指明具体对象，例如 `missing required column session.time_archived`。在多版本支持落地之前，请把它当作「这个构建不支持那个 OpenCode 版本」，而不是需要设法绕过的问题：改用面向那个 OpenCode 版本构建的 `oc-clean`，或等待相应版本发布。任何情况下 `analyze` 和 `doctor` 都保持只读，因此诊断一个未知数据库始终是安全的。
+
 ## 从源码安装
 
 本项目使用 Rust edition 2024，声明最低支持版本为 Rust 1.85，并基于 nightly 开发。`rust-toolchain.toml` 已固定该工具链，因此在检出目录内运行命令时 rustup 会自动选择并安装它。从检出的源码树安装二进制：
@@ -270,12 +292,14 @@ cargo test --release --features bench-large --test perf performance_budgets_hold
 - 数据库静默仍然是操作者的责任；持有者检测只提供一个时间点的、可见性受限的安全信号。
 - 增量 vacuum 仅是面向已配置该模式的数据库的有界空闲列表回收策略；完整重建提供另一套压缩与校验行为。
 - Schema 迁移不在范围内；第 1 层不兼容的数据库需要一个兼容的版本，或者一次单独评审过的迁移。
+- 让单个二进制支持多个 OpenCode schema 版本仍属于路线图工作；某个构建只面向 [OpenCode 版本兼容性](#opencode-版本兼容性) 中指明的那一个版本。
 - 备份生命周期管理不在范围内；默认的 `.bak` 文件会一直保留到操作者删除为止。
 - 关闭正在运行的 OpenCode 进程不在范围内；请在应用清理或回收之前自行停止 OpenCode。
 - AFT 与 Magic Context 的清理集成仍属于路线图工作。
 
 ## 路线图
 
+- 期望但尚未构建多版本 OpenCode 支持。目前一个构建只面向一份 schema，因此 OpenCode 若改动了 `oc-clean` 读取的表或列，就需要一个与之匹配的 `oc-clean` 版本。让单个二进制同时支持多个 schema 修订可以解除这层耦合。
 - 期望但尚未构建 AFT 清理集成。
 - 期望但尚未构建 Magic Context 清理集成。
 
