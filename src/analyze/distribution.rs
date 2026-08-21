@@ -248,8 +248,26 @@ fn read_directory(root: &Path) -> Result<Option<fs::ReadDir>, Error> {
     match fs::read_dir(root) {
         Ok(entries) => Ok(Some(entries)),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) if is_malformed_path(&source) => Ok(None),
         Err(source) => Err(io_error(root, source)),
     }
+}
+
+/// Reports whether the platform rejected the path as unusable rather than merely absent.
+///
+/// Windows returns `ERROR_INVALID_NAME` for a syntactically impossible path, which is how the
+/// placeholder siblings of an in-memory target appear there. Unix reports the same situation as
+/// a plain missing directory.
+#[cfg(windows)]
+fn is_malformed_path(source: &std::io::Error) -> bool {
+    const ERROR_INVALID_NAME: i32 = 123;
+
+    source.raw_os_error() == Some(ERROR_INVALID_NAME)
+}
+
+#[cfg(not(windows))]
+const fn is_malformed_path(_source: &std::io::Error) -> bool {
+    false
 }
 
 fn add_file(summary: &mut DirectorySummary, path: &Path) -> Result<(), Error> {
