@@ -1,7 +1,8 @@
 use std::ffi::{OsStr, OsString};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusqlite::{Connection, ErrorCode, OptionalExtension};
 use tracing::warn;
@@ -10,6 +11,8 @@ use crate::db::{FileIdentity, ReadWriteConnection};
 use crate::error::Error;
 
 use super::platform;
+
+static G_BACKUP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct VacuumIntoOptions {
@@ -100,6 +103,9 @@ trait FileOperations {
     fn remove_file(&self, path: &Path) -> io::Result<()>;
     fn hard_link(&self, source: &Path, destination: &Path) -> io::Result<()>;
     fn copy(&self, source: &Path, destination: &Path) -> io::Result<u64>;
+    fn copy_exclusive(&self, source: &Path, destination: &Path) -> io::Result<u64> {
+        copy_exclusive(source, destination)
+    }
     fn rename(&self, source: &Path, destination: &Path) -> io::Result<()>;
 }
 
@@ -205,12 +211,12 @@ fn vacuum_into_with_runtime<Ops: FileOperations, Hooks: SwapHooks>(
     drop(database);
     hooks.after_lock_closed(database_path, &temporary.path);
 
-    let backup_path = generated_path(database_path, ".bak.", &timestamp)?;
+    let proposed_backup_path = generated_path(database_path, ".bak.", &timestamp)?;
     hooks.enter_swap()?;
     let swap_result = swap_critical_section(
         database_path,
         &temporary.path,
-        &backup_path,
+        &proposed_backup_path,
         identity,
         hard_links,
         options.skip_backup,
@@ -218,7 +224,7 @@ fn vacuum_into_with_runtime<Ops: FileOperations, Hooks: SwapHooks>(
         hooks,
     );
     hooks.leave_swap();
-    let backup_created = swap_result?;
+    let backup_path = swap_result?;
 
     hooks.after_rename(database_path);
     sync_file_and_parent(database_path)?;
@@ -226,24 +232,30 @@ fn vacuum_into_with_runtime<Ops: FileOperations, Hooks: SwapHooks>(
         rollback_after_verification_failure(
             operations,
             database_path,
-            &backup_path,
-            backup_created,
+            backup_path.as_deref().unwrap_or(&proposed_backup_path),
+            backup_path.is_some(),
         )?;
         return Err(verification_error);
     }
     let compacted_bytes = file_size(database_path)?;
     cleanup_temporary_sidecars(operations, &temporary.path);
-    if options.skip_backup && backup_created {
+    if options.skip_backup
+        && let Some(backup_path) = &backup_path
+    {
         operations
-            .remove_file(&backup_path)
-            .map_err(|source| io_error(&backup_path, source))?;
+            .remove_file(backup_path)
+            .map_err(|source| io_error(backup_path, source))?;
     }
 
     Ok(VacuumIntoReport {
         original_bytes,
         compacted_bytes,
         bytes_reclaimed: original_bytes.saturating_sub(compacted_bytes),
-        backup_path: (!options.skip_backup && backup_created).then_some(backup_path),
+        backup_path: if options.skip_backup {
+            None
+        } else {
+            backup_path
+        },
     })
 }
 
@@ -257,33 +269,35 @@ fn swap_critical_section<Ops: FileOperations, Hooks: SwapHooks>(
     skip_backup: bool,
     operations: &Ops,
     hooks: &Hooks,
-) -> Result<bool, Error> {
+) -> Result<Option<PathBuf>, Error> {
     if identity_for_path(database_path)? != expected_identity {
         return Err(database_busy("source file identity changed before swap"));
     }
     ensure_sidecars_quiescent(database_path)?;
     remove_quiescent_sidecars(operations, database_path)?;
 
-    let backup_created = create_recovery_link(
+    let backup_path = create_recovery_link(
         operations,
         database_path,
         backup_path,
         hard_links,
         skip_backup,
     )?;
-    if backup_created {
+    if let Some(backup_path) = &backup_path {
         hooks.backup_created(backup_path);
     }
     if let Err(source) = operations.rename(temporary_path, database_path) {
-        if backup_created && operations.remove_file(backup_path).is_err() {
+        if let Some(backup_path) = &backup_path
+            && operations.remove_file(backup_path).is_err()
+        {
             return Err(Error::SwapRollbackFailed {
                 database_path: database_path.to_path_buf(),
-                backup_path: backup_path.to_path_buf(),
+                backup_path: backup_path.clone(),
             });
         }
         return Err(io_error(database_path, source));
     }
-    Ok(backup_created)
+    Ok(backup_path)
 }
 
 fn checkpoint_source(connection: &Connection) -> Result<(), Error> {
@@ -537,19 +551,92 @@ fn create_recovery_link<Ops: FileOperations>(
     backup_path: &Path,
     hard_links: bool,
     skip_backup: bool,
-) -> Result<bool, Error> {
-    if hard_links {
-        operations
-            .hard_link(database_path, backup_path)
-            .map_err(|source| io_error(backup_path, source))?;
-        Ok(true)
-    } else if skip_backup {
-        Ok(false)
-    } else {
-        operations
-            .copy(database_path, backup_path)
-            .map_err(|source| io_error(backup_path, source))?;
-        Ok(true)
+) -> Result<Option<PathBuf>, Error> {
+    if skip_backup && !hard_links {
+        return Ok(None);
+    }
+
+    refuse_destination_symlink(backup_path)?;
+    loop {
+        let candidate = available_backup_candidate(backup_path)?;
+        refuse_destination_symlink(&candidate)?;
+        let result = if hard_links {
+            operations.hard_link(database_path, &candidate).map(|()| 0)
+        } else {
+            operations.copy_exclusive(database_path, &candidate)
+        };
+        match result {
+            Ok(_) => return Ok(Some(candidate)),
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                refuse_destination_symlink(&candidate)?;
+            }
+            Err(source) => return Err(io_error(&candidate, source)),
+        }
+    }
+}
+
+fn available_backup_candidate(backup_path: &Path) -> Result<PathBuf, Error> {
+    match fs::symlink_metadata(backup_path) {
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(backup_path.to_path_buf()),
+        Err(source) => Err(io_error(backup_path, source)),
+        Ok(_) => {
+            let filename = backup_path
+                .file_name()
+                .ok_or_else(|| Error::InvalidArgument {
+                    argument: backup_path.display().to_string(),
+                    reason: "backup path has no filename".to_owned(),
+                })?;
+            let sequence = G_BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let mut candidate = OsString::from(filename);
+            candidate.push(format!("-{}-{sequence}", std::process::id()));
+            Ok(backup_path.with_file_name(candidate))
+        }
+    }
+}
+
+fn refuse_destination_symlink(path: &Path) -> Result<(), Error> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(io_error(
+            path,
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "backup destination is a symbolic link",
+            ),
+        )),
+        Ok(_) => Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(io_error(path, source)),
+    }
+}
+
+fn copy_exclusive(source: &Path, destination: &Path) -> io::Result<u64> {
+    match fs::symlink_metadata(destination) {
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "backup destination already exists",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let mut source_file = fs::File::open(source)?;
+    let mut destination_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    let result = io::copy(&mut source_file, &mut destination_file).and_then(|bytes| {
+        destination_file.set_permissions(source_file.metadata()?.permissions())?;
+        Ok(bytes)
+    });
+    match result {
+        Ok(bytes) => Ok(bytes),
+        Err(error) => {
+            drop(destination_file);
+            let _ = fs::remove_file(destination);
+            Err(error)
+        }
     }
 }
 
@@ -801,6 +888,8 @@ mod tests {
     use std::fs;
     use std::hash::{Hash, Hasher};
     use std::io::{Read, Seek, SeekFrom, Write};
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Mutex, mpsc};
@@ -1271,6 +1360,57 @@ mod tests {
         assert_eq!(
             directory_names(fixture.path.parent().expect("fixture parent")),
             vec!["opencode-nightly.db".to_owned(), backup_name.into_owned()]
+        );
+    }
+
+    #[test]
+    fn repeated_backup_timestamp_retains_distinct_backups() {
+        let fixture = Fixture::new("backup-collision.db");
+        let timestamp = "20260821T123456Z";
+
+        let first = run_with(
+            &fixture,
+            VacuumIntoOptions::default(),
+            &SystemFileOperations,
+            &FixedTimestampHooks(timestamp),
+        )
+        .expect("first backup should succeed")
+        .backup_path
+        .expect("first backup should be retained");
+        let second = run_with(
+            &fixture,
+            VacuumIntoOptions::default(),
+            &SystemFileOperations,
+            &FixedTimestampHooks(timestamp),
+        )
+        .expect("second backup should choose a fresh path")
+        .backup_path
+        .expect("second backup should be retained");
+
+        assert_ne!(first, second);
+        assert!(first.is_file());
+        assert!(second.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_backup_refuses_existing_destination_symlink() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let source = directory.path().join("source.db");
+        let destination = directory.path().join("backup.db");
+        let redirected = directory.path().join("redirected.db");
+        fs::write(&source, b"backup bytes").expect("source should be written");
+        fs::write(&redirected, b"sentinel bytes").expect("sentinel should be written");
+        symlink(&redirected, &destination).expect("destination symlink should be created");
+
+        let error =
+            create_recovery_link(&SystemFileOperations, &source, &destination, false, false)
+                .expect_err("copy backup should refuse an existing destination symlink");
+
+        assert!(matches!(error, Error::Io { .. }));
+        assert_eq!(
+            fs::read(&redirected).expect("sentinel should remain readable"),
+            b"sentinel bytes"
         );
     }
 
