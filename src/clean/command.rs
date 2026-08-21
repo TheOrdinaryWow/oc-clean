@@ -102,17 +102,8 @@ where
         let database = db::open_read_only(&target, ConnectionOptions::default())?;
         check_auto_vacuum(&database).map_err(incremental_precondition_error)?;
     }
+    phase(observer, PhaseId::P4);
     ensure_selector(arguments)?;
-
-    if !arguments.incremental && !arguments.no_vacuum {
-        phase(observer, PhaseId::P4);
-        reclaim::pre_delete_headroom(
-            database_path,
-            &pre_delete_space,
-            hard_links || cli.skip_backup,
-            free_space,
-        )?;
-    }
 
     let database = db::open_read_write(&target, ConnectionOptions::default())?;
     signals.set_interrupt_handle(database.interrupt_handle());
@@ -138,12 +129,39 @@ where
         None
     };
 
-    phase(observer, PhaseId::P9);
     let impact = impact::summarize(
         &database,
         &paths,
         &selection::impact_selection(arguments, now_ms),
     )?;
+    if !arguments.incremental && !arguments.no_vacuum {
+        let mut deletion_batch_ids = selected.clone();
+        if let Some(raw_orphans) = &raw_orphans {
+            deletion_batch_ids.extend(
+                raw_orphans
+                    .event_aggregate_ids
+                    .iter()
+                    .map(|id| id.as_str().to_owned()),
+            );
+            deletion_batch_ids.extend(
+                raw_orphans
+                    .dangling_session_ids
+                    .iter()
+                    .map(|id| id.as_str().to_owned())
+                    .filter(|id| !retained.contains(id)),
+            );
+        }
+        phase(observer, PhaseId::P9);
+        reclaim::pre_delete_headroom(
+            database_path,
+            &pre_delete_space,
+            impact.summary.current_live_bytes,
+            impact.summary.database_bytes,
+            deletion_batch_ids.len(),
+            hard_links || cli.skip_backup,
+            free_space,
+        )?;
+    }
     phase(observer, PhaseId::P10);
     if !cli.apply {
         return output::write_dry_run(&impact.summary, arguments.json, output)

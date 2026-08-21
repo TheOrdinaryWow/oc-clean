@@ -17,15 +17,22 @@ const INCREMENTAL_PAGES_PER_BATCH: u32 = 1_000;
 pub(super) fn pre_delete_headroom(
     database_path: &Path,
     file: &FileSpace,
+    current_live_bytes: u64,
+    selected_session_bytes: u64,
+    selected_session_count: usize,
     hard_link_available: bool,
     free_space: &impl FreeSpaceProvider,
 ) -> Result<(), Error> {
     ensure_headroom(
         database_path,
-        file.live_bytes,
-        0,
+        current_live_bytes,
+        selected_session_bytes,
         file.total_bytes,
-        one_batch_wal_allowance(0, 0, file.page_size),
+        one_batch_wal_allowance(
+            selected_session_bytes,
+            selected_session_count,
+            file.page_size,
+        ),
         hard_link_available,
         free_space,
     )

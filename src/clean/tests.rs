@@ -35,6 +35,14 @@ impl FreeSpaceProvider for UnlimitedSpace {
     }
 }
 
+struct FixedSpace(u64);
+
+impl FreeSpaceProvider for FixedSpace {
+    fn available_space(&self, _directory: &Path) -> std::io::Result<u64> {
+        Ok(self.0)
+    }
+}
+
 #[derive(Default)]
 struct Recorder(RefCell<Vec<PhaseId>>);
 
@@ -153,11 +161,11 @@ fn exact_phase_order_covers_default_and_conditional_paths() {
             PhaseId::P2,
             PhaseId::P3,
             PhaseId::P3b,
+            PhaseId::P4,
             PhaseId::P5,
             PhaseId::P6,
             PhaseId::P7,
             PhaseId::P8,
-            PhaseId::P9,
             PhaseId::P10,
             PhaseId::P11,
             PhaseId::P12,
@@ -172,6 +180,76 @@ fn exact_phase_order_covers_default_and_conditional_paths() {
             PhaseId::P21,
         ]
     );
+}
+
+#[test]
+fn p9_allows_clean_when_selection_makes_projected_rebuild_fit() {
+    let fixture = Fixture::build(&FixtureConfig {
+        session_count: 600,
+        archived_session_count: 600,
+        messages_per_session: 1,
+        parts_per_message: 1,
+        blob_size_per_part: 4 * 1_024,
+        ..FixtureConfig::default()
+    })
+    .expect("fixture should build");
+    let target = crate::paths::Target::File(fixture.database_path.clone());
+    let database = crate::db::open_read_only(&target, crate::db::ConnectionOptions::default())
+        .expect("fixture should open read-only");
+    let current_live_bytes = crate::analyze::space::analyze(&database)
+        .expect("fixture space should analyze")
+        .file
+        .live_bytes;
+    drop(database);
+
+    let mut cli = cli(&fixture.database_path, false);
+    cli.apply = false;
+    let mut arguments = arguments(false);
+    arguments.json = true;
+    let signals = SignalController::new();
+    let mut baseline_output = Vec::new();
+    run_with(
+        &cli,
+        &arguments,
+        &mut Cursor::new(Vec::<u8>::new()),
+        &mut baseline_output,
+        &UnlimitedSpace,
+        &NotHeldInspector,
+        RuntimeContext {
+            stdin_is_terminal: false,
+            stdout_is_terminal: false,
+        },
+        &signals,
+        &Recorder::default(),
+    )
+    .expect("baseline dry-run should succeed");
+    let baseline: serde_json::Value =
+        serde_json::from_slice(&baseline_output).expect("dry-run output should be JSON");
+    let projected_live_bytes = baseline["impact"]["estimated_post_vacuum_bytes"]
+        .as_u64()
+        .expect("projected live bytes should be numeric");
+    let available_bytes = current_live_bytes.saturating_sub(1);
+    assert!(available_bytes < current_live_bytes);
+    assert!(available_bytes > projected_live_bytes);
+
+    let recorder = Recorder::default();
+    let result = run_with(
+        &cli,
+        &arguments,
+        &mut Cursor::new(Vec::<u8>::new()),
+        &mut Vec::new(),
+        &FixedSpace(available_bytes),
+        &NotHeldInspector,
+        RuntimeContext {
+            stdin_is_terminal: false,
+            stdout_is_terminal: false,
+        },
+        &signals,
+        &recorder,
+    );
+
+    assert!(result.is_ok(), "projected rebuild should fit: {result:?}");
+    assert!(recorder.0.into_inner().contains(&PhaseId::P10));
 }
 
 #[test]
