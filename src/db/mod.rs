@@ -8,6 +8,7 @@ use rusqlite::{Connection, ErrorCode, InterruptHandle, OpenFlags};
 
 use crate::error::Error;
 use crate::paths::Target;
+use crate::safety::holders::resolve_database_target;
 
 pub mod schema;
 
@@ -299,12 +300,15 @@ fn probe_hard_links(database_path: &Path) -> Result<bool, Error> {
 }
 
 fn ensure_exists(path: &Path) -> Result<(), Error> {
-    if path.exists() {
-        Ok(())
-    } else {
-        Err(Error::NotFound {
+    match resolve_database_target(path) {
+        Ok(_) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Err(Error::NotFound {
             path: path.to_path_buf(),
-        })
+        }),
+        Err(source) => Err(Error::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
     }
 }
 

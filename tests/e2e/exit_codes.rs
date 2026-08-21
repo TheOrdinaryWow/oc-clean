@@ -138,6 +138,36 @@ fn missing_database_produces_exit_three() {
     assert_code(&output, 3);
 }
 
+#[cfg(unix)]
+#[test]
+fn symlink_cycle_produces_exit_one_for_doctor_and_vacuum() {
+    let directory = tempfile::tempdir().expect("temporary directory should create");
+    let first = directory.path().join("cycle-a.db");
+    let second = directory.path().join("cycle-b.db");
+    std::os::unix::fs::symlink("cycle-b.db", &first).expect("first cycle symlink should create");
+    std::os::unix::fs::symlink("cycle-a.db", &second).expect("second cycle symlink should create");
+
+    for subcommand in ["doctor", "vacuum"] {
+        let output = binary()
+            .arg(subcommand)
+            .arg("--db")
+            .arg(&first)
+            .output()
+            .unwrap_or_else(|error| panic!("{subcommand} should run: {error}"));
+
+        assert_code(&output, 1);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("symlink cycle while resolving"),
+            "{subcommand} should identify the symlink cycle: {stderr}"
+        );
+        assert!(
+            stderr.contains(&first.display().to_string()),
+            "{subcommand} should identify the database path: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn incompatible_schema_produces_exit_four_without_mutation() {
     let fixture = Fixture::build(&FixtureConfig::default()).expect("fixture should build");
