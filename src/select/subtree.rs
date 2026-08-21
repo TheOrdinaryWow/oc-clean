@@ -2,7 +2,7 @@ use rusqlite::{Connection, OptionalExtension, params_from_iter};
 
 use crate::analyze::attribution;
 use crate::cli::types::Size;
-use crate::db::DatabaseConnection;
+use crate::db::{self, DatabaseConnection};
 use crate::error::Error;
 
 use super::predicates::SessionIds;
@@ -156,10 +156,7 @@ fn parent_cycle(root_id: &str) -> Error {
 }
 
 fn sqlite_error(context: &str, source: rusqlite::Error) -> Error {
-    Error::Sqlite {
-        context: context.to_owned(),
-        source,
-    }
+    db::sqlite_error(context, source)
 }
 
 #[cfg(test)]

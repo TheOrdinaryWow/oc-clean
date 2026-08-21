@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::db::DatabaseConnection;
+use crate::db::{self, DatabaseConnection};
 use crate::error::Error;
 use crate::select::predicates::{SessionIds, effective_time_updated};
 use crate::select::subtree;
@@ -100,10 +100,7 @@ pub fn compute<Access>(
 }
 
 fn sqlite_error(context: &str, source: rusqlite::Error) -> Error {
-    Error::Sqlite {
-        context: context.to_owned(),
-        source,
-    }
+    db::sqlite_error(context, source)
 }
 
 #[cfg(test)]

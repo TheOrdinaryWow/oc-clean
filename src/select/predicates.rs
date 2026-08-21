@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use crate::cli::types::Duration;
-use crate::db::DatabaseConnection;
+use crate::db::{self, DatabaseConnection};
 use crate::error::Error;
 
 const EFFECTIVE_TIME_UPDATED_SQL: &str = r"
@@ -412,10 +412,7 @@ fn parent_cycle(root_id: &str) -> Error {
 }
 
 fn sqlite_error(context: &str, source: rusqlite::Error) -> Error {
-    Error::Sqlite {
-        context: context.to_owned(),
-        source,
-    }
+    db::sqlite_error(context, source)
 }
 
 #[cfg(test)]
@@ -674,5 +671,18 @@ mod tests {
         assert_eq!(selected, ids(&["ses_3"]));
         assert!(selected.is_subset(&age));
         assert!(intersect_candidate_sets(Vec::new()).is_none());
+    }
+
+    #[test]
+    fn sqlite_busy_maps_to_database_busy_exit_five() {
+        let source = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+
+        let error = sqlite_error("testing session predicate query", source);
+
+        assert!(matches!(error, Error::DatabaseBusy { .. }));
+        assert_eq!(error.exit_code(), 5);
     }
 }

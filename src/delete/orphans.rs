@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
-use crate::db::{DatabaseConnection, ReadWrite};
+use crate::db::{self, DatabaseConnection, ReadWrite};
 use crate::error::Error;
 use crate::select::orphans::{DanglingSessionId, EventAggregateId, RawOrphans};
 use crate::select::predicates::SessionIds;
@@ -219,10 +219,7 @@ fn merge_deletion_report(target: &mut DeletionReport, source: DeletionReport) {
 }
 
 fn sqlite_error(context: &str, source: rusqlite::Error) -> Error {
-    Error::Sqlite {
-        context: context.to_owned(),
-        source,
-    }
+    db::sqlite_error(context, source)
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use rusqlite::{Transaction, TransactionBehavior};
 
-use crate::db::{DatabaseConnection, ReadWrite};
+use crate::db::{self, DatabaseConnection, ReadWrite};
 use crate::error::Error;
 use crate::select::predicates::SessionIds;
 
@@ -139,10 +139,7 @@ fn ensure_foreign_keys(database: &DatabaseConnection<ReadWrite>) -> Result<(), E
 }
 
 fn sqlite_error(context: &str, source: rusqlite::Error) -> Error {
-    Error::Sqlite {
-        context: context.to_owned(),
-        source,
-    }
+    db::sqlite_error(context, source)
 }
 
 #[cfg(test)]

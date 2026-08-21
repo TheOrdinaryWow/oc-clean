@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use rusqlite::{Connection, Transaction};
 
 use super::TempIdBatcher;
-use crate::db::{DatabaseConnection, ReadWrite};
+use crate::db::{self, DatabaseConnection, ReadWrite};
 use crate::error::Error;
 use crate::select::predicates::SessionIds;
 
@@ -331,8 +331,23 @@ fn batch_deadline_error() -> Error {
 }
 
 fn sqlite_error(context: &str, source: rusqlite::Error) -> Error {
-    Error::Sqlite {
-        context: context.to_owned(),
-        source,
+    db::sqlite_error(context, source)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sqlite_locked_maps_to_database_busy_exit_five() {
+        let source = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
+            None,
+        );
+
+        let error = sqlite_error("testing session deletion", source);
+
+        assert!(matches!(error, Error::DatabaseBusy { .. }));
+        assert_eq!(error.exit_code(), 5);
     }
 }

@@ -473,10 +473,7 @@ fn ensure_selector(arguments: &CleanArgs) -> Result<(), Error> {
 
 fn incremental_precondition_error(error: IncrementalVacuumError) -> Error {
     match error {
-        IncrementalVacuumError::Sqlite { context, source } => Error::Sqlite {
-            context: context.to_owned(),
-            source,
-        },
+        IncrementalVacuumError::Sqlite { context, source } => db::sqlite_error(context, source),
         other => Error::ReclaimUnavailable {
             reason: other.to_string(),
         },
@@ -550,5 +547,26 @@ fn output_error(source: io::Error) -> Error {
     Error::Io {
         path: PathBuf::from("<stdout>"),
         source,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incremental_precondition_busy_maps_to_database_busy_exit_five() {
+        let source = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+
+        let error = incremental_precondition_error(IncrementalVacuumError::Sqlite {
+            context: "checking incremental vacuum precondition",
+            source,
+        });
+
+        assert!(matches!(error, Error::DatabaseBusy { .. }));
+        assert_eq!(error.exit_code(), 5);
     }
 }
