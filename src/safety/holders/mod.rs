@@ -1,5 +1,6 @@
 //! Cross-platform process-holder inspection and command gating.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::error::Error;
@@ -159,13 +160,16 @@ pub fn inspect_and_decide(
 }
 
 pub(crate) fn database_related_paths(database_path: &Path) -> [PathBuf; 3] {
-    let database_path =
-        std::fs::canonicalize(database_path).unwrap_or_else(|_| absolute_path(database_path));
+    let database_path = normalize_database_path(database_path);
     [
         database_path.clone(),
         path_with_suffix(&database_path, "-wal"),
         path_with_suffix(&database_path, "-shm"),
     ]
+}
+
+fn normalize_database_path(path: &Path) -> PathBuf {
+    fold_path_case(strip_trailing_separators(&absolute_path(path)))
 }
 
 fn absolute_path(path: &Path) -> PathBuf {
@@ -174,6 +178,46 @@ fn absolute_path(path: &Path) -> PathBuf {
     } else {
         std::env::current_dir().map_or_else(|_| path.to_owned(), |current| current.join(path))
     }
+}
+
+#[cfg(unix)]
+fn strip_trailing_separators(path: &Path) -> PathBuf {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let bytes = path.as_os_str().as_bytes();
+    let end = bytes
+        .iter()
+        .rposition(|byte| *byte != b'/')
+        .map_or(1, |index| index + 1);
+    PathBuf::from(OsString::from_vec(bytes[..end].to_vec()))
+}
+
+#[cfg(windows)]
+fn strip_trailing_separators(path: &Path) -> PathBuf {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    while wide
+        .last()
+        .is_some_and(|unit| *unit == u16::from(b'/') || *unit == u16::from(b'\\'))
+    {
+        let candidate = OsString::from_wide(&wide[..wide.len() - 1]);
+        if !Path::new(&candidate).is_absolute() {
+            break;
+        }
+        wide.pop();
+    }
+    PathBuf::from(OsString::from_wide(&wide))
+}
+
+#[cfg(not(windows))]
+fn fold_path_case(path: PathBuf) -> PathBuf {
+    path
+}
+
+#[cfg(windows)]
+fn fold_path_case(path: PathBuf) -> PathBuf {
+    PathBuf::from(path.to_string_lossy().to_lowercase())
 }
 
 fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -185,6 +229,9 @@ fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
 
     #[derive(Clone)]
     struct FakeInspector(Inspection);
@@ -218,6 +265,42 @@ mod tests {
             verdict: Verdict::CannotDetermine("permission denied".to_owned()),
             completeness: Completeness::PartialDueToPermissions,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_related_paths_preserve_symlink_path() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let target = directory.path().join("target.db");
+        std::fs::write(&target, []).expect("database fixture should be created");
+        let link = directory.path().join("linked.db");
+        symlink(&target, &link).expect("database symlink should be created");
+
+        let related = database_related_paths(&link);
+
+        assert_eq!(related[0], link);
+        assert_eq!(related[1], path_with_suffix(&link, "-wal"));
+        assert_eq!(related[2], path_with_suffix(&link, "-shm"));
+        assert_ne!(related[0], target);
+    }
+
+    #[test]
+    fn database_related_paths_are_absolute_and_strip_trailing_separators() {
+        let related = database_related_paths(Path::new("holder-fixture.db/"));
+
+        assert!(related[0].is_absolute());
+        assert_eq!(
+            related[0].file_name(),
+            Some(std::ffi::OsStr::new("holder-fixture.db"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn database_related_paths_fold_case_on_windows() {
+        let related = database_related_paths(Path::new(r"C:\Holder-Fixture.DB\"));
+
+        assert_eq!(related[0], Path::new(r"c:\holder-fixture.db"));
     }
 
     #[test]
