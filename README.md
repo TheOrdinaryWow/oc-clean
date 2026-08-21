@@ -148,7 +148,7 @@ The table is the complete set of long flags defined by the current clap interfac
 
 ## Environment Variables
 
-The executable is named `oc-clean`, while its own environment-variable prefix is `OCC_`. The current clap interface exposes `OCC_DB` only; every `CLI only` table entry has no environment binding, and destructive switches intentionally require visible command-line input.
+The executable is named `oc-clean`, while its own environment-variable prefix is `OCC_`. The current clap interface exposes an `OCC_*` environment binding for every non-destructive option across all four subcommands; destructive switches intentionally require visible command-line input.
 
 `OPENCODE_DB` belongs to OpenCode and participates in fallback database discovery after `--db` and `OCC_DB`. `XDG_DATA_HOME`, `HOME`, `USERPROFILE`, and `OPENCODE_DISABLE_CHANNEL_DB` may also influence platform discovery. `NO_COLOR` disables color in human analysis output.
 
