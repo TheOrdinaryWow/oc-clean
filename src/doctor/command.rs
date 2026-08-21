@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 
 use super::model::{DoctorReport, VacuumHeadroom};
@@ -66,7 +66,11 @@ pub fn run(cli: &Cli, arguments: &DoctorArgs, output: &mut dyn Write) -> Result<
     if arguments.json {
         super::json::write(&report, output)?;
     } else {
-        super::human::write(&report, output)?;
+        let style = crate::report::format::Style::resolve(
+            std::io::stdout().is_terminal(),
+            std::env::var_os("NO_COLOR").is_some(),
+        );
+        super::human::write(&report, output, style)?;
     }
     ensure_report_health(&report)
 }

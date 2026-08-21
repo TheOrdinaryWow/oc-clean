@@ -358,6 +358,17 @@ mod analyze {
         #[test]
         fn each_payload_table_has_one_grouped_scan_for_both_rollups() {
             let source = include_str!("../src/analyze/attribution.rs");
+            // Only the rollup query is scan-sensitive: it aggregates every payload table across
+            // the whole database. Per-session lookups elsewhere in the module are indexed point
+            // reads and are excluded from this budget on purpose.
+            let rollup_start = source
+                .find("const ATTRIBUTION_SQL")
+                .expect("the rollup query constant should exist");
+            let rollup_end = source[rollup_start..]
+                .find("\";")
+                .expect("the rollup query constant should terminate")
+                + rollup_start;
+            let rollup = &source[rollup_start..rollup_end];
 
             for table in [
                 "message",
@@ -367,12 +378,12 @@ mod analyze {
                 "event",
             ] {
                 assert_eq!(
-                    source.matches(&format!("FROM {table} ")).count(),
+                    rollup.matches(&format!("FROM {table} ")).count(),
                     1,
                     "{table}"
                 );
             }
-            assert!(source.contains("octet_length("));
+            assert!(rollup.contains("octet_length("));
             assert!(!source.contains(" LENGTH("));
         }
     }

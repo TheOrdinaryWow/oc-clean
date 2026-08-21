@@ -1,4 +1,4 @@
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::db::{self, Capabilities, DatabaseConnection};
 use crate::error::Error;
@@ -104,6 +104,73 @@ pub struct SessionAttribution {
     pub project_id: String,
     pub self_bytes: u64,
     pub subtree_bytes: u64,
+    /// Descriptive fields, present only once [`describe`] has run for this session.
+    pub details: Option<SessionDetails>,
+}
+
+/// Human-facing session facts that a size rollup alone cannot convey.
+///
+/// A session identifier is a random string, so a report that shows only identifiers gives an
+/// operator no basis for deciding what to keep. The title and activity date do.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionDetails {
+    pub title: String,
+    pub time_updated_ms: i64,
+    pub message_count: u64,
+}
+
+const DESCRIBE_SQL: &str = r"
+SELECT
+    session.id,
+    session.title,
+    session.time_updated,
+    (
+        SELECT COUNT(*) FROM message WHERE message.session_id = session.id
+    ) + (
+        SELECT COUNT(*) FROM session_message WHERE session_message.session_id = session.id
+    )
+FROM session
+WHERE session.id = ?1
+";
+
+/// Attaches titles, activity dates, and message counts to the given sessions.
+///
+/// The lookup is deliberately per-session rather than a join inside the attribution query:
+/// callers such as size selection request an attribution rollup covering every session, and
+/// counting messages for all of them would scan the whole `message` table for a report that
+/// only ever displays a handful of rows.
+///
+/// A session that disappeared between the rollup and this lookup keeps `details` unset rather
+/// than failing the report.
+///
+/// # Errors
+///
+/// Returns [`Error::Sqlite`] when the description query cannot be prepared or executed.
+pub fn describe(connection: &Connection, sessions: &mut [SessionAttribution]) -> Result<(), Error> {
+    if sessions.is_empty() {
+        return Ok(());
+    }
+    let mut statement = connection
+        .prepare(DESCRIBE_SQL)
+        .map_err(|source| sqlite_error("preparing session description lookup", source))?;
+    for session in sessions {
+        let row = statement
+            .query_row(params![session.session_id], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .optional()
+            .map_err(|source| sqlite_error("reading session description", source))?;
+        session.details = row.map(|(title, time_updated_ms, message_count)| SessionDetails {
+            title,
+            time_updated_ms,
+            message_count: u64::try_from(message_count).unwrap_or(0),
+        });
+    }
+    Ok(())
 }
 
 /// Project totals and the largest session subtrees.
@@ -221,6 +288,7 @@ fn session_row(row: &rusqlite::Row<'_>, session_id: String) -> Result<SessionAtt
         project_id,
         self_bytes: non_negative_bytes(3, self_bytes, "reading session self bytes")?,
         subtree_bytes: non_negative_bytes(4, subtree_bytes, "reading session subtree bytes")?,
+        details: None,
     })
 }
 

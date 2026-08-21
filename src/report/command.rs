@@ -43,11 +43,11 @@ pub fn run(cli: &Cli, arguments: &AnalyzeArgs, output: &mut dyn Write) -> Result
     if arguments.json {
         super::write_json(&report, output)
     } else {
-        let color = super::human::color_enabled(
+        let style = super::format::Style::resolve(
             io::stdout().is_terminal(),
             std::env::var_os("NO_COLOR").is_some(),
         );
-        super::write_human(&report, output, color)
+        super::write_human(&report, output, style)
     }
 }
 
@@ -63,7 +63,10 @@ fn full_report<Access>(
     progress.step("accounting for SQLite space");
     let space = space::analyze(database)?;
     progress.step("attributing project and session bytes");
-    let attribution = attribution::analyze(database, top)?;
+    let mut attribution = attribution::analyze(database, top)?;
+    // Only the sessions the report will display are described, so the message-count lookup
+    // never touches rows that are about to be discarded.
+    attribution::describe(database.connection(), &mut attribution.sessions)?;
     progress.step("counting orphans");
     let orphans = orphans::analyze(database, paths)?;
     progress.step("building age and directory overview");

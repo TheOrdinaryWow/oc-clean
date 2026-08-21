@@ -15,6 +15,7 @@ use crate::error::Error;
 use crate::paths::{self, DatabaseOptions, DerivedPaths, Environment, Platform, Target};
 use crate::reclaim::headroom::{FreeSpaceProvider, Fs2FreeSpaceProvider};
 use crate::reclaim::incremental::{IncrementalVacuumError, check_auto_vacuum};
+use crate::report::format::Style;
 use crate::report::impact::{self, Impact};
 use crate::report::progress;
 use crate::safety::confirm::{ConfirmationDecision, ConfirmationOptions, ImpactSummary, confirm};
@@ -184,7 +185,7 @@ where
     }
     phase(observer, PhaseId::P10);
     if !cli.apply {
-        return output::write_dry_run(&impact.summary, arguments.json, output)
+        return output::write_dry_run(&impact.summary, arguments.json, report_style(), output)
             .map_err(output_error);
     }
     render_apply_impact(arguments, &impact, output)?;
@@ -328,7 +329,7 @@ where
         cleanup,
         bytes_reclaimed,
     );
-    output::write_final(&report, arguments.json, output).map_err(output_error)?;
+    output::write_final(&report, arguments.json, report_style(), output).map_err(output_error)?;
     if report.partial_failures.is_empty() {
         Ok(())
     } else {
@@ -425,8 +426,16 @@ fn render_apply_impact(
     if arguments.json {
         Ok(())
     } else {
-        impact::write_human(&impact.summary, output).map_err(output_error)
+        impact::write_human(&impact.summary, output, report_style()).map_err(output_error)
     }
+}
+
+/// Resolves the styling used by every human renderer this command writes.
+fn report_style() -> Style {
+    Style::resolve(
+        io::stdout().is_terminal(),
+        std::env::var_os("NO_COLOR").is_some(),
+    )
 }
 
 fn ensure_confirmed<R>(

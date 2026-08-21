@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use serde_json::{Value, json};
 
 use super::{AnalysisReport, ReportMode, SCHEMA_VERSION};
+use crate::analyze::attribution::SessionAttribution;
 use crate::analyze::distribution::{AgeRange, DirectoryGroup, DirectorySummary};
 use crate::error::Error;
 
@@ -18,12 +19,7 @@ pub(super) fn write(report: &AnalysisReport, output: &mut dyn Write) -> Result<(
             "project_id": project.project_id,
             "bytes": project.bytes,
         })).collect::<Vec<_>>()),
-        "largest_sessions": report.largest_sessions.as_ref().map(|sessions| sessions.iter().map(|session| json!({
-            "session_id": session.session_id,
-            "project_id": session.project_id,
-            "self_bytes": session.self_bytes,
-            "subtree_bytes": session.subtree_bytes,
-        })).collect::<Vec<_>>()),
+        "largest_sessions": report.largest_sessions.as_ref().map(|sessions| sessions.iter().map(session_object).collect::<Vec<_>>()),
         "orphans": report.orphans.as_ref().map(|orphans| json!({
             "orphan_events": orphan(orphans.orphan_events),
             "dangling_parent_sessions": orphan(orphans.dangling_parent_sessions),
@@ -79,6 +75,26 @@ fn table_space(report: &crate::analyze::space::ObjectSpaceReport) -> Value {
             "bytes": entry.bytes,
         })).collect::<Vec<_>>(),
     })
+}
+
+/// Serializes one attributed session, including its description when one was looked up.
+///
+/// `title`, `time_updated`, and `message_count` are additive fields within the current
+/// `schema_version`: they are absent for a session whose row disappeared between the size
+/// rollup and the description lookup, so consumers must treat them as optional.
+fn session_object(session: &SessionAttribution) -> serde_json::Value {
+    let mut object = json!({
+        "session_id": session.session_id,
+        "project_id": session.project_id,
+        "self_bytes": session.self_bytes,
+        "subtree_bytes": session.subtree_bytes,
+    });
+    if let (Some(details), Some(map)) = (session.details.as_ref(), object.as_object_mut()) {
+        map.insert("title".to_owned(), json!(details.title));
+        map.insert("time_updated".to_owned(), json!(details.time_updated_ms));
+        map.insert("message_count".to_owned(), json!(details.message_count));
+    }
+    object
 }
 
 fn orphan(value: crate::analyze::orphans::OrphanClass) -> Value {

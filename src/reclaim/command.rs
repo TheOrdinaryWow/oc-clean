@@ -21,6 +21,7 @@ use crate::cli::{Cli, VacuumArgs};
 use crate::db::{self, ConnectionOptions};
 use crate::error::Error;
 use crate::paths::{self, DatabaseOptions, Environment, Platform, Target};
+use crate::report::format::{self, Style};
 use crate::report::progress;
 use crate::safety::confirm::{ConfirmationDecision, ConfirmationOptions, ImpactSummary, confirm};
 use crate::safety::holders::{CommandMode, GateDecision, HolderInspector, inspect_and_decide};
@@ -373,27 +374,56 @@ fn write_report(
         .map_err(json_error)?;
         writeln!(output).map_err(output_error)
     } else {
+        let style = report_style();
         writeln!(
             output,
-            "Vacuum ({})",
-            if report.applied { "applied" } else { "dry-run" }
+            "\n{}",
+            style.heading(if report.applied {
+                "Vacuum (applied)"
+            } else {
+                "Vacuum (dry-run)"
+            })
         )
         .map_err(output_error)?;
-        writeln!(output, "  Strategy: {}", report.strategy.as_str()).map_err(output_error)?;
-        writeln!(output, "  Current size: {} bytes", report.current_size).map_err(output_error)?;
-        writeln!(output, "  Live bytes: {}", report.live_bytes).map_err(output_error)?;
-        writeln!(output, "  Freelist bytes: {}", report.freelist_bytes).map_err(output_error)?;
-        writeln!(
+        field(output, "Strategy", report.strategy.as_str())?;
+        field(output, "Current size", format::bytes(report.current_size))?;
+        field(output, "Live", format::bytes(report.live_bytes))?;
+        field(output, "Freelist", format::bytes(report.freelist_bytes))?;
+        field(
             output,
-            "  Estimated post-vacuum size: {} bytes",
-            report.estimated_post_vacuum_size
-        )
-        .map_err(output_error)?;
+            "Estimated post-vacuum size",
+            format::bytes(report.estimated_post_vacuum_size),
+        )?;
         if let Some(bytes_reclaimed) = report.bytes_reclaimed {
-            writeln!(output, "  Bytes reclaimed: {bytes_reclaimed}").map_err(output_error)?;
+            field(output, "Space reclaimed", format::bytes(bytes_reclaimed))?;
         }
         Ok(())
     }
+}
+
+/// Resolves the styling used by this command's human renderer.
+fn report_style() -> Style {
+    Style::resolve(
+        io::stdout().is_terminal(),
+        std::env::var_os("NO_COLOR").is_some(),
+    )
+}
+
+/// Writes one indented `label  value` line into a generic writer.
+///
+/// `format::field` targets `dyn Write`, while this module's renderers are generic over a
+/// possibly unsized writer, so the padding is applied here against the shared label width.
+fn field(
+    output: &mut (impl Write + ?Sized),
+    label: &str,
+    value: impl std::fmt::Display,
+) -> Result<(), Error> {
+    writeln!(
+        output,
+        "  {label:<width$}{value}",
+        width = format::LABEL_WIDTH
+    )
+    .map_err(output_error)
 }
 
 fn write_headroom_refusal(
@@ -416,15 +446,15 @@ fn write_headroom_refusal(
         .map_err(json_error)?;
         writeln!(output).map_err(output_error)
     } else {
-        writeln!(output, "Insufficient disk space").map_err(output_error)?;
-        writeln!(output, "  Required bytes: {}", headroom.required_bytes).map_err(output_error)?;
-        writeln!(output, "  Available bytes: {}", headroom.available_bytes)
-            .map_err(output_error)?;
-        writeln!(
+        let style = report_style();
+        writeln!(output, "\n{}", style.fail("Insufficient disk space")).map_err(output_error)?;
+        field(output, "Required", format::bytes(headroom.required_bytes))?;
+        field(output, "Available", format::bytes(headroom.available_bytes))?;
+        field(
             output,
-            "  Free at least {shortfall_bytes} bytes before retrying"
+            "Free before retrying",
+            format::bytes(shortfall_bytes),
         )
-        .map_err(output_error)
     }
 }
 
@@ -738,8 +768,8 @@ mod tests {
         result.expect("dry-run should succeed");
         assert_eq!(file_hash(&fixture.database_path), before);
         assert!(output.contains("Current size"));
-        assert!(output.contains("Live bytes"));
-        assert!(output.contains("Freelist bytes"));
+        assert!(output.contains("Live"));
+        assert!(output.contains("Freelist"));
         assert!(output.contains("Estimated post-vacuum size"));
     }
 
@@ -754,9 +784,9 @@ mod tests {
 
             let error = result.expect_err("low headroom should be refused");
             assert_eq!(error.exit_code(), 6);
-            assert!(output.contains("Required bytes"));
-            assert!(output.contains("Available bytes"));
-            assert!(output.contains("Free at least"));
+            assert!(output.contains("Required"));
+            assert!(output.contains("Available"));
+            assert!(output.contains("Free before retrying"));
             assert!(!output.to_ascii_lowercase().contains("incremental"));
             assert_eq!(file_hash(&fixture.database_path), before);
         }
@@ -783,7 +813,9 @@ mod tests {
         };
         assert_eq!(required_bytes, 1_110);
         assert_eq!(available_bytes, 200);
-        assert!(output.contains("Required bytes: 1110"));
+        // The typed error above carries the exact byte count; the report renders it for a human.
+        assert!(output.contains("Required"));
+        assert!(output.contains("1.08 KiB"));
     }
 
     #[test]

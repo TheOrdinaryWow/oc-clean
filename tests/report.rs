@@ -85,9 +85,22 @@ mod report {
         let page_count = json["file_space"]["page_count"].as_u64().unwrap();
         let project_count = json["project_attribution"].as_array().unwrap().len();
         let orphan_events = json["orphans"]["orphan_events"]["count"].as_u64().unwrap();
-        assert!(human.contains(&format!("Page count               {page_count}")));
-        assert!(human.contains(&format!("Projects                 {project_count}")));
-        assert!(human.contains(&format!("Orphan events            {orphan_events}")));
+        // Column padding is a rendering detail; the contract is that each labelled fact
+        // carries the same value the JSON report does.
+        for (label, value) in [
+            ("Page count", page_count.to_string()),
+            ("Projects", project_count.to_string()),
+            ("Orphan events", orphan_events.to_string()),
+        ] {
+            let line = human
+                .lines()
+                .find(|line| line.trim_start().starts_with(label))
+                .unwrap_or_else(|| panic!("human report should carry a `{label}` line"));
+            assert!(
+                line.split_whitespace().any(|field| field == value),
+                "`{label}` line `{line}` should carry `{value}`"
+            );
+        }
     }
 
     #[test]

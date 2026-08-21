@@ -2,6 +2,7 @@
 
 pub mod command;
 pub mod failure;
+pub mod format;
 mod human;
 pub mod impact;
 mod json;
@@ -89,9 +90,9 @@ impl AnalysisReport {
 pub fn write_human(
     report: &AnalysisReport,
     output: &mut dyn Write,
-    color: bool,
+    style: format::Style,
 ) -> Result<(), Error> {
-    human::write(report, output, color)
+    human::write(report, output, style)
 }
 
 /// Writes one schema-versioned JSON object.

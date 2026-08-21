@@ -8,12 +8,14 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use rusqlite::types::ValueRef;
 
+use crate::analyze::attribution::SessionAttribution;
 use crate::analyze::{attribution, orphans as orphan_census, space};
 use crate::assets::storage::session_id_from_path;
 use crate::cli::types::{Duration, Size};
 use crate::db::{self, DatabaseConnection};
 use crate::error::Error;
 use crate::paths::DerivedPaths;
+use crate::report::format::{self, Align, Grid, Style};
 use crate::select::orphans;
 use crate::select::predicates::{self, CaseSensitivity, SessionIds, intersect_candidate_sets};
 use crate::select::{retention, subtree};
@@ -104,6 +106,8 @@ pub struct ImpactSelection {
     pub larger_than: Option<Size>,
     pub keep_recent: u64,
     pub sweep_orphans: bool,
+    /// How many of the largest selected sessions to describe in the preview.
+    pub preview_top: usize,
 }
 
 /// Project-selection context shown before confirmation.
@@ -129,6 +133,11 @@ pub struct ImpactSummary {
     pub current_live_bytes: u64,
     pub estimated_post_vacuum_bytes: u64,
     pub project_selection: Option<ProjectSelectionImpact>,
+    /// The largest selected sessions, described so a reviewer can recognize them.
+    ///
+    /// A count alone cannot answer "is this the right selection?", because a session
+    /// identifier is a random string. The title and last-activity date can.
+    pub preview: Vec<SessionAttribution>,
 }
 
 impl ImpactSummary {
@@ -183,6 +192,7 @@ struct DatabaseImpact {
     project_ids: BTreeSet<String>,
     database_bytes: u64,
     current_live_bytes: u64,
+    preview: Vec<SessionAttribution>,
 }
 
 struct AssetImpact {
@@ -226,6 +236,7 @@ pub fn summarize<Access>(
                 .current_live_bytes
                 .saturating_sub(database_impact.database_bytes),
             project_selection: planned.project_selection,
+            preview: database_impact.preview,
         },
         session_ids: planned.session_ids,
         orphan_event_aggregate_ids: planned.orphan_event_aggregate_ids,
@@ -235,44 +246,134 @@ pub fn summarize<Access>(
     })
 }
 
-/// Writes the stable human-readable dry-run and confirmation summary.
+/// Width budget for a session title inside the selection preview.
+const PREVIEW_TITLE_WIDTH: usize = 44;
+
+/// Writes the human-readable dry-run and confirmation summary.
 ///
 /// # Errors
 ///
 /// Returns the underlying writer error when output cannot be completed.
-pub fn write_human(summary: &ImpactSummary, output: &mut dyn Write) -> io::Result<()> {
+pub fn write_human(
+    summary: &ImpactSummary,
+    output: &mut dyn Write,
+    style: Style,
+) -> io::Result<()> {
     if summary.is_empty() {
         writeln!(output, "nothing to delete")?;
         return Ok(());
     }
-    writeln!(output, "Cleanup impact (dry-run)")?;
-    writeln!(output, "  Root sessions: {}", summary.root_session_count)?;
-    writeln!(output, "  Total sessions: {}", summary.total_session_count)?;
-    for (table, rows) in &summary.table_rows {
-        writeln!(output, "  {table}: {rows} rows")?;
-    }
-    writeln!(output, "  Orphan rows: {}", summary.orphan_row_count)?;
-    writeln!(output, "  Storage files: {}", summary.storage_file_count)?;
-    writeln!(
+    write_section(summary, output, style).map_err(unwrap_io)
+}
+
+fn write_section(
+    summary: &ImpactSummary,
+    output: &mut dyn Write,
+    style: Style,
+) -> Result<(), Error> {
+    format::heading(output, "Cleanup Impact (dry-run)", style)?;
+    format::field(output, "Root sessions", summary.root_session_count)?;
+    format::field(output, "Total sessions", summary.total_session_count)?;
+    format::field(output, "Orphan rows", summary.orphan_row_count)?;
+    format::field(output, "Storage files", summary.storage_file_count)?;
+    format::field(
         output,
-        "  Snapshot directories: {}",
-        summary.snapshot_directory_count
+        "Snapshot directories",
+        summary.snapshot_directory_count,
     )?;
-    writeln!(output, "  Projects pruned: {}", summary.project_prune_count)?;
-    writeln!(output, "  Total bytes: {}", summary.total_bytes)?;
-    writeln!(
+    format::field(output, "Projects pruned", summary.project_prune_count)?;
+    format::field(output, "Total size", format::bytes(summary.total_bytes))?;
+    format::field(
         output,
-        "  Estimated post-VACUUM size: {}",
-        summary.estimated_post_vacuum_bytes
+        "Estimated post-VACUUM size",
+        format::bytes(summary.estimated_post_vacuum_bytes),
     )?;
     if let Some(project) = &summary.project_selection {
-        writeln!(
+        format::note(
             output,
-            "  Project `{}` selects ALL {} member sessions regardless of each session directory",
-            project.path_or_glob, project.matched_sessions
+            &format!(
+                "Project `{}` selects ALL {} member sessions regardless of each session directory",
+                project.path_or_glob, project.matched_sessions
+            ),
+            style,
+        )?;
+    }
+
+    write_preview(summary, output, style)?;
+    write_rows(summary, output, style)
+}
+
+fn write_preview(
+    summary: &ImpactSummary,
+    output: &mut dyn Write,
+    style: Style,
+) -> Result<(), Error> {
+    if summary.preview.is_empty() {
+        return Ok(());
+    }
+    format::heading(output, "Largest Selected Sessions", style)?;
+    let mut grid = Grid::new(
+        style,
+        &[
+            ("Session", Align::Left),
+            ("Title", Align::Left),
+            ("Msgs", Align::Right),
+            ("Last active", Align::Left),
+            ("Subtree", Align::Right),
+        ],
+    );
+    for session in &summary.preview {
+        let (title, messages, last_active) = session.details.as_ref().map_or_else(
+            || ("(unavailable)".to_owned(), "-".to_owned(), "-".to_owned()),
+            |details| {
+                (
+                    format::sanitize(&details.title, PREVIEW_TITLE_WIDTH),
+                    details.message_count.to_string(),
+                    format::timestamp_ms(details.time_updated_ms),
+                )
+            },
+        );
+        grid.row(vec![
+            style.dim(&format::short_id(&session.session_id)),
+            title,
+            messages,
+            style.dim(&last_active),
+            format::bytes(session.subtree_bytes),
+        ]);
+    }
+    grid.write(output)?;
+    let shown = summary.preview.len() as u64;
+    if summary.total_session_count > shown {
+        format::note(
+            output,
+            &format!(
+                "Showing the {shown} largest of {} selected sessions; raise --top to see more.",
+                summary.total_session_count
+            ),
+            style,
         )?;
     }
     Ok(())
+}
+
+fn write_rows(summary: &ImpactSummary, output: &mut dyn Write, style: Style) -> Result<(), Error> {
+    format::heading(output, "Rows To Delete", style)?;
+    let mut grid = Grid::new(style, &[("Table", Align::Left), ("Rows", Align::Right)]);
+    for (table, rows) in &summary.table_rows {
+        grid.row(vec![table.clone(), rows.to_string()]);
+    }
+    grid.write(output)
+}
+
+/// Unwraps a rendering error back into the writer error the caller's signature promises.
+///
+/// Every failure inside this section originates from `output`, so the typed wrapper the
+/// format helpers return carries no information the caller cannot already act on.
+fn unwrap_io(error: Error) -> io::Error {
+    match error {
+        Error::Io { source, .. } => source,
+        other => io::Error::other(other.to_string()),
+    }
 }
 
 fn plan_selection<Access>(
@@ -325,7 +426,8 @@ fn database_impact<Access>(
     selection: &ImpactSelection,
     planned: &PlannedSelection,
 ) -> Result<DatabaseImpact, Error> {
-    let session_payload_bytes = selected_session_payload_bytes(database, &planned.session_ids)?;
+    let payload = selected_session_payload(database, &planned.session_ids, selection.preview_top)?;
+    let session_payload_bytes = payload.bytes;
     let project_ids = projects_emptied_by(database, &planned.session_ids)?;
     let mut impact_by_table = DELETION_TABLES
         .iter()
@@ -370,13 +472,21 @@ fn database_impact<Access>(
         project_ids,
         database_bytes,
         current_live_bytes: file_space.live_bytes,
+        preview: payload.preview,
     })
 }
 
-fn selected_session_payload_bytes<Access>(
+/// The selection's total payload bytes, plus the largest selected sessions for preview.
+struct SelectedPayload {
+    bytes: u64,
+    preview: Vec<SessionAttribution>,
+}
+
+fn selected_session_payload<Access>(
     database: &DatabaseConnection<Access>,
     session_ids: &SessionIds,
-) -> Result<u64, Error> {
+    preview_top: usize,
+) -> Result<SelectedPayload, Error> {
     let session_count = database
         .connection()
         .query_row("SELECT COUNT(*) FROM session", [], |row| {
@@ -387,13 +497,21 @@ fn selected_session_payload_bytes<Access>(
         session_count,
         "reading session count for impact attribution",
     )?;
-    Ok(attribution::analyze(database, top_n)?
+    // The rollup is already sorted by subtree size, so the first matches are the largest.
+    let selected: Vec<SessionAttribution> = attribution::analyze(database, top_n)?
         .sessions
-        .iter()
+        .into_iter()
         .filter(|session| session_ids.contains(&session.session_id))
-        .fold(0_u64, |total, session| {
-            total.saturating_add(session.self_bytes)
-        }))
+        .collect();
+    let bytes = selected.iter().fold(0_u64, |total, session| {
+        total.saturating_add(session.self_bytes)
+    });
+
+    // Only the sessions the preview will show are described, so the message-count lookup
+    // stays proportional to the preview size rather than to the selection size.
+    let mut preview: Vec<SessionAttribution> = selected.into_iter().take(preview_top).collect();
+    attribution::describe(database.connection(), &mut preview)?;
+    Ok(SelectedPayload { bytes, preview })
 }
 
 fn asset_impact(
@@ -1053,7 +1171,7 @@ mod tests {
             2
         );
         let mut rendered = Vec::new();
-        write_human(&impact.summary, &mut rendered).expect("impact should render");
+        write_human(&impact.summary, &mut rendered, Style::plain()).expect("impact should render");
         assert!(
             String::from_utf8(rendered)
                 .unwrap()

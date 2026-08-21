@@ -65,6 +65,7 @@ pub(super) fn impact_selection(arguments: &CleanArgs, now_ms: i64) -> ImpactSele
         larger_than: arguments.larger_than,
         keep_recent: arguments.keep_recent,
         sweep_orphans: arguments.orphans,
+        preview_top: arguments.top,
     }
 }
 

@@ -2,6 +2,8 @@ use std::io::{self, Write};
 
 use serde_json::json;
 
+use crate::analyze::attribution::SessionAttribution;
+use crate::report::format::{self, Style};
 use crate::report::impact::{self, ImpactSummary};
 
 #[derive(Debug)]
@@ -20,18 +22,20 @@ pub(super) struct CleanReport {
 pub(super) fn write_dry_run(
     summary: &ImpactSummary,
     json_output: bool,
+    style: Style,
     output: &mut dyn Write,
 ) -> io::Result<()> {
     if json_output {
         write_json("dry-run", summary, 0, 0, 0, 0, 0, &[], output)
     } else {
-        impact::write_human(summary, output)
+        impact::write_human(summary, output, style)
     }
 }
 
 pub(super) fn write_final(
     report: &CleanReport,
     json_output: bool,
+    style: Style,
     output: &mut dyn Write,
 ) -> io::Result<()> {
     if json_output {
@@ -47,27 +51,32 @@ pub(super) fn write_final(
             output,
         );
     }
-    writeln!(output, "Cleanup complete")?;
-    writeln!(output, "  Sessions deleted: {}", report.deleted_sessions)?;
-    writeln!(output, "  Rows deleted: {}", report.deleted_rows)?;
-    writeln!(output, "  Projects pruned: {}", report.pruned_projects)?;
-    writeln!(
-        output,
-        "  Storage files removed: {}",
-        report.storage_files_removed
-    )?;
-    writeln!(
-        output,
-        "  Snapshot directories removed: {}",
-        report.snapshot_directories_removed
-    )?;
-    writeln!(
-        output,
-        "  Database bytes reclaimed: {}",
-        report.bytes_reclaimed
-    )?;
+    writeln!(output, "\n{}", style.heading("Cleanup Complete"))?;
+    for (label, value) in [
+        ("Sessions deleted", report.deleted_sessions.to_string()),
+        ("Rows deleted", report.deleted_rows.to_string()),
+        ("Projects pruned", report.pruned_projects.to_string()),
+        (
+            "Storage files removed",
+            report.storage_files_removed.to_string(),
+        ),
+        (
+            "Snapshot directories removed",
+            report.snapshot_directories_removed.to_string(),
+        ),
+        (
+            "Database space reclaimed",
+            format::bytes(report.bytes_reclaimed),
+        ),
+    ] {
+        writeln!(
+            output,
+            "  {label:<width$}{value}",
+            width = format::LABEL_WIDTH
+        )?;
+    }
     for failure in &report.partial_failures {
-        writeln!(output, "  Warning: {failure}")?;
+        writeln!(output, "  {} {failure}", style.warn("warning:"))?;
     }
     Ok(())
 }
@@ -119,6 +128,7 @@ fn write_json(
                 "projects": summary.project_prune_count,
                 "total_bytes": summary.total_bytes,
                 "estimated_post_vacuum_bytes": summary.estimated_post_vacuum_bytes,
+                "preview": summary.preview.iter().map(preview_entry).collect::<Vec<_>>(),
             },
             "deleted_sessions": deleted_sessions,
             "deleted_rows": deleted_rows,
@@ -130,4 +140,23 @@ fn write_json(
     )
     .map_err(io::Error::other)?;
     writeln!(output)
+}
+
+/// Serializes one previewed session for the JSON cleanup report.
+///
+/// The description fields are additive within the current `schema_version` and are absent
+/// when the session row could not be described, so consumers must treat them as optional.
+fn preview_entry(session: &SessionAttribution) -> serde_json::Value {
+    let mut object = json!({
+        "session_id": session.session_id,
+        "project_id": session.project_id,
+        "self_bytes": session.self_bytes,
+        "subtree_bytes": session.subtree_bytes,
+    });
+    if let (Some(details), Some(map)) = (session.details.as_ref(), object.as_object_mut()) {
+        map.insert("title".to_owned(), json!(details.title));
+        map.insert("time_updated".to_owned(), json!(details.time_updated_ms));
+        map.insert("message_count".to_owned(), json!(details.message_count));
+    }
+    object
 }
