@@ -722,6 +722,17 @@ mod tests {
         assert!(matches!(inspection.verdict, Verdict::Held(_)));
     }
 
+    /// Compares two paths by file identity so a symlinked prefix does not change the answer.
+    #[cfg(unix)]
+    fn same_file(left: &Path, right: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+
+        let (Ok(left), Ok(right)) = (std::fs::metadata(left), std::fs::metadata(right)) else {
+            return false;
+        };
+        left.dev() == right.dev() && left.ino() == right.ino()
+    }
+
     /// Counts the symlink hops the resolver spends walking to `directory`.
     #[cfg(unix)]
     fn symlink_hops_in_prefix(directory: &Path) -> usize {
@@ -763,7 +774,12 @@ mod tests {
 
         let resolved = resolve_database_target(&directory.path().join("link-1.db"))
             .expect("forty symlink hops should resolve");
-        assert_eq!(resolved, target);
+        assert!(
+            same_file(&resolved, &target),
+            "resolution should reach the fixture database: {} vs {}",
+            resolved.display(),
+            target.display()
+        );
 
         let error = resolve_database_target(&directory.path().join("link-0.db"))
             .expect_err("overlong symlink chain should be rejected");

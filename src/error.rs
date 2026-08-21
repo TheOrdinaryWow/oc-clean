@@ -304,9 +304,14 @@ mod tests {
 
     #[test]
     fn swap_rollback_paths_are_absolute() {
+        let root = if cfg!(windows) {
+            PathBuf::from("C:\\opencode")
+        } else {
+            PathBuf::from("/var/lib/opencode")
+        };
         let error = Error::SwapRollbackFailed {
-            database_path: PathBuf::from("/var/lib/opencode/opencode.db"),
-            backup_path: PathBuf::from("/var/lib/opencode/opencode.db.bak"),
+            database_path: root.join("opencode.db"),
+            backup_path: root.join("opencode.db.bak"),
         };
 
         let Error::SwapRollbackFailed {
