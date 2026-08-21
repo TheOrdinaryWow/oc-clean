@@ -3,7 +3,7 @@ use std::path::Path;
 
 use rusqlite::params;
 
-use crate::db::DatabaseConnection;
+use crate::db::{DatabaseConnection, sqlite_error};
 use crate::error::Error;
 use crate::paths::DerivedPaths;
 
@@ -21,6 +21,10 @@ const AGE_DISTRIBUTION_SQL: &str = "
             SELECT session_id, octet_length(data) AS bytes FROM message
             UNION ALL
             SELECT session_id, octet_length(data) AS bytes FROM part
+            UNION ALL
+            SELECT session_id, COALESCE(SUM(octet_length(baseline) + octet_length(snapshot)), 0) AS bytes
+            FROM session_context_epoch AS source
+            GROUP BY session_id
             UNION ALL
             SELECT session_id, octet_length(data) AS bytes FROM session_message
             UNION ALL
@@ -107,8 +111,8 @@ pub struct DistributionReport {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Sqlite`] when the age query fails or [`Error::Io`] when an existing external
-/// directory cannot be read.
+/// Returns [`Error::DatabaseBusy`] for SQLite lock contention, [`Error::Sqlite`] for other age
+/// query failures, or [`Error::Io`] when an existing external directory cannot be read.
 pub fn analyze<Access>(
     database: &DatabaseConnection<Access>,
     paths: &DerivedPaths,
@@ -280,13 +284,6 @@ fn io_error(path: &Path, source: std::io::Error) -> Error {
     }
 }
 
-fn sqlite_error(context: &str, source: rusqlite::Error) -> Error {
-    Error::Sqlite {
-        context: context.to_owned(),
-        source,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -341,29 +338,71 @@ mod tests {
                 AgeBucket {
                     range: AgeRange::Days0To7,
                     sessions: 2,
-                    bytes: 44,
+                    bytes: 52,
                 },
                 AgeBucket {
                     range: AgeRange::Days7To30,
                     sessions: 2,
-                    bytes: 44,
+                    bytes: 52,
                 },
                 AgeBucket {
                     range: AgeRange::Days30To90,
                     sessions: 2,
-                    bytes: 44,
+                    bytes: 52,
                 },
                 AgeBucket {
                     range: AgeRange::Days90To180,
                     sessions: 2,
-                    bytes: 44,
+                    bytes: 52,
                 },
                 AgeBucket {
                     range: AgeRange::Days180Plus,
                     sessions: 2,
-                    bytes: 44,
+                    bytes: 52,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn epoch_only_payload_matches_session_attribution() {
+        let config = FixtureConfig {
+            project_count: 1,
+            session_count: 1,
+            messages_per_session: 0,
+            parts_per_message: 0,
+            ..FixtureConfig::default()
+        };
+        let fixture = Fixture::build(&config).expect("fixture should build");
+        let session_id = &fixture.session_ids[0];
+        let baseline = "epoch baseline";
+        let snapshot = "epoch snapshot";
+        let expected_bytes = u64::try_from(baseline.len() + snapshot.len())
+            .expect("payload length should fit in u64");
+        let connection = fixture.connect().expect("fixture should connect");
+        connection
+            .execute("DELETE FROM event WHERE aggregate_id = ?1", [session_id])
+            .expect("event payload should be removed");
+        connection
+            .execute(
+                "UPDATE session_context_epoch SET baseline = ?1, snapshot = ?2 WHERE session_id = ?3",
+                params![baseline, snapshot, session_id],
+            )
+            .expect("context epoch payload should update");
+        drop(connection);
+        let database = open_fixture(&fixture);
+
+        let distribution = analyze(&database, &derived_paths(fixture.root()), KNOWN_NOW_MS)
+            .expect("distribution should succeed");
+        let attribution =
+            crate::analyze::attribution::analyze(&database, 1).expect("attribution should succeed");
+
+        assert_eq!(distribution.age_buckets[0].bytes, expected_bytes);
+        assert_eq!(attribution.sessions[0].session_id, *session_id);
+        assert_eq!(attribution.sessions[0].self_bytes, expected_bytes);
+        assert_eq!(
+            distribution.age_buckets[0].bytes,
+            attribution.sessions[0].self_bytes
         );
     }
 
