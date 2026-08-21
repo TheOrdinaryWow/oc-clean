@@ -37,6 +37,14 @@ pub enum PhaseId {
     P21,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhaseOperation {
+    Retention,
+    PredicateSelection,
+    DescendantExpansion,
+    OrphanSelection,
+}
+
 impl fmt::Display for PhaseId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{self:?}")
@@ -45,6 +53,8 @@ impl fmt::Display for PhaseId {
 
 pub trait PhaseObserver {
     fn entered(&self, phase: PhaseId);
+
+    fn performing(&self, _phase: PhaseId, _operation: PhaseOperation) {}
 }
 
 pub(super) struct NoopPhaseObserver;

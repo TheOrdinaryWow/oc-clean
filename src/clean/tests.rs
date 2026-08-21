@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::Cursor;
 use std::path::Path;
 
@@ -9,9 +9,9 @@ use crate::safety::holders::{Completeness, HolderInspector, Inspection, Verdict}
 use clap::Parser;
 use rusqlite::Connection;
 
-use super::command::{RuntimeContext, run_with};
+use super::command::{RuntimeContext, run_with, run_with_git_path};
 use super::signal::SignalController;
-use super::{PhaseId, PhaseObserver};
+use super::{PhaseId, PhaseObserver, PhaseOperation};
 
 #[allow(clippy::duplicate_mod, dead_code)]
 #[path = "../../tests/support/fixture.rs"]
@@ -47,11 +47,18 @@ impl FreeSpaceProvider for FixedSpace {
 }
 
 #[derive(Default)]
-struct Recorder(RefCell<Vec<PhaseId>>);
+struct Recorder {
+    phases: RefCell<Vec<PhaseId>>,
+    operations: RefCell<Vec<(PhaseId, PhaseOperation)>>,
+}
 
 impl PhaseObserver for Recorder {
     fn entered(&self, phase: PhaseId) {
-        self.0.borrow_mut().push(phase);
+        self.phases.borrow_mut().push(phase);
+    }
+
+    fn performing(&self, phase: PhaseId, operation: PhaseOperation) {
+        self.operations.borrow_mut().push((phase, operation));
     }
 }
 
@@ -126,7 +133,7 @@ fn recorded_phases(incremental: bool) -> Vec<PhaseId> {
         &recorder,
     );
     assert!(result.is_ok() || result.is_err_and(|error| error.exit_code() == 10));
-    recorder.0.into_inner()
+    recorder.phases.into_inner()
 }
 
 #[test]
@@ -183,6 +190,136 @@ fn exact_phase_order_covers_default_and_conditional_paths() {
             PhaseId::P20,
             PhaseId::P21,
         ]
+    );
+}
+
+#[test]
+fn selection_operations_are_attributed_to_the_normative_phases() {
+    let fixture = fixture(false);
+    let cli = cli(&fixture.database_path, false);
+    let arguments = arguments(false);
+    let recorder = Recorder::default();
+    let result = run_with(
+        &cli,
+        &arguments,
+        &mut Cursor::new(Vec::<u8>::new()),
+        &mut Vec::new(),
+        &UnlimitedSpace,
+        &NotHeldInspector,
+        RuntimeContext {
+            stdin_is_terminal: false,
+            stdout_is_terminal: false,
+        },
+        &SignalController::new(),
+        &recorder,
+    );
+    assert!(result.is_ok() || result.is_err_and(|error| error.exit_code() == 10));
+    assert_eq!(
+        recorder.operations.into_inner(),
+        vec![
+            (PhaseId::P6, PhaseOperation::Retention),
+            (PhaseId::P7, PhaseOperation::PredicateSelection),
+            (PhaseId::P8, PhaseOperation::DescendantExpansion),
+            (PhaseId::P13, PhaseOperation::OrphanSelection),
+        ]
+    );
+}
+
+#[test]
+fn orphan_event_aggregate_does_not_inflate_deleted_session_count() {
+    let fixture = Fixture::build(&FixtureConfig {
+        project_count: 5,
+        session_count: 10,
+        ..FixtureConfig::default()
+    })
+    .expect("fixture should build");
+    let connection = fixture.connect().expect("fixture should connect");
+    connection
+        .execute("UPDATE session SET time_created = 0, time_updated = 0", [])
+        .expect("sessions should be older than the selector cutoff");
+    connection
+        .execute(
+            "INSERT INTO event_sequence VALUES ('ses_OrphanAggregate', 1, NULL)",
+            [],
+        )
+        .expect("orphan event sequence should insert");
+    connection
+        .execute(
+            "INSERT INTO event VALUES ('event-orphan-aggregate', 'ses_OrphanAggregate', 1, 'session.orphan', '{}')",
+            [],
+        )
+        .expect("orphan event should insert");
+    drop(connection);
+
+    let mut arguments = arguments(false);
+    arguments.archived = false;
+    arguments.older_than = Some("1d".parse().expect("duration should parse"));
+    arguments.keep_recent = 1;
+    arguments.no_vacuum = true;
+    arguments.gc_snapshots = false;
+    arguments.json = true;
+    let cli = cli(&fixture.database_path, false);
+    let mut output = Vec::new();
+    run_with(
+        &cli,
+        &arguments,
+        &mut Cursor::new(Vec::<u8>::new()),
+        &mut output,
+        &UnlimitedSpace,
+        &NotHeldInspector,
+        RuntimeContext {
+            stdin_is_terminal: false,
+            stdout_is_terminal: false,
+        },
+        &SignalController::new(),
+        &Recorder::default(),
+    )
+    .expect("combined session and orphan cleanup should succeed");
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&output).expect("final output should be JSON");
+    assert_eq!(report["deleted_sessions"], 5);
+    let remaining: i64 = fixture
+        .connect()
+        .expect("fixture should reconnect")
+        .query_row("SELECT COUNT(*) FROM session", [], |row| row.get(0))
+        .expect("remaining sessions should count");
+    assert_eq!(remaining, 5);
+}
+
+#[test]
+fn missing_git_during_snapshot_gc_keeps_command_successful() {
+    let fixture = Fixture::build(&FixtureConfig {
+        session_count: 1,
+        archived_session_count: 1,
+        ..FixtureConfig::default()
+    })
+    .expect("fixture should build");
+    let arguments = CleanArgs {
+        orphans: false,
+        no_vacuum: true,
+        gc_snapshots: true,
+        ..arguments(false)
+    };
+    let cli = cli(&fixture.database_path, false);
+    let result = run_with_git_path(
+        &cli,
+        &arguments,
+        &mut Cursor::new(Vec::<u8>::new()),
+        &mut Vec::new(),
+        &UnlimitedSpace,
+        &NotHeldInspector,
+        RuntimeContext {
+            stdin_is_terminal: false,
+            stdout_is_terminal: false,
+        },
+        &SignalController::new(),
+        &Recorder::default(),
+        Some(OsStr::new("")),
+    );
+    assert!(
+        result.is_ok(),
+        "missing git should be an informational skip: {result:?}"
     );
 }
 
@@ -299,7 +436,7 @@ fn preexisting_orphan_snapshots_require_the_orphans_selector() {
 }
 
 #[test]
-fn p9_allows_clean_when_selection_makes_projected_rebuild_fit() {
+fn p9_refuses_when_the_full_delete_batch_wal_exceeds_available_space() {
     let fixture = Fixture::build(&FixtureConfig {
         session_count: 600,
         archived_session_count: 600,
@@ -364,8 +501,14 @@ fn p9_allows_clean_when_selection_makes_projected_rebuild_fit() {
         &recorder,
     );
 
-    assert!(result.is_ok(), "projected rebuild should fit: {result:?}");
-    assert!(recorder.0.into_inner().contains(&PhaseId::P10));
+    let error = result.expect_err("full delete-batch WAL should exceed available space");
+    assert!(matches!(
+        error,
+        crate::error::Error::InsufficientDiskSpace { .. }
+    ));
+    let phases = recorder.phases.into_inner();
+    assert!(phases.contains(&PhaseId::P9));
+    assert!(!phases.contains(&PhaseId::P10));
 }
 
 #[test]
@@ -416,7 +559,7 @@ fn filesystem_cleanup_failure_continues_through_swap_and_exits_partial_success()
     .expect_err("unsafe snapshot id should yield partial success");
 
     assert_eq!(error.exit_code(), 10);
-    let phases = recorder.0.into_inner();
+    let phases = recorder.phases.into_inner();
     assert!(phases.contains(&PhaseId::P20));
     assert_eq!(phases.last(), Some(&PhaseId::P21));
     assert!(fixture.database_path.is_file());

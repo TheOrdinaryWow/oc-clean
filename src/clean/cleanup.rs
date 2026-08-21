@@ -1,3 +1,7 @@
+use std::ffi::OsStr;
+
+use tracing::warn;
+
 use crate::assets::snapshot::{self, GcSnapshotsOutcome, RemovalReport};
 use crate::assets::storage::{self, SweepReport, SweepScope};
 use crate::db::{DatabaseConnection, ReadWrite};
@@ -64,6 +68,7 @@ impl CleanupOutcome {
         database: &DatabaseConnection<ReadWrite>,
         paths: &DerivedPaths,
         pruned: &ProjectIds,
+        git_path: Option<&OsStr>,
     ) {
         let retained = match projects::all_ids(database) {
             Ok(retained) => retained,
@@ -72,14 +77,14 @@ impl CleanupOutcome {
                 return;
             }
         };
-        match snapshot::gc_retained(&paths.snapshot, &retained, pruned) {
+        match snapshot::gc_retained_with_path(&paths.snapshot, &retained, pruned, git_path) {
             Ok(GcSnapshotsOutcome::Completed(report)) => {
                 if let Some(error) = report.partial_success_error() {
                     self.partial_failures.push(error.to_string());
                 }
             }
             Ok(GcSnapshotsOutcome::SkippedGitUnavailable { warning }) => {
-                self.partial_failures.push(warning);
+                warn!("{warning}");
             }
             Err(error) => self.partial_failures.push(error.to_string()),
         }

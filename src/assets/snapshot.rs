@@ -101,7 +101,7 @@ pub fn gc_retained(
     )
 }
 
-fn gc_retained_with_path(
+pub(crate) fn gc_retained_with_path(
     snapshot_root: &Path,
     retained_project_ids: &ProjectIds,
     deleting_project_ids: &ProjectIds,

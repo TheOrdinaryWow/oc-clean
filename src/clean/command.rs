@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
@@ -24,7 +25,7 @@ use super::cleanup::CleanupOutcome;
 use super::output::{self, CleanReport};
 use super::selection;
 use super::signal::SignalController;
-use super::{NoopPhaseObserver, PhaseId, PhaseObserver, reclaim};
+use super::{NoopPhaseObserver, PhaseId, PhaseObserver, PhaseOperation, reclaim};
 
 #[derive(Clone, Copy)]
 pub(super) struct RuntimeContext {
@@ -74,6 +75,37 @@ where
     R: BufRead + ?Sized,
     P: FreeSpaceProvider,
 {
+    run_with_git_path(
+        cli,
+        arguments,
+        input,
+        output,
+        free_space,
+        holder_inspector,
+        runtime,
+        signals,
+        observer,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(super) fn run_with_git_path<R, P>(
+    cli: &Cli,
+    arguments: &CleanArgs,
+    input: &mut R,
+    output: &mut dyn Write,
+    free_space: &P,
+    holder_inspector: &dyn HolderInspector,
+    runtime: RuntimeContext,
+    signals: &SignalController,
+    observer: &dyn PhaseObserver,
+    git_path: Option<&OsStr>,
+) -> Result<(), Error>
+where
+    R: BufRead + ?Sized,
+    P: FreeSpaceProvider,
+{
     phase(observer, PhaseId::P1);
     let target = database_target(cli)?;
     let database_path = file_path(&target)?;
@@ -117,17 +149,14 @@ where
 
     let now_ms = selection::now_ms()?;
     phase(observer, PhaseId::P6);
+    observer.performing(PhaseId::P6, PhaseOperation::Retention);
     let retained = selection::retention_set(&database, arguments.keep_recent)?;
-    let candidates = selection::predicate_candidates(&database, arguments, &retained, now_ms)?;
     phase(observer, PhaseId::P7);
+    observer.performing(PhaseId::P7, PhaseOperation::PredicateSelection);
+    let candidates = selection::predicate_candidates(&database, arguments, &retained, now_ms)?;
+    phase(observer, PhaseId::P8);
+    observer.performing(PhaseId::P8, PhaseOperation::DescendantExpansion);
     let selected = selection::expand_candidates(&database, &candidates, &retained)?;
-
-    let raw_orphans = if arguments.orphans {
-        phase(observer, PhaseId::P8);
-        Some(crate::select::orphans::select(&database, &paths)?)
-    } else {
-        None
-    };
 
     let impact = impact::summarize(
         &database,
@@ -135,22 +164,8 @@ where
         &selection::impact_selection(arguments, now_ms),
     )?;
     if !arguments.incremental && !arguments.no_vacuum {
-        let mut deletion_batch_ids = selected.clone();
-        if let Some(raw_orphans) = &raw_orphans {
-            deletion_batch_ids.extend(
-                raw_orphans
-                    .event_aggregate_ids
-                    .iter()
-                    .map(|id| id.as_str().to_owned()),
-            );
-            deletion_batch_ids.extend(
-                raw_orphans
-                    .dangling_session_ids
-                    .iter()
-                    .map(|id| id.as_str().to_owned())
-                    .filter(|id| !retained.contains(id)),
-            );
-        }
+        let mut deletion_batch_ids = impact.session_ids.clone();
+        deletion_batch_ids.extend(impact.orphan_event_aggregate_ids.iter().cloned());
         phase(observer, PhaseId::P9);
         reclaim::pre_delete_headroom(
             database_path,
@@ -185,11 +200,12 @@ where
     let mut orphan_report = None;
     if arguments.orphans {
         phase(observer, PhaseId::P13);
-        let raw_orphans = raw_orphans.as_ref().expect("P8 selected requested orphans");
-        affected_projects.extend(orphan_project_owners(&database, raw_orphans)?);
+        observer.performing(PhaseId::P13, PhaseOperation::OrphanSelection);
+        let raw_orphans = crate::select::orphans::select(&database, &paths)?;
+        affected_projects.extend(orphan_project_owners(&database, &raw_orphans)?);
         let report = orphans::delete_with_progress(
             &database,
-            raw_orphans,
+            &raw_orphans,
             OrphanDeleteOptions {
                 keep_recent: arguments.keep_recent,
                 ..OrphanDeleteOptions::default()
@@ -245,7 +261,7 @@ where
     }
     if arguments.gc_snapshots {
         phase(observer, PhaseId::P18);
-        cleanup.gc_retained(&database, &paths, &pruned_projects);
+        cleanup.gc_retained(&database, &paths, &pruned_projects, git_path);
         stop_after_delete_if_cancelled(&combined, arguments, output, signals)?;
     }
 
