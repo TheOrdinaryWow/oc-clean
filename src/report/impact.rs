@@ -5,6 +5,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
 use rusqlite::types::ValueRef;
 
 use crate::analyze::{attribution, orphans as orphan_census, space};
@@ -528,66 +529,81 @@ fn table_impact<Access>(
         return Ok(result);
     }
     for spec in specs {
-        let mut statement = database
-            .connection()
-            .prepare(&format!("SELECT * FROM {}", spec.table))
-            .map_err(|source| {
-                sqlite_error(&format!("preparing `{}` impact scan", spec.table), source)
-            })?;
-        let owner_index = statement
-            .column_names()
-            .iter()
-            .position(|column| *column == spec.owner_column)
-            .ok_or_else(|| Error::SchemaIncompatible {
+        let quoted_table = quote_identifier(spec.table);
+        let columns = {
+            let mut statement = database
+                .connection()
+                .prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")
+                .map_err(|source| {
+                    sqlite_error(&format!("preparing `{}` impact schema", spec.table), source)
+                })?;
+            statement
+                .query_map([spec.table], |row| row.get::<_, String>(0))
+                .map_err(|source| {
+                    sqlite_error(&format!("querying `{}` impact schema", spec.table), source)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|source| {
+                    sqlite_error(&format!("reading `{}` impact schema", spec.table), source)
+                })?
+        };
+        if !columns.iter().any(|column| column == spec.owner_column) {
+            return Err(Error::SchemaIncompatible {
                 incompatibility: format!(
                     "table `{}` lacks impact owner column `{}`",
                     spec.table, spec.owner_column
                 ),
-            })?;
-        let excluded = statement
-            .column_names()
+            });
+        }
+        let byte_expression = columns
             .iter()
-            .enumerate()
-            .filter_map(|(index, column)| {
-                spec.attributed_payload_columns
-                    .contains(column)
-                    .then_some(index)
-            })
-            .collect::<BTreeSet<_>>();
-        let column_count = statement.column_count();
-        let mut rows = statement
-            .query([])
-            .map_err(|source| sqlite_error(&format!("querying `{}` impact", spec.table), source))?;
+            .filter(|column| !spec.attributed_payload_columns.contains(&column.as_str()))
+            .map(|column| value_bytes_sql(&quote_identifier(column)))
+            .collect::<Vec<_>>()
+            .join(" + ");
         let mut impact = TableImpact::default();
-        while let Some(row) = rows
-            .next()
-            .map_err(|source| sqlite_error(&format!("reading `{}` impact", spec.table), source))?
-        {
-            let owner = row.get::<_, String>(owner_index).map_err(|source| {
-                sqlite_error(&format!("reading `{}` owner", spec.table), source)
-            })?;
-            if owners.contains(&owner) {
-                impact.rows = impact.rows.saturating_add(1);
-                for column in 0..column_count {
-                    if !excluded.contains(&column) {
-                        impact.bytes =
-                            impact
-                                .bytes
-                                .saturating_add(value_bytes(row.get_ref(column).map_err(
-                                    |source| {
-                                        sqlite_error(
-                                            &format!("sizing `{}` row", spec.table),
-                                            source,
-                                        )
-                                    },
-                                )?));
-                    }
-                }
-            }
+        for owner_chunk in owners.iter().collect::<Vec<_>>().chunks(500) {
+            let placeholders = std::iter::repeat_n("?", owner_chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT COUNT(*), COALESCE(SUM({byte_expression}), 0) \
+                 FROM {quoted_table} WHERE {} IN ({placeholders})",
+                quote_identifier(spec.owner_column)
+            );
+            let (rows, bytes) = database
+                .connection()
+                .query_row(
+                    &sql,
+                    rusqlite::params_from_iter(owner_chunk.iter().copied()),
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .map_err(|source| {
+                    sqlite_error(&format!("aggregating `{}` impact", spec.table), source)
+                })?;
+            impact.rows = impact.rows.saturating_add(to_u64(
+                rows,
+                &format!("reading `{}` impact row count", spec.table),
+            )?);
+            impact.bytes = impact.bytes.saturating_add(to_u64(
+                bytes,
+                &format!("reading `{}` impact byte count", spec.table),
+            )?);
         }
         result.insert(spec.table.to_owned(), impact);
     }
     Ok(result)
+}
+
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn value_bytes_sql(column: &str) -> String {
+    format!(
+        "CASE typeof({column}) WHEN 'null' THEN 0 WHEN 'integer' THEN 8 \
+         WHEN 'real' THEN 8 ELSE length(CAST({column} AS BLOB)) END"
+    )
 }
 
 fn merge_table_impact(
@@ -695,6 +711,7 @@ fn directory_entries(path: &Path) -> Result<Vec<fs::DirEntry>, Error> {
         .collect()
 }
 
+#[cfg(test)]
 const fn value_bytes(value: ValueRef<'_>) -> u64 {
     match value {
         ValueRef::Null => 0,
@@ -705,6 +722,11 @@ const fn value_bytes(value: ValueRef<'_>) -> u64 {
 
 fn to_usize(value: i64, context: &str) -> Result<usize, Error> {
     usize::try_from(value)
+        .map_err(|_| sqlite_error(context, rusqlite::Error::IntegralValueOutOfRange(0, value)))
+}
+
+fn to_u64(value: i64, context: &str) -> Result<u64, Error> {
+    u64::try_from(value)
         .map_err(|_| sqlite_error(context, rusqlite::Error::IntegralValueOutOfRange(0, value)))
 }
 
@@ -775,10 +797,106 @@ mod tests {
             .collect()
     }
 
+    fn legacy_table_impact(
+        connection: &rusqlite::Connection,
+        specs: &[TableSpec],
+        owners: &BTreeSet<String>,
+    ) -> BTreeMap<String, TableImpact> {
+        specs
+            .iter()
+            .map(|spec| {
+                let mut statement = connection
+                    .prepare(&format!("SELECT * FROM {}", spec.table))
+                    .expect("legacy impact scan should prepare");
+                let owner_index = statement
+                    .column_names()
+                    .iter()
+                    .position(|column| *column == spec.owner_column)
+                    .expect("fixture should contain the impact owner column");
+                let excluded = statement
+                    .column_names()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, column)| {
+                        spec.attributed_payload_columns
+                            .contains(column)
+                            .then_some(index)
+                    })
+                    .collect::<BTreeSet<_>>();
+                let column_count = statement.column_count();
+                let mut rows = statement
+                    .query([])
+                    .expect("legacy impact scan should query");
+                let mut impact = TableImpact::default();
+                while let Some(row) = rows.next().expect("legacy impact row should be readable") {
+                    let owner = row
+                        .get::<_, String>(owner_index)
+                        .expect("legacy impact owner should be readable");
+                    if owners.contains(&owner) {
+                        impact.rows = impact.rows.saturating_add(1);
+                        for column in 0..column_count {
+                            if !excluded.contains(&column) {
+                                impact.bytes = impact.bytes.saturating_add(value_bytes(
+                                    row.get_ref(column)
+                                        .expect("legacy impact value should be readable"),
+                                ));
+                            }
+                        }
+                    }
+                }
+                (spec.table.to_owned(), impact)
+            })
+            .collect()
+    }
+
     #[test]
     fn attributable_bytes_are_saturating_and_self_contained() {
         assert_eq!(total_attributable_bytes(20, 30, 40), 90);
         assert_eq!(total_attributable_bytes(u64::MAX, 1, 1), u64::MAX);
+    }
+
+    #[test]
+    fn narrow_selection_matches_legacy_accounting_on_large_relation_tables() {
+        let fixture = Fixture::build(&FixtureConfig {
+            project_count: 8,
+            session_count: 512,
+            messages_per_session: 3,
+            parts_per_message: 2,
+            ..FixtureConfig::default()
+        })
+        .expect("large relation fixture should build");
+        let database = open_fixture(&fixture);
+        let selected_session = BTreeSet::from([fixture.session_ids[257].clone()]);
+        let selected_project = database
+            .connection()
+            .query_row(
+                "SELECT project_id FROM session WHERE id = ?1",
+                [&fixture.session_ids[257]],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|project_id| BTreeSet::from([project_id]))
+            .expect("selected project should be readable");
+
+        for (specs, owners) in [
+            (SESSION_TABLES, &selected_session),
+            (PROJECT_TABLES, &selected_project),
+        ] {
+            let actual =
+                table_impact(&database, specs, owners).expect("impact query should succeed");
+            let expected = legacy_table_impact(database.connection(), specs, owners);
+            for spec in specs {
+                assert_eq!(
+                    actual[spec.table].rows, expected[spec.table].rows,
+                    "{} rows",
+                    spec.table
+                );
+                assert_eq!(
+                    actual[spec.table].bytes, expected[spec.table].bytes,
+                    "{} bytes",
+                    spec.table
+                );
+            }
+        }
     }
 
     #[test]
