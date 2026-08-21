@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use crate::db::{DatabaseConnection, ReadWrite};
 use crate::error::Error;
@@ -11,6 +11,18 @@ use crate::select::retention;
 use super::sessions::{self, DeleteOptions, DeletionReport};
 
 const DEFAULT_MAX_PASSES: usize = 32;
+const CREATE_DANGLING_CANDIDATES_SQL: &str = "
+    DROP TABLE IF EXISTS dangling_session_candidates;
+    CREATE TEMP TABLE dangling_session_candidates(id TEXT PRIMARY KEY) WITHOUT ROWID;
+";
+const CURRENT_DANGLING_SQL: &str = "
+    SELECT child.id
+    FROM dangling_session_candidates AS candidate
+    CROSS JOIN session AS child ON child.id = candidate.id
+    LEFT JOIN session AS parent ON parent.id = child.parent_id
+    WHERE child.parent_id IS NOT NULL AND parent.id IS NULL
+    ORDER BY child.id
+";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OrphanDeleteOptions {
@@ -88,16 +100,17 @@ where
         return Ok(report);
     }
 
-    let mut candidates = raw_orphans
+    let candidates = raw_orphans
         .dangling_session_ids
         .iter()
         .map(DanglingSessionId::as_str)
         .filter(|id| !retained.contains(*id))
         .map(str::to_owned)
         .collect::<SessionIds>();
+    let candidates = DanglingCandidates::materialize(database.connection(), &candidates)?;
 
     for _ in 0..options.max_passes {
-        let dangling = current_dangling(database.connection(), &candidates)?;
+        let dangling = candidates.current()?;
         if dangling.is_empty() {
             return Ok(report);
         }
@@ -110,11 +123,11 @@ where
                 &mut batch_committed,
             )?,
         );
-        candidates.retain(|id| !dangling.contains(id));
+        candidates.remove(&dangling)?;
         report.dangling_passes = report.dangling_passes.saturating_add(1);
     }
 
-    report.iteration_bound_hit = !current_dangling(database.connection(), &candidates)?.is_empty();
+    report.iteration_bound_hit = !candidates.current()?.is_empty();
     Ok(report)
 }
 
@@ -124,23 +137,71 @@ fn is_session_id(value: &str) -> bool {
     })
 }
 
-fn current_dangling(connection: &Connection, candidates: &SessionIds) -> Result<SessionIds, Error> {
-    const SQL: &str = "
-        SELECT session.id
-        FROM session
-        LEFT JOIN session AS parent ON parent.id = session.parent_id
-        WHERE session.parent_id IS NOT NULL AND parent.id IS NULL
-        ORDER BY session.id
-    ";
-    let mut statement = connection
-        .prepare(SQL)
-        .map_err(|source| sqlite_error("preparing dangling-session deletion pass", source))?;
-    let dangling = statement
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|source| sqlite_error("querying dangling-session deletion pass", source))?
-        .collect::<Result<BTreeSet<_>, _>>()
-        .map_err(|source| sqlite_error("reading dangling-session deletion pass", source))?;
-    Ok(dangling.intersection(candidates).cloned().collect())
+struct DanglingCandidates<'connection> {
+    connection: &'connection Connection,
+}
+
+impl<'connection> DanglingCandidates<'connection> {
+    fn materialize(
+        connection: &'connection Connection,
+        candidates: &SessionIds,
+    ) -> Result<Self, Error> {
+        connection
+            .execute_batch(CREATE_DANGLING_CANDIDATES_SQL)
+            .map_err(|source| sqlite_error("creating dangling-session candidate table", source))?;
+        let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Deferred)
+            .map_err(|source| sqlite_error("starting dangling-session materialization", source))?;
+        {
+            let mut insert = transaction
+                .prepare("INSERT INTO dangling_session_candidates(id) VALUES (?1)")
+                .map_err(|source| {
+                    sqlite_error("preparing dangling-session materialization", source)
+                })?;
+            for candidate in candidates {
+                insert.execute([candidate]).map_err(|source| {
+                    sqlite_error("materializing dangling-session candidates", source)
+                })?;
+            }
+        }
+        transaction.commit().map_err(|source| {
+            sqlite_error("committing dangling-session materialization", source)
+        })?;
+        Ok(Self { connection })
+    }
+
+    fn current(&self) -> Result<SessionIds, Error> {
+        let mut statement = self
+            .connection
+            .prepare(CURRENT_DANGLING_SQL)
+            .map_err(|source| sqlite_error("preparing dangling-session deletion pass", source))?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|source| sqlite_error("querying dangling-session deletion pass", source))?
+            .collect::<Result<BTreeSet<_>, _>>()
+            .map_err(|source| sqlite_error("reading dangling-session deletion pass", source))
+    }
+
+    fn remove(&self, candidates: &SessionIds) -> Result<(), Error> {
+        let transaction =
+            Transaction::new_unchecked(self.connection, TransactionBehavior::Deferred).map_err(
+                |source| sqlite_error("starting dangling-session candidate removal", source),
+            )?;
+        {
+            let mut remove = transaction
+                .prepare("DELETE FROM dangling_session_candidates WHERE id = ?1")
+                .map_err(|source| {
+                    sqlite_error("preparing dangling-session candidate removal", source)
+                })?;
+            for candidate in candidates {
+                remove.execute([candidate]).map_err(|source| {
+                    sqlite_error("removing dangling-session candidates", source)
+                })?;
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error("committing dangling-session candidate removal", source))
+    }
 }
 
 fn merge_deletion_report(target: &mut DeletionReport, source: DeletionReport) {
@@ -420,5 +481,47 @@ mod tests {
         assert_eq!(report.dangling_passes, 2);
         assert!(report.iteration_bound_hit);
         assert_eq!(counts(database.connection())["session"], 2);
+    }
+
+    #[test]
+    fn dangling_pass_query_uses_temp_candidates_without_scanning_sessions() {
+        let fixture = Fixture::build(&FixtureConfig {
+            session_count: 3_000,
+            ..FixtureConfig::default()
+        })
+        .expect("query-plan fixture should build");
+        let connection = fixture.connect().expect("fixture should connect");
+        connection
+            .execute_batch(CREATE_DANGLING_CANDIDATES_SQL)
+            .expect("candidate table should materialize");
+        connection
+            .execute(
+                "INSERT INTO dangling_session_candidates SELECT id FROM session ORDER BY id LIMIT 10",
+                [],
+            )
+            .expect("candidate ids should insert");
+
+        let mut statement = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {CURRENT_DANGLING_SQL}"))
+            .expect("query plan should prepare");
+        let details = statement
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("query plan should execute")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("query plan should read");
+        let normalized = details
+            .iter()
+            .map(|detail| detail.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+
+        assert!(normalized
+            .iter()
+            .any(|detail| detail.starts_with("scan candidate")));
+        assert!(normalized.iter().any(|detail| {
+            detail.contains("search child") && detail.contains("sqlite_autoindex_session_1")
+        }));
+        assert!(normalized
+            .iter()
+            .all(|detail| !detail.starts_with("scan child")));
     }
 }
