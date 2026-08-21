@@ -48,7 +48,7 @@ oc-clean clean --older-than 90D --dry-run
 oc-clean clean --older-than 90D
 ```
 
-The second command prints the same impact, asks `Proceed? [y/N]`, and deletes only after `y` or `yes`. Automation must add `--dangerously-skip-confirm` explicitly after reviewing the same `--dry-run` selection.
+The second command prints the same impact, asks `Proceed? [y/n]`, and deletes only after `y` or `yes`. Answering `n` or `no` cancels. An answer that is neither is re-asked, up to three attempts per question. Automation must add `--dangerously-skip-confirm` explicitly after reviewing the same `--dry-run` selection.
 
 ## Commands
 
@@ -177,9 +177,9 @@ Sub-day duration units and binary size units are explicitly rejected. Incrementa
 
 ### Dry Runs And Confirmation
 
-`analyze` and `doctor` are read-only. `clean` and `vacuum` mutate, and both stop at an interactive confirmation that displays the full impact and accepts only `y` or `yes`, ignoring case and surrounding whitespace. `--dry-run` performs the same selection, compatibility, holder, and headroom work, prints the report, and exits while preserving database bytes. Mutating runs acquire SQLite's exclusive lock before touching data. Piped input, JSON output, or a missing terminal cannot answer the prompt and therefore refuse with exit code 2 unless `--dangerously-skip-confirm` is supplied.
+`analyze` and `doctor` are read-only. `clean` and `vacuum` mutate, and both stop at an interactive confirmation that displays the full impact. `y` and `yes` proceed, `n` and `no` cancel, and case and surrounding whitespace are ignored. Any other answer is re-asked; each question allows three attempts before the command gives up. Canceling is reported as a plain notice rather than an `error:` line, because declining is a decision, and it still exits with code 2 so a script can tell that nothing ran. `--dry-run` performs the same selection, compatibility, holder, and headroom work, prints the report, and exits while preserving database bytes. Mutating runs acquire SQLite's exclusive lock before touching data. Piped input, JSON output, or a missing terminal cannot answer the prompt and therefore refuse with exit code 2 unless `--dangerously-skip-confirm` is supplied.
 
-A `clean` selecting at least half of the sessions in the database asks a second, independent question after the first, naming the selected count against the database total; both answers must be affirmative. `--dangerously-skip-confirm` bypasses both prompts, and leaves holder, schema, lock, headroom, and integrity gates active. A mistaken selector or database path can therefore execute unattended and delete the wrong data.
+A `clean` selecting at least half of the sessions in the database asks a second, independent question after the first, naming the selected count against the database total; both answers must be affirmative. The second question carries its own attempt allowance. `--dangerously-skip-confirm` bypasses both prompts, and leaves holder, schema, lock, headroom, and integrity gates active. A mistaken selector or database path can therefore execute unattended and delete the wrong data.
 
 ### Holder Detection
 
@@ -249,7 +249,8 @@ Exit codes are a stable process contract. Several error variants intentionally s
 | 0 | `Success` | Complete success. |
 | 1 | `Io` | Filesystem, terminal, or output I/O failure. |
 | 1 | `Sqlite` | Generic SQLite failure outside a more specific category. |
-| 2 | `InvalidArgument` | Invalid value, missing selector, refused confirmation, or incompatible invocation. |
+| 2 | `InvalidArgument` | Invalid value, missing selector, or incompatible invocation. |
+| 2 | `Canceled` | The operator declined the confirmation, or never answered it. |
 | 3 | `NotFound` | Database file does not exist. |
 | 4 | `SchemaIncompatible` | Required schema is missing or deletion semantics are unrecognized. |
 | 5 | `DatabaseBusy` | Holder policy, SQLite locking, or concurrent-change protection refused the operation. |

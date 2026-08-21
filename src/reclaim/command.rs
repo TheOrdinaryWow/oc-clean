@@ -23,7 +23,10 @@ use crate::error::Error;
 use crate::paths::{self, DatabaseOptions, Environment, Platform, Target};
 use crate::report::format::{self, Style};
 use crate::report::progress;
-use crate::safety::confirm::{ConfirmationDecision, ConfirmationOptions, ImpactSummary, confirm};
+use crate::safety::confirm::{
+    CONFIRMATION_ATTEMPTS, ConfirmationDecision, ConfirmationOptions, ImpactSummary, RefusalReason,
+    confirm,
+};
 use crate::safety::holders::{CommandMode, GateDecision, HolderInspector, inspect_and_decide};
 
 use signal::SignalController;
@@ -316,10 +319,10 @@ where
     W: Write + ?Sized,
 {
     let details = format!(
-        "Strategy: {}; current size: {} bytes; estimated post-vacuum size: {} bytes",
+        "Strategy: {}; current size: {}; estimated post-vacuum size: {}",
         report.strategy.as_str(),
-        report.current_size,
-        report.estimated_post_vacuum_size
+        format::bytes(report.current_size),
+        format::bytes(report.estimated_post_vacuum_size)
     );
     let decision = confirm(
         &ImpactSummary {
@@ -339,11 +342,23 @@ where
     .map_err(|source| io_error(Path::new("<terminal>"), source))?;
     match decision {
         ConfirmationDecision::Proceed => Ok(()),
-        ConfirmationDecision::Refuse => Err(Error::InvalidArgument {
-            argument: "confirmation".to_owned(),
-            reason: "vacuum requires an interactive `yes` or --dangerously-skip-confirm; \
-                     use --dry-run to preview without reclaiming"
-                .to_owned(),
+        ConfirmationDecision::Refuse(reason) => Err(match reason {
+            RefusalReason::Declined => Error::Canceled {
+                reason: "vacuum canceled; nothing was changed".to_owned(),
+            },
+            RefusalReason::Unanswered => Error::Canceled {
+                reason: format!(
+                    "vacuum canceled after {CONFIRMATION_ATTEMPTS} unrecognized answers; \
+                     nothing was changed"
+                ),
+            },
+            RefusalReason::NotInteractive => Error::InvalidArgument {
+                argument: "confirmation".to_owned(),
+                reason: "vacuum cannot ask for confirmation without a terminal; \
+                         pass --dangerously-skip-confirm, or --dry-run to preview without \
+                         reclaiming"
+                    .to_owned(),
+            },
         }),
     }
 }

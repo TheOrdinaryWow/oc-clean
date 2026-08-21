@@ -50,13 +50,32 @@ impl ConfirmationOptions {
 }
 
 /// Policy result kept separate from command errors until a destructive command applies it.
-///
-/// Todo 28/31 will route disk-headroom conflicts directly through [`Self::Refuse`] in every mode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfirmationDecision {
     Proceed,
-    Refuse,
+    Refuse(RefusalReason),
 }
+
+/// Why a confirmation did not proceed, so the caller can word the outcome honestly.
+///
+/// A person answering `no` made a decision; a stream that cannot be asked, or an answer that was
+/// never recognized, did not. Rendering all three the same way would tell an operator their
+/// deliberate `no` was a program failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RefusalReason {
+    /// The operator answered in the negative.
+    Declined,
+    /// Every attempt produced an answer that was neither affirmative nor negative.
+    Unanswered,
+    /// The invocation could not present a prompt at all.
+    NotInteractive,
+}
+
+/// How many times one question may be asked before the command gives up.
+///
+/// The first ask plus two retries. A mistyped answer is common enough to deserve a retry, and an
+/// operator who cannot produce a recognized answer three times will not on the fourth.
+pub const CONFIRMATION_ATTEMPTS: u32 = 3;
 
 /// Confirms a destructive operation according to the interactive contract.
 ///
@@ -85,38 +104,64 @@ where
         return Ok(ConfirmationDecision::Proceed);
     }
     if !options.is_interactive() {
-        return Ok(ConfirmationDecision::Refuse);
+        return Ok(ConfirmationDecision::Refuse(RefusalReason::NotInteractive));
     }
 
     writeln!(output, "{} impact:", summary.operation)?;
     writeln!(output, "{}", summary.details)?;
-    if prompt(output, input, "Proceed? [y/N] ")? == ConfirmationDecision::Refuse {
-        return Ok(ConfirmationDecision::Refuse);
+    match prompt(output, input, "Proceed? [y/n] ")? {
+        ConfirmationDecision::Proceed => {}
+        refusal @ ConfirmationDecision::Refuse(_) => return Ok(refusal),
     }
 
     let Some(escalation) = summary.escalation else {
         return Ok(ConfirmationDecision::Proceed);
     };
     writeln!(output, "{escalation}")?;
-    prompt(output, input, "Are you sure? [y/N] ")
+    prompt(output, input, "Are you sure? [y/n] ")
 }
 
+/// Asks one question until it is answered or the attempt allowance runs out.
+///
+/// An unrecognized answer is re-asked rather than treated as a refusal, because a typo is not a
+/// decision. An explicit negative ends the question immediately: the operator already decided,
+/// and asking again would be pestering them into a different answer.
+///
+/// End-of-input stops the loop. A closed stream will not produce a different answer on the next
+/// attempt, so retrying would spin without ever blocking.
 fn prompt<R, W>(output: &mut W, input: &mut R, question: &str) -> io::Result<ConfirmationDecision>
 where
     R: BufRead + ?Sized,
     W: Write + ?Sized,
 {
-    write!(output, "{question}")?;
-    output.flush()?;
+    for remaining in (0..CONFIRMATION_ATTEMPTS).rev() {
+        write!(output, "{question}")?;
+        output.flush()?;
 
-    let mut answer = String::new();
-    input.read_line(&mut answer)?;
-    let answer = answer.trim();
-    if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
-        Ok(ConfirmationDecision::Proceed)
-    } else {
-        Ok(ConfirmationDecision::Refuse)
+        let mut answer = String::new();
+        if input.read_line(&mut answer)? == 0 {
+            return Ok(ConfirmationDecision::Refuse(RefusalReason::Unanswered));
+        }
+        let answer = answer.trim();
+        if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
+            return Ok(ConfirmationDecision::Proceed);
+        }
+        if answer.eq_ignore_ascii_case("n") || answer.eq_ignore_ascii_case("no") {
+            return Ok(ConfirmationDecision::Refuse(RefusalReason::Declined));
+        }
+        if remaining > 0 {
+            writeln!(
+                output,
+                "Please answer `y` or `n` ({remaining} {} left).",
+                if remaining == 1 {
+                    "attempt"
+                } else {
+                    "attempts"
+                }
+            )?;
+        }
     }
+    Ok(ConfirmationDecision::Refuse(RefusalReason::Unanswered))
 }
 
 #[cfg(test)]
@@ -124,7 +169,8 @@ mod tests {
     use std::io::Cursor;
 
     use super::{
-        ConfirmationDecision, ConfirmationOptions, ImpactSummary, confirm, warrants_escalation,
+        CONFIRMATION_ATTEMPTS, ConfirmationDecision, ConfirmationOptions, ImpactSummary,
+        RefusalReason, confirm, warrants_escalation,
     };
 
     fn summary() -> ImpactSummary<'static> {
@@ -153,7 +199,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(decision, ConfirmationDecision::Refuse);
+        assert_eq!(
+            decision,
+            ConfirmationDecision::Refuse(RefusalReason::NotInteractive)
+        );
         assert_eq!(output, b"");
     }
 
@@ -192,7 +241,7 @@ mod tests {
 
         assert_eq!(
             confirm(&summary(), confirmation, &mut input, &mut output).unwrap(),
-            ConfirmationDecision::Refuse
+            ConfirmationDecision::Refuse(RefusalReason::NotInteractive)
         );
         assert_eq!(output, b"");
     }
@@ -202,8 +251,21 @@ mod tests {
         for (answer, expected) in [
             ("yes\n", ConfirmationDecision::Proceed),
             ("y\n", ConfirmationDecision::Proceed),
-            ("\n", ConfirmationDecision::Refuse),
-            ("maybe\n", ConfirmationDecision::Refuse),
+            ("YES\n", ConfirmationDecision::Proceed),
+            ("  y  \n", ConfirmationDecision::Proceed),
+            ("n\n", ConfirmationDecision::Refuse(RefusalReason::Declined)),
+            (
+                "NO\n",
+                ConfirmationDecision::Refuse(RefusalReason::Declined),
+            ),
+            (
+                "\n\n\n",
+                ConfirmationDecision::Refuse(RefusalReason::Unanswered),
+            ),
+            (
+                "maybe\nwhat\nhuh\n",
+                ConfirmationDecision::Refuse(RefusalReason::Unanswered),
+            ),
         ] {
             let mut input = Cursor::new(answer.as_bytes());
             let mut output = Vec::new();
@@ -224,7 +286,7 @@ mod tests {
             let rendered = String::from_utf8(output).unwrap();
             assert!(rendered.contains("clean"));
             assert!(rendered.contains("3 root sessions"));
-            assert!(rendered.contains("Proceed? [y/N]"));
+            assert!(rendered.contains("Proceed? [y/n]"));
         }
     }
 
@@ -266,11 +328,96 @@ mod tests {
 
         assert_eq!(
             decide(Some("majority"), "y\nn\n").0,
-            ConfirmationDecision::Refuse
+            ConfirmationDecision::Refuse(RefusalReason::Declined)
         );
         let (decision, rendered) = decide(Some("majority"), "n\ny\n");
-        assert_eq!(decision, ConfirmationDecision::Refuse);
+        assert_eq!(
+            decision,
+            ConfirmationDecision::Refuse(RefusalReason::Declined)
+        );
         assert!(!rendered.contains("Are you sure?"));
+    }
+
+    #[test]
+    fn an_unrecognized_answer_is_re_asked_and_the_allowance_is_per_question() {
+        fn decide(escalation: Option<&str>, answers: &str) -> (ConfirmationDecision, String) {
+            let mut input = Cursor::new(answers.as_bytes().to_vec());
+            let mut output = Vec::new();
+            let decision = confirm(
+                &ImpactSummary {
+                    operation: "clean",
+                    details: "8 sessions",
+                    escalation,
+                },
+                ConfirmationOptions {
+                    stdin_is_terminal: true,
+                    stdout_is_terminal: true,
+                    json: false,
+                    dangerously_skip_confirm: false,
+                },
+                &mut input,
+                &mut output,
+            )
+            .unwrap();
+            (
+                decision,
+                String::from_utf8(output).expect("prompt should be UTF-8"),
+            )
+        }
+
+        // A typo costs an attempt, not the command.
+        let (decision, rendered) = decide(None, "wat\ny\n");
+        assert_eq!(decision, ConfirmationDecision::Proceed);
+        assert_eq!(rendered.matches("Proceed? [y/n]").count(), 2);
+        assert!(rendered.contains("2 attempts left"));
+
+        // The third attempt is still honored.
+        let (decision, rendered) = decide(None, "wat\nhuh\ny\n");
+        assert_eq!(decision, ConfirmationDecision::Proceed);
+        assert_eq!(rendered.matches("Proceed? [y/n]").count(), 3);
+        assert!(rendered.contains("1 attempt left"));
+
+        // The fourth is not offered.
+        let (decision, rendered) = decide(None, "wat\nhuh\neh\ny\n");
+        assert_eq!(
+            decision,
+            ConfirmationDecision::Refuse(RefusalReason::Unanswered)
+        );
+        assert_eq!(
+            rendered.matches("Proceed? [y/n]").count(),
+            CONFIRMATION_ATTEMPTS as usize
+        );
+
+        // The escalation prompt carries its own allowance rather than sharing the first one.
+        let (decision, rendered) = decide(Some("majority"), "wat\ny\nhuh\ny\n");
+        assert_eq!(decision, ConfirmationDecision::Proceed);
+        assert_eq!(rendered.matches("Are you sure? [y/n]").count(), 2);
+    }
+
+    #[test]
+    fn a_closed_stream_stops_asking_instead_of_spinning() {
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+
+        let decision = confirm(
+            &summary(),
+            ConfirmationOptions {
+                stdin_is_terminal: true,
+                stdout_is_terminal: true,
+                json: false,
+                dangerously_skip_confirm: false,
+            },
+            &mut input,
+            &mut output,
+        )
+        .unwrap();
+
+        assert_eq!(
+            decision,
+            ConfirmationDecision::Refuse(RefusalReason::Unanswered)
+        );
+        let rendered = String::from_utf8(output).expect("prompt should be UTF-8");
+        assert_eq!(rendered.matches("Proceed? [y/n]").count(), 1);
     }
 
     #[test]

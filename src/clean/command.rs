@@ -16,11 +16,12 @@ use crate::parallel::{self, JobHandle};
 use crate::paths::{self, DatabaseOptions, DerivedPaths, Environment, Platform, Target};
 use crate::reclaim::headroom::{FreeSpaceProvider, Fs2FreeSpaceProvider};
 use crate::reclaim::incremental::{IncrementalVacuumError, check_auto_vacuum};
-use crate::report::format::Style;
-use crate::report::impact::{self, Impact};
+use crate::report::format::{self, Style};
+use crate::report::impact::{self, Impact, ReportMode};
 use crate::report::progress;
 use crate::safety::confirm::{
-    ConfirmationDecision, ConfirmationOptions, ImpactSummary, confirm, warrants_escalation,
+    CONFIRMATION_ATTEMPTS, ConfirmationDecision, ConfirmationOptions, ImpactSummary, RefusalReason,
+    confirm, warrants_escalation,
 };
 use crate::safety::holders::{CommandMode, GateDecision, HolderInspector, inspect_and_decide};
 use crate::select::orphans::RawOrphans;
@@ -174,9 +175,10 @@ where
         return output::write_dry_run(&impact.summary, arguments.json, report_style(), output)
             .map_err(output_error);
     }
-    render_apply_impact(arguments, &impact, output)?;
-
+    // Entering P11 clears the phase bar. It must happen before the report and the prompt are
+    // written, because the bar redraws on stderr and would interleave with them otherwise.
     phase(observer, PhaseId::P11);
+    render_apply_impact(arguments, &impact, output)?;
     ensure_confirmed(cli, arguments, input, output, runtime, &impact)?;
     stop_before_mutation_if_cancelled(signals)?;
 
@@ -412,7 +414,8 @@ fn render_apply_impact(
     if arguments.json {
         Ok(())
     } else {
-        impact::write_human(&impact.summary, output, report_style()).map_err(output_error)
+        impact::write_human(&impact.summary, ReportMode::Pending, output, report_style())
+            .map_err(output_error)
     }
 }
 
@@ -436,8 +439,9 @@ where
     R: BufRead + ?Sized,
 {
     let details = format!(
-        "Delete {} sessions and {} attributable bytes",
-        impact.summary.total_session_count, impact.summary.total_bytes
+        "Delete {} sessions and {} of attributable data",
+        impact.summary.total_session_count,
+        format::bytes(impact.summary.total_bytes)
     );
     let escalation = warrants_escalation(
         impact.summary.total_session_count,
@@ -467,12 +471,32 @@ where
     .map_err(output_error)?;
     match decision {
         ConfirmationDecision::Proceed => Ok(()),
-        ConfirmationDecision::Refuse => Err(Error::InvalidArgument {
+        ConfirmationDecision::Refuse(reason) => Err(refusal_error("clean", "deleting", reason)),
+    }
+}
+
+/// Turns a refusal into the message the operator should read.
+///
+/// Declining is a decision and reads as one. An unusable stream is a usage problem, so it names
+/// the flag that makes the command work unattended.
+fn refusal_error(command: &str, effect: &str, reason: RefusalReason) -> Error {
+    match reason {
+        RefusalReason::Declined => Error::Canceled {
+            reason: format!("{command} canceled; nothing was changed"),
+        },
+        RefusalReason::Unanswered => Error::Canceled {
+            reason: format!(
+                "{command} canceled after {CONFIRMATION_ATTEMPTS} unrecognized answers; \
+                 nothing was changed"
+            ),
+        },
+        RefusalReason::NotInteractive => Error::InvalidArgument {
             argument: "confirmation".to_owned(),
-            reason: "clean requires an interactive `yes` or --dangerously-skip-confirm; \
-                     use --dry-run to preview without deleting"
-                .to_owned(),
-        }),
+            reason: format!(
+                "{command} cannot ask for confirmation without a terminal; \
+                 pass --dangerously-skip-confirm, or --dry-run to preview without {effect}"
+            ),
+        },
     }
 }
 

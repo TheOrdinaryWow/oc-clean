@@ -258,6 +258,24 @@ pub fn summarize<Access>(
 /// Width budget for a session title inside the selection preview.
 const PREVIEW_TITLE_WIDTH: usize = 44;
 
+/// Whether an impact report describes a preview or the run about to be confirmed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReportMode {
+    /// `--dry-run`: the report is the whole output and nothing will be deleted.
+    DryRun,
+    /// The report precedes a confirmation that can still delete what it describes.
+    Pending,
+}
+
+impl ReportMode {
+    const fn heading(self) -> &'static str {
+        match self {
+            Self::DryRun => "Cleanup Impact (dry-run)",
+            Self::Pending => "Cleanup Impact",
+        }
+    }
+}
+
 /// Writes the human-readable dry-run and confirmation summary.
 ///
 /// # Errors
@@ -265,6 +283,7 @@ const PREVIEW_TITLE_WIDTH: usize = 44;
 /// Returns the underlying writer error when output cannot be completed.
 pub fn write_human(
     summary: &ImpactSummary,
+    mode: ReportMode,
     output: &mut dyn Write,
     style: Style,
 ) -> io::Result<()> {
@@ -272,15 +291,16 @@ pub fn write_human(
         writeln!(output, "nothing to delete")?;
         return Ok(());
     }
-    write_section(summary, output, style).map_err(unwrap_io)
+    write_section(summary, mode, output, style).map_err(unwrap_io)
 }
 
 fn write_section(
     summary: &ImpactSummary,
+    mode: ReportMode,
     output: &mut dyn Write,
     style: Style,
 ) -> Result<(), Error> {
-    format::heading(output, "Cleanup Impact (dry-run)", style)?;
+    format::heading(output, mode.heading(), style)?;
     format::field(output, "Root sessions", summary.root_session_count)?;
     format::field(output, "Total sessions", summary.total_session_count)?;
     format::field(output, "Orphan rows", summary.orphan_row_count)?;
@@ -1259,7 +1279,13 @@ mod tests {
             2
         );
         let mut rendered = Vec::new();
-        write_human(&impact.summary, &mut rendered, Style::plain()).expect("impact should render");
+        write_human(
+            &impact.summary,
+            ReportMode::DryRun,
+            &mut rendered,
+            Style::plain(),
+        )
+        .expect("impact should render");
         assert!(
             String::from_utf8(rendered)
                 .unwrap()

@@ -16,6 +16,11 @@ use crate::error::Error;
 ///
 /// Returns the underlying writer error when the diagnostic cannot be written.
 pub fn write_human(error: &Error, output: &mut dyn Write) -> io::Result<()> {
+    // A canceled operation is an answer, not a fault. Prefixing a deliberate `no` with `error:`
+    // tells the operator the program broke when it did exactly what they asked.
+    if let Error::Canceled { reason } = error {
+        return writeln!(output, "{reason}");
+    }
     writeln!(
         output,
         "{} {error}",

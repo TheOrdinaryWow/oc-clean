@@ -256,6 +256,50 @@ fn exact_phase_order_covers_default_and_conditional_paths() {
 }
 
 #[test]
+fn the_confirmation_prompt_states_a_formatted_size_and_retries_a_typo() {
+    let fixture = fixture(false);
+    let mut cli = cli(&fixture.database_path, false);
+    cli.dangerously_skip_confirm = false;
+    let mut arguments = arguments(false);
+    arguments.no_vacuum = true;
+    arguments.gc_snapshots = false;
+    let mut output = Vec::new();
+
+    run_with(
+        &cli,
+        &arguments,
+        // The fixture selects every session, so the majority escalation asks a second question.
+        &mut Cursor::new(b"wat\ny\ny\n".to_vec()),
+        &mut output,
+        &UnlimitedSpace,
+        &NotHeldInspector,
+        RuntimeContext {
+            stdin_is_terminal: true,
+            stdout_is_terminal: true,
+        },
+        &SignalController::new(),
+        &ThreadSafeRecorder::default(),
+    )
+    .expect("clean should proceed after the retry");
+
+    let rendered = String::from_utf8(output).expect("prompt should be UTF-8");
+    assert!(
+        rendered.contains("of attributable data"),
+        "the prompt should describe a size, got: {rendered}"
+    );
+    // The report precedes a confirmation that can still delete, so it must not claim otherwise.
+    assert!(
+        rendered.contains("Cleanup Impact") && !rendered.contains("(dry-run)"),
+        "a confirmable run must not be labeled a dry run: {rendered}"
+    );
+    assert!(
+        !rendered.contains("attributable bytes"),
+        "the prompt must not print a raw byte count: {rendered}"
+    );
+    assert_eq!(rendered.matches("Proceed? [y/n]").count(), 2);
+}
+
+#[test]
 fn p9_precedes_impact_summary_work() {
     const MUTATED_STORAGE_BYTES: u64 = 16 * 1_024 * 1_024;
 

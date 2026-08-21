@@ -11,7 +11,7 @@ use thiserror::Error as ThisError;
 ///
 /// - `0`: complete success (never returned by an `Error`)
 /// - `1`: generic I/O or SQLite failure
-/// - `2`: invalid argument
+/// - `2`: invalid argument, or an operation the operator canceled
 /// - `3`: database not found
 /// - `4`: incompatible schema
 /// - `5`: database busy
@@ -36,7 +36,7 @@ use thiserror::Error as ThisError;
 ///         Error::Interrupted { .. } => 8,
 ///         Error::PartialSuccess { .. } => 10,
 ///         Error::SwapRollbackFailed { .. } => 11,
-///         Error::InvalidArgument { .. } => 2,
+///         Error::InvalidArgument { .. } | Error::Canceled { .. } => 2,
 ///         Error::Io { .. } | Error::Sqlite { .. } => 1,
 ///         Error::NotFound { .. } => 3,
 ///         Error::UnsupportedPlatform { .. } => 9,
@@ -85,6 +85,14 @@ pub enum Error {
     #[error("invalid argument `{argument}`: {reason}")]
     InvalidArgument { argument: String, reason: String },
 
+    /// The operator declined a destructive command, or never answered its confirmation.
+    ///
+    /// This shares exit code 2 with [`Self::InvalidArgument`] so a script can still branch on a
+    /// non-zero status, but it is a decision rather than a fault and is rendered without the
+    /// `error:` prefix.
+    #[error("{reason}")]
+    Canceled { reason: String },
+
     #[error("I/O operation failed for `{path}`: {source}", path = path.display())]
     Io {
         path: PathBuf,
@@ -112,7 +120,7 @@ impl Error {
     pub const fn exit_code(&self) -> i32 {
         match self {
             Self::Io { .. } | Self::Sqlite { .. } => 1,
-            Self::InvalidArgument { .. } => 2,
+            Self::InvalidArgument { .. } | Self::Canceled { .. } => 2,
             Self::NotFound { .. } => 3,
             Self::SchemaIncompatible { .. } => 4,
             Self::DatabaseBusy { .. } => 5,
@@ -135,6 +143,7 @@ impl Error {
             Self::Io { .. } => "io",
             Self::Sqlite { .. } => "sqlite",
             Self::InvalidArgument { .. } => "invalid_argument",
+            Self::Canceled { .. } => "canceled",
             Self::NotFound { .. } => "not_found",
             Self::SchemaIncompatible { .. } => "schema_incompatible",
             Self::DatabaseBusy { .. } => "database_busy",

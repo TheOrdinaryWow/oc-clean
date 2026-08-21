@@ -38,7 +38,7 @@ All three are omitted together when the session row could not be read, which hap
 A failed command writes one JSON object to **stderr** when `--json` is in effect, leaving stdout carrying either exactly one report object or nothing at all. The failure object contains:
 
 - `error`: boolean, always `true`, so a failure is distinguishable from a report.
-- `kind`: stable snake-case identifier for the failure category, such as `not_found` or `database_busy`. It changes only alongside the documented exit-code table.
+- `kind`: stable snake-case identifier for the failure category, such as `not_found`, `database_busy`, or `canceled`. It changes only alongside the documented exit-code table. A `canceled` object reports an operator who declined or never answered a confirmation, which is a decision rather than a fault even though it exits non-zero.
 - `exit_code`: integer, the same value the process exits with.
 - `message`: human-readable description of the failure.
 - `hint`: optional string naming the next action an operator can take. It is absent when no specific next step applies.

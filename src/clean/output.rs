@@ -4,7 +4,7 @@ use serde_json::json;
 
 use crate::analyze::attribution::SessionAttribution;
 use crate::report::format::{self, Style};
-use crate::report::impact::{self, ImpactSummary};
+use crate::report::impact::{self, ImpactSummary, ReportMode};
 
 #[derive(Debug)]
 pub(super) struct CleanReport {
@@ -28,7 +28,7 @@ pub(super) fn write_dry_run(
     if json_output {
         write_json("dry-run", summary, 0, 0, 0, 0, 0, &[], output)
     } else {
-        impact::write_human(summary, output, style)
+        impact::write_human(summary, ReportMode::DryRun, output, style)
     }
 }
 
