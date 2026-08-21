@@ -82,9 +82,46 @@ pub(super) fn now_ms() -> Result<i64, Error> {
 }
 
 const fn case_sensitivity() -> CaseSensitivity {
-    if cfg!(windows) {
+    platform_case_sensitivity(cfg!(windows), cfg!(target_os = "macos"))
+}
+
+const fn platform_case_sensitivity(is_windows: bool, is_macos: bool) -> CaseSensitivity {
+    if is_windows || is_macos {
         CaseSensitivity::Insensitive
     } else {
         CaseSensitivity::Sensitive
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn platform_case_sensitivity_is_host_independent() {
+        assert_eq!(
+            platform_case_sensitivity(false, true),
+            CaseSensitivity::Insensitive
+        );
+        assert_eq!(
+            platform_case_sensitivity(true, false),
+            CaseSensitivity::Insensitive
+        );
+        assert_eq!(
+            platform_case_sensitivity(false, false),
+            CaseSensitivity::Sensitive
+        );
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn native_case_insensitive_platform_uses_insensitive_matching() {
+        assert_eq!(case_sensitivity(), CaseSensitivity::Insensitive);
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    #[test]
+    fn native_case_sensitive_platform_uses_sensitive_matching() {
+        assert_eq!(case_sensitivity(), CaseSensitivity::Sensitive);
     }
 }
