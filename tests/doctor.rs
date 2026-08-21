@@ -4,6 +4,8 @@ mod fixture;
 
 mod doctor {
     use std::fs;
+    use std::fs::OpenOptions;
+    use std::io::{Seek, SeekFrom, Write};
     use std::path::Path;
     use std::process::{Command, Output};
 
@@ -102,9 +104,12 @@ mod doctor {
             assert!(holder["name"].is_string() || holder["name"].is_null());
             assert!(holder["observed_via"].is_string());
         }
-        assert_eq!(
-            report["vacuum_headroom"]["estimated_required_bytes"],
-            fixture.database_path.metadata().unwrap().len()
+        assert!(report["vacuum_headroom"]["estimated_required_bytes"].is_u64());
+        assert!(
+            report["vacuum_headroom"]["estimated_required_bytes"]
+                .as_u64()
+                .unwrap()
+                > 0
         );
         assert!(report["vacuum_headroom"]["available_bytes"].is_u64());
         assert!(report["vacuum_headroom"]["vacuum_into_feasible"].is_boolean());
@@ -201,6 +206,70 @@ mod doctor {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(metadata(&fixture.database_path), before);
+    }
+
+    #[test]
+    fn corrupted_btree_page_returns_integrity_exit_code() {
+        let fixture = Fixture::build(&FixtureConfig {
+            session_count: 512,
+            messages_per_session: 0,
+            parts_per_message: 0,
+            ..FixtureConfig::default()
+        })
+        .expect("fixture should build");
+        let connection = fixture.connect().expect("fixture should connect");
+        let (page_size, leaf_page): (i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT page_size FROM pragma_page_size), pageno FROM dbstat WHERE name = 'session' AND pagetype = 'leaf' AND pageno != (SELECT rootpage FROM sqlite_master WHERE type = 'table' AND name = 'session') ORDER BY pageno DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("non-root session leaf page should be found");
+        drop(connection);
+        let mut database = OpenOptions::new()
+            .write(true)
+            .open(&fixture.database_path)
+            .expect("fixture database should open for corruption");
+        database
+            .seek(SeekFrom::Start(
+                u64::try_from((leaf_page - 1) * page_size)
+                    .expect("page offset should be non-negative"),
+            ))
+            .expect("session leaf page should be seekable");
+        database
+            .write_all(&[0])
+            .expect("session leaf page should be corrupted");
+        database.sync_all().expect("corruption should be persisted");
+
+        let output = run(&fixture, &[]);
+
+        assert_eq!(output.status.code(), Some(7));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("integrity"),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn missing_required_schema_column_returns_schema_exit_code() {
+        let fixture = Fixture::build(&FixtureConfig::default()).expect("fixture should build");
+        fixture
+            .connect()
+            .expect("fixture should connect")
+            .execute_batch(
+                "ALTER TABLE session RENAME COLUMN time_updated TO incompatible_time_updated",
+            )
+            .expect("required column should be renamed");
+
+        let output = run(&fixture, &[]);
+
+        assert_eq!(output.status.code(), Some(4));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("schema is incompatible"),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn metadata(path: &Path) -> (u64, std::time::SystemTime) {

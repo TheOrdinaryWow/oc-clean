@@ -7,6 +7,9 @@ use super::model::{
     HolderReport, TimestampSanity, VacuumHeadroom,
 };
 use crate::error::Error;
+use crate::reclaim::headroom::{
+    FreeSpaceProvider, Fs2FreeSpaceProvider, HeadroomInput, HeadroomVerdict, evaluate_headroom,
+};
 use crate::safety::holders::{
     CommandMode, Completeness, HolderInspector, Inspection, Verdict, inspect_and_decide,
 };
@@ -30,7 +33,12 @@ pub(crate) fn integrity_check(connection: &Connection) -> Result<CheckReport, Er
 pub(crate) fn foreign_key_check(connection: &Connection) -> Result<ForeignKeyReport, Error> {
     let mut statement = connection
         .prepare("PRAGMA foreign_key_check")
-        .map_err(|source| sqlite_error("preparing PRAGMA foreign_key_check", source))?;
+        .map_err(|source| {
+            integrity_error(
+                "foreign_key_check",
+                &sqlite_error("preparing PRAGMA foreign_key_check", source),
+            )
+        })?;
     let rows = statement
         .query_map([], |row| {
             Ok(ForeignKeyFinding {
@@ -40,27 +48,64 @@ pub(crate) fn foreign_key_check(connection: &Connection) -> Result<ForeignKeyRep
                 foreign_key_index: row.get(3)?,
             })
         })
-        .map_err(|source| sqlite_error("running PRAGMA foreign_key_check", source))?;
-    let findings = rows
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|source| sqlite_error("reading PRAGMA foreign_key_check", source))?;
+        .map_err(|source| {
+            integrity_error(
+                "foreign_key_check",
+                &sqlite_error("running PRAGMA foreign_key_check", source),
+            )
+        })?;
+    let findings = rows.collect::<Result<Vec<_>, _>>().map_err(|source| {
+        integrity_error(
+            "foreign_key_check",
+            &sqlite_error("reading PRAGMA foreign_key_check", source),
+        )
+    })?;
     Ok(ForeignKeyReport {
         ok: findings.is_empty(),
         findings,
     })
 }
 
-pub(super) fn vacuum_headroom(database_path: &Path) -> Result<VacuumHeadroom, Error> {
-    let estimated_required_bytes = database_path
+pub(super) fn vacuum_headroom(
+    database_path: &Path,
+    current_live_bytes: u64,
+    hardlink_supported: bool,
+) -> Result<VacuumHeadroom, Error> {
+    vacuum_headroom_with_provider(
+        database_path,
+        current_live_bytes,
+        hardlink_supported,
+        &Fs2FreeSpaceProvider,
+    )
+}
+
+fn vacuum_headroom_with_provider(
+    database_path: &Path,
+    current_live_bytes: u64,
+    hardlink_supported: bool,
+    provider: &impl FreeSpaceProvider,
+) -> Result<VacuumHeadroom, Error> {
+    let full_original_size = database_path
         .metadata()
         .map_err(|source| io_error(database_path, source))?
         .len();
-    let available_bytes =
-        fs2::available_space(database_path).map_err(|source| io_error(database_path, source))?;
+    let estimate = evaluate_headroom(
+        provider,
+        database_path,
+        HeadroomInput {
+            current_live_bytes,
+            selected_session_bytes: 0,
+            full_original_size,
+            one_batch_wal_allowance: 0,
+            margin_fraction: HeadroomInput::DEFAULT_MARGIN_FRACTION,
+            hardlink_supported,
+        },
+    )
+    .map_err(|source| io_error(database_path, source))?;
     Ok(VacuumHeadroom {
-        estimated_required_bytes,
-        available_bytes,
-        vacuum_into_feasible: available_bytes >= estimated_required_bytes,
+        estimated_required_bytes: estimate.required_bytes,
+        available_bytes: estimate.available_bytes,
+        vacuum_into_feasible: matches!(estimate.verdict, HeadroomVerdict::Sufficient),
     })
 }
 
@@ -228,6 +273,57 @@ fn io_error(path: &Path, source: std::io::Error) -> Error {
     Error::Io {
         path: path.to_owned(),
         source,
+    }
+}
+
+#[cfg(test)]
+mod headroom_tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::reclaim::headroom::{
+        FixedFreeSpaceProvider, HeadroomInput, MarginFraction, evaluate_headroom,
+    };
+
+    #[test]
+    fn vacuum_headroom_matches_reclaim_budget_at_the_space_boundary() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let database_path = directory.path().join("opencode.db");
+        fs::write(&database_path, vec![0; 4_096]).expect("fixture database should be written");
+        let current_live_bytes = 3_072;
+        let input = HeadroomInput {
+            current_live_bytes,
+            selected_session_bytes: 0,
+            full_original_size: 4_096,
+            one_batch_wal_allowance: 0,
+            margin_fraction: MarginFraction::default(),
+            hardlink_supported: false,
+        };
+        let boundary = evaluate_headroom(&FixedFreeSpaceProvider(u64::MAX), &database_path, input)
+            .expect("shared headroom estimate should succeed")
+            .required_bytes;
+
+        for (available_bytes, expected_feasible) in [(boundary - 1, false), (boundary, true)] {
+            let shared = evaluate_headroom(
+                &FixedFreeSpaceProvider(available_bytes),
+                &database_path,
+                input,
+            )
+            .expect("shared headroom estimate should succeed");
+            let doctor = vacuum_headroom_with_provider(
+                &database_path,
+                current_live_bytes,
+                false,
+                &FixedFreeSpaceProvider(available_bytes),
+            )
+            .expect("doctor headroom estimate should succeed");
+
+            assert_eq!(doctor.estimated_required_bytes, shared.required_bytes);
+            assert_eq!(doctor.available_bytes, shared.available_bytes);
+            assert_eq!(doctor.vacuum_into_feasible, expected_feasible);
+        }
     }
 }
 

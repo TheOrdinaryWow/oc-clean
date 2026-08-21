@@ -2,7 +2,7 @@ use std::io::Write;
 use std::path::Path;
 
 use super::model::DoctorReport;
-use crate::analyze::orphans;
+use crate::analyze::{orphans, space};
 use crate::cli::{Cli, DoctorArgs};
 use crate::db::{self, ConnectionOptions};
 use crate::error::Error;
@@ -27,14 +27,22 @@ pub fn run(cli: &Cli, arguments: &DoctorArgs, output: &mut dyn Write) -> Result<
     let connection = database.connection();
 
     let integrity_check = super::checks::integrity_check(connection)?;
+    let schema = db::schema::inspect_report(connection)?;
+    ensure_schema_compatible(&schema)?;
+    let foreign_key_check = super::checks::foreign_key_check(connection)?;
+    let file_space = space::analyze(&database)?.file;
     let report = DoctorReport {
         database_path: database_path.to_owned(),
-        schema: db::schema::inspect_report(connection)?,
+        schema,
         integrity_check,
-        foreign_key_check: super::checks::foreign_key_check(connection)?,
+        foreign_key_check,
         orphans: orphans::analyze(&database, &derived_paths)?,
         holders: super::checks::holders(database_path),
-        vacuum_headroom: super::checks::vacuum_headroom(database_path)?,
+        vacuum_headroom: super::checks::vacuum_headroom(
+            database_path,
+            file_space.live_bytes,
+            database.capabilities().hard_links,
+        )?,
         auto_vacuum: super::checks::auto_vacuum(connection)?,
         timestamp_sanity: super::checks::timestamp_sanity(connection)?,
     };
@@ -45,6 +53,16 @@ pub fn run(cli: &Cli, arguments: &DoctorArgs, output: &mut dyn Write) -> Result<
         super::human::write(&report, output)?;
     }
     ensure_report_health(&report)
+}
+
+fn ensure_schema_compatible(schema: &db::schema::SchemaReport) -> Result<(), Error> {
+    if schema.tier_one_missing.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::SchemaIncompatible {
+            incompatibility: schema.tier_one_missing.join("; "),
+        })
+    }
 }
 
 fn ensure_report_health(report: &DoctorReport) -> Result<(), Error> {
