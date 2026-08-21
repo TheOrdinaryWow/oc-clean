@@ -107,7 +107,7 @@ pub(crate) fn gc_retained_with_path(
     snapshot_root: &Path,
     retained_project_ids: &ProjectIds,
     deleting_project_ids: &ProjectIds,
-    path: Option<&OsStr>,
+    program: Option<&OsStr>,
 ) -> Result<GcSnapshotsOutcome, Error> {
     let retained_paths = retained_project_ids
         .iter()
@@ -119,7 +119,7 @@ pub(crate) fn gc_retained_with_path(
     for project_id in deleting_project_ids {
         validate_project_id(project_id)?;
     }
-    if !git_is_available(path)? {
+    if !git_is_available(program)? {
         return Ok(GcSnapshotsOutcome::SkippedGitUnavailable {
             warning: "SKIP: git is unavailable; retained snapshot repositories were not compacted"
                 .to_owned(),
@@ -160,16 +160,15 @@ pub(crate) fn gc_retained_with_path(
                 report.skipped_entries = report.skipped_entries.saturating_add(1);
                 continue;
             };
-            compact_repository(&repository, path, &mut report)?;
+            compact_repository(&repository, program, &mut report)?;
         }
     }
     Ok(GcSnapshotsOutcome::Completed(report))
 }
 
-fn git_is_available(path: Option<&OsStr>) -> Result<bool, Error> {
-    let mut command = Command::new("git");
+fn git_is_available(program: Option<&OsStr>) -> Result<bool, Error> {
+    let mut command = Command::new(git_program(program));
     command.arg("--version");
-    set_command_path(&mut command, path);
     match command.output() {
         Ok(output) if output.status.success() => Ok(true),
         Ok(output) => Err(io_error(
@@ -189,16 +188,15 @@ fn git_is_available(path: Option<&OsStr>) -> Result<bool, Error> {
 
 fn compact_repository(
     repository: &AnchoredDir,
-    path: Option<&OsStr>,
+    program: Option<&OsStr>,
     report: &mut GcReport,
 ) -> Result<(), Error> {
     let before_bytes = repository
         .directory_bytes()
         .map_err(|source| io_error(repository.path(), source))?;
-    let mut command = Command::new("git");
+    let mut command = Command::new(git_program(program));
     repository.configure_git_command(&mut command);
     command.args(["gc", "--prune=now"]);
-    set_command_path(&mut command, path);
     match command.output() {
         Ok(output) if output.status.success() => {
             let after_bytes = repository
@@ -225,10 +223,9 @@ fn compact_repository(
     Ok(())
 }
 
-fn set_command_path(command: &mut Command, path: Option<&OsStr>) {
-    if let Some(path) = path {
-        command.env("PATH", path);
-    }
+/// Resolves the git executable, allowing tests to substitute a name that cannot be found.
+fn git_program(program: Option<&OsStr>) -> &OsStr {
+    program.unwrap_or(OsStr::new("git"))
 }
 
 /// Removes snapshot directories for projects pruned by the current clean operation.
@@ -472,6 +469,7 @@ fn sqlite_error(context: &str, source: rusqlite::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::fs;
     use std::path::PathBuf;
     use std::process::Command;
@@ -710,15 +708,11 @@ mod tests {
         let fixture = Fixture::new();
         let _repository =
             bare_repository_with_loose_objects(&fixture, "project-retained", "worktree-hash");
-        let empty_path_directory = fixture.directory.path().join("no-executables");
-        fs::create_dir_all(&empty_path_directory)
-            .expect("empty search directory should be created");
-
         let outcome = gc_retained_with_path(
             &fixture.snapshot_root,
             &project_ids(&["project-retained"]),
             &ProjectIds::new(),
-            Some(empty_path_directory.as_os_str()),
+            Some(OsStr::new("oc-clean-nonexistent-git")),
         )
         .expect("missing git should be a successful skip");
 

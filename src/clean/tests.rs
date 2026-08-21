@@ -151,7 +151,10 @@ fn recorded_phases(incremental: bool) -> Vec<PhaseId> {
         &signals,
         &recorder,
     );
-    assert!(result.is_ok() || result.is_err_and(|error| error.exit_code() == 10));
+    assert!(
+        result.is_ok() || result.as_ref().is_err_and(|error| error.exit_code() == 10),
+        "clean pipeline should complete or report partial success: {result:?}"
+    );
     recorder.phases.into_inner()
 }
 
@@ -278,7 +281,10 @@ fn selection_operations_are_attributed_to_the_normative_phases() {
         &SignalController::new(),
         &recorder,
     );
-    assert!(result.is_ok() || result.is_err_and(|error| error.exit_code() == 10));
+    assert!(
+        result.is_ok() || result.as_ref().is_err_and(|error| error.exit_code() == 10),
+        "clean pipeline should complete or report partial success: {result:?}"
+    );
     assert_eq!(
         recorder.operations.into_inner(),
         vec![
@@ -380,7 +386,7 @@ fn missing_git_during_snapshot_gc_keeps_command_successful() {
         },
         &SignalController::new(),
         &Recorder::default(),
-        Some(OsStr::new("")),
+        Some(OsStr::new("oc-clean-nonexistent-git")),
     );
     assert!(
         result.is_ok(),
