@@ -179,6 +179,47 @@ fn held_database_produces_exit_five() {
 }
 
 #[test]
+fn incremental_vacuum_lock_contention_produces_exit_five() {
+    let fixture = Fixture::build(&FixtureConfig {
+        session_count: 12,
+        messages_per_session: 2,
+        parts_per_message: 2,
+        blob_size_per_part: 64 * 1_024,
+        ..FixtureConfig::default()
+    })
+    .expect("fixture should build");
+    let holder = fixture.connect().expect("fixture holder should connect");
+    holder
+        .pragma_update(None, "auto_vacuum", "INCREMENTAL")
+        .expect("incremental auto-vacuum should be requested");
+    holder
+        .execute_batch("VACUUM; DELETE FROM session;")
+        .expect("fixture should enter incremental mode and gain free pages");
+    let freelist_pages = holder
+        .pragma_query_value(None, "freelist_count", |row| row.get::<_, i64>(0))
+        .expect("fixture freelist should be readable");
+    assert!(freelist_pages > 0, "fixture should have reclaimable pages");
+    holder
+        .execute_batch("BEGIN IMMEDIATE;")
+        .expect("holder should acquire a competing write lock");
+
+    let output = command(&fixture, "vacuum")
+        .args([
+            "--incremental",
+            "--apply",
+            "--dangerously-skip-confirm",
+            "--force",
+        ])
+        .output()
+        .expect("incremental vacuum should run");
+
+    assert_code(&output, 5);
+    holder
+        .execute_batch("ROLLBACK;")
+        .expect("holder transaction should roll back");
+}
+
+#[test]
 fn clean_incremental_on_auto_vacuum_none_produces_exit_six() {
     let fixture = Fixture::build(&FixtureConfig {
         session_count: 3,

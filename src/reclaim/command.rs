@@ -438,10 +438,7 @@ fn incremental_error(error: IncrementalVacuumError) -> Error {
                 progress.pages_reclaimed, progress.bytes_reclaimed
             ),
         },
-        IncrementalVacuumError::Sqlite { context, source } => Error::Sqlite {
-            context: context.to_owned(),
-            source,
-        },
+        IncrementalVacuumError::Sqlite { context, source } => db::sqlite_error(context, source),
         other => Error::ReclaimUnavailable {
             reason: other.to_string(),
         },
