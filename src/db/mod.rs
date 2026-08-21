@@ -76,6 +76,10 @@ pub type FileIdentity = (u64, i64, i64, u64, u64);
 /// An opened database file paired with the resolved path naming the same file.
 #[derive(Debug)]
 pub(crate) struct AnchoredDatabaseFile {
+    // Unix keeps the file and parent open because openat-based traversal is anchored to them.
+    // Off unix no handle is retained: Windows counts every open handle in its sharing checks,
+    // and an anchor outliving the SQLite connection would deny the swap that replaces the file.
+    #[cfg(unix)]
     descriptor: File,
     #[cfg(unix)]
     parent_descriptor: File,
@@ -224,42 +228,11 @@ impl AnchoredDatabaseFile {
         })
     }
 
-    #[cfg(windows)]
-    fn open(path: &Path) -> Result<Self, Error> {
-        use std::os::windows::fs::OpenOptionsExt;
-
-        const FILE_SHARE_READ: u32 = 0x0000_0001;
-        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
-        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
-
-        let resolved_path =
-            resolve_database_target(path).map_err(|source| path_open_error(path, source))?;
-        // The anchor stays open for the whole command. Unix rename ignores open descriptors, but
-        // Windows refuses to replace a file that any handle holds without delete sharing, which
-        // would make this process block its own P20 swap. Full sharing restores the unix
-        // behaviour; identity checks, not the handle, are what detect a swapped target.
-        let descriptor = fs::OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-            .open(&resolved_path)
-            .map_err(|source| path_open_error(path, source))?;
-        let anchor = Self {
-            descriptor,
-            lexical_path: path.to_path_buf(),
-            resolved_path,
-        };
-        anchor.ensure_resolved_path_matches("database target changed while it was anchored")?;
-        Ok(anchor)
-    }
-
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(unix))]
     fn open(path: &Path) -> Result<Self, Error> {
         let resolved_path =
             resolve_database_target(path).map_err(|source| path_open_error(path, source))?;
-        let descriptor =
-            File::open(&resolved_path).map_err(|source| path_open_error(path, source))?;
         let anchor = Self {
-            descriptor,
             lexical_path: path.to_path_buf(),
             resolved_path,
         };
@@ -417,8 +390,16 @@ impl AnchoredDatabaseFile {
         })
     }
 
+    #[cfg(unix)]
     pub(crate) fn identity(&self) -> Result<FileIdentity, Error> {
         file_identity_from_handle(&self.lexical_path, &self.descriptor)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn identity(&self) -> Result<FileIdentity, Error> {
+        let handle = open_for_identity_probe(&self.resolved_path)
+            .map_err(|source| path_open_error(&self.resolved_path, source))?;
+        file_identity_from_handle(&self.lexical_path, &handle)
     }
 
     pub(crate) fn ensure_path_matches(&self, path: &Path, reason: &str) -> Result<(), Error> {

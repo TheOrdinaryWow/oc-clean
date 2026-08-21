@@ -1242,6 +1242,23 @@ mod tests {
         }
     }
 
+    /// Compares two paths by file identity so a symlinked prefix does not change the answer.
+    fn same_file_path(left: &Path, right: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let (Ok(left), Ok(right)) = (fs::metadata(left), fs::metadata(right)) else {
+                return left == right;
+            };
+            left.dev() == right.dev() && left.ino() == right.ino()
+        }
+        #[cfg(not(unix))]
+        {
+            left == right
+        }
+    }
+
     struct FailingRenameOperations {
         hard_link_called: AtomicBool,
         canonical_existed_at_rename: AtomicBool,
@@ -1320,7 +1337,7 @@ mod tests {
             self.canonical_existed_at_rename
                 .store(destination.exists(), Ordering::SeqCst);
             self.rename_source_was_canonical
-                .store(source == destination, Ordering::SeqCst);
+                .store(same_file_path(source, destination), Ordering::SeqCst);
             Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "injected rename failure",
@@ -1826,7 +1843,12 @@ mod tests {
         else {
             panic!("expected fatal swap rollback failure");
         };
-        assert_eq!(database_path, fixture.path);
+        assert!(
+            same_file_path(&database_path, &fixture.path),
+            "rollback should name the fixture database: {} vs {}",
+            database_path.display(),
+            fixture.path.display()
+        );
         assert!(backup_path.exists());
     }
 
