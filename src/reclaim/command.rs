@@ -460,7 +460,7 @@ fn database_target(cli: &Cli) -> Result<Target, Error> {
         &environment,
         DatabaseOptions {
             explicit: cli.db.as_deref(),
-            channel: None,
+            channel: cli.channel.as_deref(),
             platform: current_platform()?,
         },
     )
@@ -604,6 +604,7 @@ mod tests {
                 incremental: false,
             }),
             db: Some(path.to_owned()),
+            channel: None,
             apply,
             force: false,
             force_schema: false,

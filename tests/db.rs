@@ -74,7 +74,7 @@ mod db {
     }
 
     #[test]
-    fn in_memory_write_connection_has_no_file_capability_or_identity() {
+    fn in_memory_connections_have_no_file_capability_or_identity() {
         let database = open_read_write(&Target::Memory, ConnectionOptions::default()).unwrap();
 
         assert!(!database.capabilities().hard_links);
@@ -82,10 +82,21 @@ mod db {
             database.file_identity(),
             Err(Error::InvalidArgument { argument, .. }) if argument == ":memory:"
         ));
+        let read_only = open_read_only(&Target::Memory, ConnectionOptions::default()).unwrap();
+        assert!(!read_only.capabilities().hard_links);
         assert!(matches!(
-            open_read_only(&Target::Memory, ConnectionOptions::default()),
+            read_only.file_identity(),
             Err(Error::InvalidArgument { argument, .. }) if argument == ":memory:"
         ));
+        let session_table_count = read_only
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'session'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(session_table_count, 1);
     }
 
     #[test]

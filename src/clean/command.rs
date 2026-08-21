@@ -494,7 +494,7 @@ fn database_target(cli: &Cli) -> Result<Target, Error> {
         &environment,
         DatabaseOptions {
             explicit: cli.db.as_deref(),
-            channel: None,
+            channel: cli.channel.as_deref(),
             platform: current_platform()?,
         },
     )

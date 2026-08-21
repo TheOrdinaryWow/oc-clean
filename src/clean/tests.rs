@@ -83,6 +83,7 @@ fn cli(path: &Path, incremental: bool) -> Cli {
     Cli {
         command: Commands::Clean(arguments(incremental)),
         db: Some(path.to_owned()),
+        channel: None,
         apply: true,
         force: false,
         force_schema: false,

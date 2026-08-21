@@ -13,6 +13,9 @@ pub mod schema;
 
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 const DEFAULT_CACHE_SIZE: i32 = -64_000;
+const OPENCODE_SCHEMA: &str = include_str!("opencode_schema.sql");
+const FRESH_SCHEMA_MARKER: &str = "-- @shape fresh";
+const SCHEMA_END_MARKER: &str = "-- @end";
 static G_LINK_PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Capabilities discovered for the active SQLite build and database filesystem.
@@ -74,24 +77,32 @@ pub type ReadOnlyConnection = DatabaseConnection<ReadOnly>;
 /// A connection that can query and mutate SQLite and acquire an exclusive lock.
 pub type ReadWriteConnection = DatabaseConnection<ReadWrite>;
 
-/// Opens an existing database with SQLite's read-only flag.
+/// Opens an existing file database with SQLite's read-only flag or creates a fresh in-memory
+/// database whose type exposes only read operations.
 ///
 /// # Errors
 ///
-/// Returns [`Error::NotFound`] when a file target is absent, [`Error::InvalidArgument`] for an
-/// in-memory target, or an infrastructure error when opening or configuring SQLite fails.
+/// Returns [`Error::NotFound`] when a file target is absent or an infrastructure error when
+/// opening, initializing, or configuring SQLite fails.
 pub fn open_read_only(
     target: &Target,
     options: ConnectionOptions,
 ) -> Result<ReadOnlyConnection, Error> {
-    let path = file_target(target, "read-only connections require a file target")?;
-    ensure_exists(path)?;
-    let connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|source| sqlite_error("opening database read-only", source))?;
-    finish_open(connection, Some(path.to_path_buf()), options)
+    match target {
+        Target::File(path) => {
+            ensure_exists(path)?;
+            let connection = Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .map_err(|source| sqlite_error("opening database read-only", source))?;
+            finish_open(connection, Some(path.clone()), options)
+        }
+        Target::Memory => {
+            let connection = fresh_memory_connection()?;
+            finish_open(connection, None, options)
+        }
+    }
 }
 
 /// Opens an existing database with read-write access.
@@ -115,11 +126,32 @@ pub fn open_read_write(
             finish_open(connection, Some(path.clone()), options)
         }
         Target::Memory => {
-            let connection = Connection::open_in_memory()
-                .map_err(|source| sqlite_error("opening in-memory database", source))?;
+            let connection = fresh_memory_connection()?;
             finish_open(connection, None, options)
         }
     }
+}
+
+fn fresh_memory_connection() -> Result<Connection, Error> {
+    let connection = Connection::open_in_memory()
+        .map_err(|source| sqlite_error("opening in-memory database", source))?;
+    let (_, fresh_schema) = OPENCODE_SCHEMA
+        .split_once(FRESH_SCHEMA_MARKER)
+        .ok_or_else(|| Error::InvalidArgument {
+            argument: "embedded OpenCode schema".to_owned(),
+            reason: "fresh schema marker is missing".to_owned(),
+        })?;
+    let (fresh_schema, _) =
+        fresh_schema
+            .split_once(SCHEMA_END_MARKER)
+            .ok_or_else(|| Error::InvalidArgument {
+                argument: "embedded OpenCode schema".to_owned(),
+                reason: "schema end marker is missing".to_owned(),
+            })?;
+    connection
+        .execute_batch(fresh_schema)
+        .map_err(|source| sqlite_error("initializing in-memory database schema", source))?;
+    Ok(connection)
 }
 
 impl<Access> DatabaseConnection<Access> {
@@ -264,16 +296,6 @@ fn probe_hard_links(database_path: &Path) -> Result<bool, Error> {
         source,
     })?;
     Ok(true)
-}
-
-fn file_target<'target>(target: &'target Target, reason: &str) -> Result<&'target Path, Error> {
-    match target {
-        Target::File(path) => Ok(path),
-        Target::Memory => Err(Error::InvalidArgument {
-            argument: ":memory:".to_owned(),
-            reason: reason.to_owned(),
-        }),
-    }
 }
 
 fn ensure_exists(path: &Path) -> Result<(), Error> {

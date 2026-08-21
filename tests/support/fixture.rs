@@ -22,7 +22,7 @@ pub use large::{LargeFixtureError, LargeFixtureReport};
 
 pub type FixtureResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
-const SCHEMA: &str = include_str!("schema.sql");
+const SCHEMA: &str = include_str!("../../src/db/opencode_schema.sql");
 const FRESH_MARKER: &str = "-- @shape fresh";
 const END_MARKER: &str = "-- @end";
 pub(super) const BASE_TIME_MS: i64 = 1_800_000_000_000;

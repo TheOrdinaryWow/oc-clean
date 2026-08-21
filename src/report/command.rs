@@ -25,11 +25,11 @@ pub fn run(cli: &Cli, arguments: &AnalyzeArgs, output: &mut dyn Write) -> Result
         &environment,
         DatabaseOptions {
             explicit: cli.db.as_deref(),
-            channel: None,
+            channel: cli.channel.as_deref(),
             platform: current_platform()?,
         },
     )?;
-    let derived_paths = report_paths(&target)?;
+    let derived_paths = report_paths(&target);
     let database = db::open_read_only(&target, ConnectionOptions::default())?;
     db::schema::inspect(database.connection(), cli.force_schema)?;
 
@@ -99,7 +99,7 @@ fn file_space(
     connection: &rusqlite::Connection,
     target: &Target,
 ) -> Result<space::FileSpace, Error> {
-    let database_path = target_path(target)?;
+    let database_path = target_path(target);
     let page_count = pragma_u32(connection, "page_count")?;
     let freelist_count = pragma_u32(connection, "freelist_count")?;
     let page_size = pragma_u32(connection, "page_size")?;
@@ -112,6 +112,14 @@ fn file_space(
         f64::from(freelist_count) * 100.0 / f64::from(page_count)
     };
 
+    let (wal_bytes, shm_bytes) = match target {
+        Target::File(_) => (
+            sidecar_bytes(database_path, "-wal")?,
+            sidecar_bytes(database_path, "-shm")?,
+        ),
+        Target::Memory => (None, None),
+    };
+
     Ok(space::FileSpace {
         page_count,
         freelist_count,
@@ -120,8 +128,8 @@ fn file_space(
         live_bytes,
         freelist_bytes,
         freelist_percent,
-        wal_bytes: sidecar_bytes(database_path, "-wal")?,
-        shm_bytes: sidecar_bytes(database_path, "-shm")?,
+        wal_bytes,
+        shm_bytes,
     })
 }
 
@@ -152,22 +160,22 @@ fn row_counts(connection: &rusqlite::Connection) -> Result<BTreeMap<String, u64>
     Ok(counts)
 }
 
-fn report_paths(target: &Target) -> Result<DerivedPaths, Error> {
-    let path = target_path(target)?;
+fn report_paths(target: &Target) -> DerivedPaths {
+    if matches!(target, Target::Memory) {
+        return paths::derived_paths(Path::new(":memory:"));
+    }
+    let path = target_path(target);
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    Ok(paths::derived_paths(parent))
+    paths::derived_paths(parent)
 }
 
-fn target_path(target: &Target) -> Result<&Path, Error> {
+fn target_path(target: &Target) -> &Path {
     match target {
-        Target::File(path) => Ok(path),
-        Target::Memory => Err(Error::InvalidArgument {
-            argument: ":memory:".to_owned(),
-            reason: "analysis requires a file-backed database".to_owned(),
-        }),
+        Target::File(path) => path,
+        Target::Memory => Path::new(":memory:"),
     }
 }
 

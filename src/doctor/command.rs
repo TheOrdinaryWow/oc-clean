@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::path::Path;
 
-use super::model::DoctorReport;
+use super::model::{DoctorReport, VacuumHeadroom};
 use crate::analyze::{orphans, space};
 use crate::cli::{Cli, DoctorArgs};
 use crate::db::{self, ConnectionOptions};
@@ -15,13 +15,11 @@ use crate::paths::{self, DatabaseOptions, Environment, Platform, Target};
 /// Returns a typed path, SQLite, integrity, analysis, or output error.
 pub fn run(cli: &Cli, arguments: &DoctorArgs, output: &mut dyn Write) -> Result<(), Error> {
     let target = database_target(cli)?;
-    let database_path = file_path(&target)?;
+    let database_path = target_path(&target);
     let data_directory = database_path
         .parent()
-        .ok_or_else(|| Error::InvalidArgument {
-            argument: "--db".to_owned(),
-            reason: "database path must have a parent directory".to_owned(),
-        })?;
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new(":memory:"));
     let derived_paths = paths::derived_paths(data_directory);
     let database = db::open_read_only(&target, ConnectionOptions::default())?;
     let connection = database.connection();
@@ -38,7 +36,8 @@ pub fn run(cli: &Cli, arguments: &DoctorArgs, output: &mut dyn Write) -> Result<
         foreign_key_check,
         orphans: orphans::analyze(&database, &derived_paths)?,
         holders: super::checks::holders(database_path),
-        vacuum_headroom: super::checks::vacuum_headroom(
+        vacuum_headroom: vacuum_headroom(
+            &target,
             database_path,
             file_space.live_bytes,
             database.capabilities().hard_links,
@@ -96,18 +95,33 @@ fn database_target(cli: &Cli) -> Result<Target, Error> {
         &environment,
         DatabaseOptions {
             explicit: cli.db.as_deref(),
-            channel: None,
+            channel: cli.channel.as_deref(),
             platform: current_platform()?,
         },
     )
 }
 
-fn file_path(target: &Target) -> Result<&Path, Error> {
+fn target_path(target: &Target) -> &Path {
     match target {
-        Target::File(path) => Ok(path),
-        Target::Memory => Err(Error::InvalidArgument {
-            argument: "--db".to_owned(),
-            reason: "doctor requires a file-backed database".to_owned(),
+        Target::File(path) => path,
+        Target::Memory => Path::new(":memory:"),
+    }
+}
+
+fn vacuum_headroom(
+    target: &Target,
+    database_path: &Path,
+    current_live_bytes: u64,
+    hardlink_supported: bool,
+) -> Result<VacuumHeadroom, Error> {
+    match target {
+        Target::File(_) => {
+            super::checks::vacuum_headroom(database_path, current_live_bytes, hardlink_supported)
+        }
+        Target::Memory => Ok(VacuumHeadroom {
+            estimated_required_bytes: 0,
+            available_bytes: 0,
+            vacuum_into_feasible: true,
         }),
     }
 }

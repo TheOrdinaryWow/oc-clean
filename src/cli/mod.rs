@@ -22,6 +22,10 @@ pub struct Cli {
     #[arg(long, env = "OCC_DB", value_name = "PATH", global = true)]
     pub db: Option<PathBuf>,
 
+    /// Select the `OpenCode` release channel used for the default database filename.
+    #[arg(long, env = "OCC_CHANNEL", value_name = "NAME", global = true)]
+    pub channel: Option<String>,
+
     #[arg(long, global = true)]
     pub apply: bool,
 

@@ -88,6 +88,7 @@ fn measure_report(database_path: &Path, quick: bool) -> BaselineResult<Duration>
             quick,
         }),
         db: Some(database_path.to_owned()),
+        channel: None,
         apply: false,
         force: false,
         force_schema: false,

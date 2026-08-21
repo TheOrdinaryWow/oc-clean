@@ -25,13 +25,15 @@ The optimized binary is installed as `oc-clean` in Cargo's binary directory, nor
 
 ## Database Selection
 
-The effective database precedence is an explicit `--db PATH`, then `OCC_DB`, then OpenCode's existing `OPENCODE_DB`, then the platform default. `OCC_DB` is the clap environment binding equivalent to `--db`; `OPENCODE_DB` remains OpenCode's own database selector and may be absolute, relative to the OpenCode data directory, or `:memory:`. Destructive commands require a file-backed database.
+The effective database precedence is an explicit `--db PATH`, then `OCC_DB`, then OpenCode's existing `OPENCODE_DB`, then the platform default. `OCC_DB` is the clap environment binding equivalent to `--db`; `OPENCODE_DB` remains OpenCode's own database selector and may be absolute or relative to the OpenCode data directory. The special value `:memory:` creates a fresh in-memory OpenCode schema for `analyze` and `doctor`. Destructive commands require a file-backed database.
 
-Without an override, Linux and macOS resolve the latest channel to `~/.local/share/opencode/opencode.db`, subject to `XDG_DATA_HOME`; Windows uses the corresponding OpenCode data directory under `USERPROFILE`. The derived external paths are sibling `storage`, `snapshot`, `tool-output`, and `log` directories.
+Without an override, Linux and macOS resolve the latest channel to `~/.local/share/opencode/opencode.db`, subject to `XDG_DATA_HOME`; Windows uses the corresponding OpenCode data directory under `USERPROFILE`. `--channel NAME` or `OCC_CHANNEL` selects `opencode-<NAME>.db` for custom channels when no database-path override is present; `latest`, `beta`, and `prod` continue to use `opencode.db`. The derived external paths are sibling `storage`, `snapshot`, `tool-output`, and `log` directories.
 
 ```sh
 oc-clean --db /srv/opencode/opencode.db analyze
 OCC_DB=/srv/opencode/opencode.db oc-clean doctor
+oc-clean analyze --db :memory: --json
+OCC_CHANNEL=nightly oc-clean analyze --quick
 OPENCODE_DB=opencode-beta.db oc-clean analyze --quick
 ```
 
@@ -119,7 +121,8 @@ The table is the complete set of long flags defined by the current clap interfac
 
 | Scope | Flag | Environment | Purpose |
 |---|---|---|---|
-| Global | `--db <PATH>` | `OCC_DB` | Select the database path. This takes precedence over `OPENCODE_DB` and platform discovery. |
+| Global | `--db <PATH>` | `OCC_DB` | Select the database path or `:memory:` for a fresh in-memory analysis target. This takes precedence over `OPENCODE_DB` and platform discovery. |
+| Global | `--channel <NAME>` | `OCC_CHANNEL` | Select the OpenCode channel used for the discovered database filename. |
 | Global | `--apply` | CLI only | Enable mutation for `clean` or `vacuum`; both remain dry runs without it. |
 | Global | `--force` | CLI only | Downgrade a held or indeterminate holder gate to a warning for applied `clean` or `vacuum`. |
 | Global | `--force-schema` | CLI only | Downgrade Tier 3 schema-semantic findings to warnings; Tier 1 remains mandatory and Tier 2 is already tolerated. |
@@ -150,7 +153,7 @@ The table is the complete set of long flags defined by the current clap interfac
 
 The executable is named `oc-clean`, while its own environment-variable prefix is `OCC_`. The current clap interface exposes an `OCC_*` environment binding for every non-destructive option across all four subcommands; destructive switches intentionally require visible command-line input.
 
-`OPENCODE_DB` belongs to OpenCode and participates in fallback database discovery after `--db` and `OCC_DB`. `XDG_DATA_HOME`, `HOME`, `USERPROFILE`, and `OPENCODE_DISABLE_CHANNEL_DB` may also influence platform discovery. `NO_COLOR` disables color in human analysis output.
+`OCC_CHANNEL` is the environment equivalent of `--channel`; explicit `--db`/`OCC_DB` and `OPENCODE_DB` path selectors take precedence over channel naming. `OPENCODE_DB` belongs to OpenCode and participates in fallback database discovery after `--db` and `OCC_DB`. `XDG_DATA_HOME`, `HOME`, `USERPROFILE`, and `OPENCODE_DISABLE_CHANNEL_DB` may also influence platform discovery. `NO_COLOR` disables color in human analysis output.
 
 ## Duration And Size Grammars
 

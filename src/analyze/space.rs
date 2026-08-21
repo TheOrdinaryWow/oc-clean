@@ -77,8 +77,8 @@ pub struct SpaceReport {
 /// # Errors
 ///
 /// Returns [`Error::Sqlite`] when SQLite accounting queries fail, [`Error::Io`] when sidecar
-/// metadata cannot be read, or [`Error::InvalidArgument`] for an in-memory database or a SQLite
-/// build lacking both supported per-object accounting mechanisms.
+/// metadata cannot be read, or [`Error::InvalidArgument`] when SQLite lacks both supported
+/// per-object accounting mechanisms.
 pub fn analyze<Access>(database: &DatabaseConnection<Access>) -> Result<SpaceReport, Error> {
     analyze_with_capabilities(database, database.capabilities())
 }
@@ -91,15 +91,15 @@ pub fn analyze<Access>(database: &DatabaseConnection<Access>) -> Result<SpaceRep
 /// # Errors
 ///
 /// Returns [`Error::Sqlite`] when SQLite accounting queries fail, [`Error::Io`] when sidecar
-/// metadata cannot be read, or [`Error::InvalidArgument`] for an in-memory database or a SQLite
-/// build lacking both supported per-object accounting mechanisms.
+/// metadata cannot be read, or [`Error::InvalidArgument`] when SQLite lacks both supported
+/// per-object accounting mechanisms.
 pub fn analyze_with_capabilities<Access>(
     database: &DatabaseConnection<Access>,
     capabilities: &Capabilities,
 ) -> Result<SpaceReport, Error> {
     let connection = database.connection();
     let database_path = main_database_path(connection)?;
-    let file = file_space(connection, &database_path)?;
+    let file = file_space(connection, database_path.as_deref())?;
     let objects = if capabilities.dbstat {
         dbstat_space(connection)?
     } else if capabilities.octet_length {
@@ -114,7 +114,7 @@ pub fn analyze_with_capabilities<Access>(
     Ok(SpaceReport { file, objects })
 }
 
-fn file_space(connection: &Connection, database_path: &Path) -> Result<FileSpace, Error> {
+fn file_space(connection: &Connection, database_path: Option<&Path>) -> Result<FileSpace, Error> {
     let page_count = pragma_u32(connection, "page_count")?;
     let freelist_count = pragma_u32(connection, "freelist_count")?;
     let page_size = pragma_u32(connection, "page_size")?;
@@ -135,8 +135,14 @@ fn file_space(connection: &Connection, database_path: &Path) -> Result<FileSpace
         live_bytes,
         freelist_bytes,
         freelist_percent,
-        wal_bytes: sidecar_bytes(database_path, "-wal")?,
-        shm_bytes: sidecar_bytes(database_path, "-shm")?,
+        wal_bytes: database_path
+            .map(|path| sidecar_bytes(path, "-wal"))
+            .transpose()?
+            .flatten(),
+        shm_bytes: database_path
+            .map(|path| sidecar_bytes(path, "-shm"))
+            .transpose()?
+            .flatten(),
     })
 }
 
@@ -146,7 +152,7 @@ fn pragma_u32(connection: &Connection, pragma: &str) -> Result<u32, Error> {
         .map_err(|source| sqlite_error(&format!("reading PRAGMA {pragma}"), source))
 }
 
-fn main_database_path(connection: &Connection) -> Result<PathBuf, Error> {
+fn main_database_path(connection: &Connection) -> Result<Option<PathBuf>, Error> {
     let path = connection
         .query_row(
             "SELECT file FROM pragma_database_list WHERE name = ?1",
@@ -154,13 +160,7 @@ fn main_database_path(connection: &Connection) -> Result<PathBuf, Error> {
             |row| row.get::<_, String>(0),
         )
         .map_err(|source| sqlite_error("reading the main database path", source))?;
-    if path.is_empty() {
-        return Err(Error::InvalidArgument {
-            argument: ":memory:".to_owned(),
-            reason: "space accounting requires a file-backed database".to_owned(),
-        });
-    }
-    Ok(PathBuf::from(path))
+    Ok((!path.is_empty()).then(|| PathBuf::from(path)))
 }
 
 fn sidecar_bytes(database_path: &Path, suffix: &str) -> Result<Option<u64>, Error> {
