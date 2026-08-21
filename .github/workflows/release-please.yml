@@ -17,12 +17,28 @@ jobs:
   release-please:
     name: Maintain release pull request
     runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
-      # This job only maintains the release pull request and, once that pull
-      # request is merged, the tag and GitHub release. Publishing to crates.io
-      # and uploading binary artifacts are intentionally not wired up yet.
+      # This job maintains the release pull request and, once that pull request is
+      # merged, the tag and GitHub release. Publishing to crates.io is intentionally
+      # not wired up yet; binary artifacts are attached by the `artifacts` job below.
       - name: Run release-please
+        id: release
         uses: googleapis/release-please-action@v4
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+  artifacts:
+    name: Build release artifacts
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    # A release created with the default GITHUB_TOKEN does not emit a `release`
+    # event, so the artifact build is chained explicitly instead of triggered.
+    uses: ./.github/workflows/release.yml
+    permissions:
+      contents: write
+    with:
+      tag: ${{ needs.release-please.outputs.tag_name }}
