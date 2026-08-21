@@ -72,15 +72,21 @@ where
         .filter(|id| is_session_id(id))
         .map(str::to_owned)
         .collect::<SessionIds>();
-    merge_deletion_report(
-        &mut report.deletion,
-        sessions::delete_event_aggregates_with_progress(
-            database,
-            &event_aggregate_ids,
-            options.deletion,
-            &mut batch_committed,
-        )?,
-    );
+    let mut cancelled = false;
+    let event_report = sessions::delete_event_aggregates_with_progress(
+        database,
+        &event_aggregate_ids,
+        options.deletion,
+        |batch_report| {
+            let should_continue = batch_committed(batch_report);
+            cancelled = !should_continue;
+            should_continue
+        },
+    )?;
+    merge_deletion_report(&mut report.deletion, event_report);
+    if cancelled {
+        return Ok(report);
+    }
 
     let mut candidates = raw_orphans
         .dangling_session_ids
@@ -168,12 +174,12 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
-    use rusqlite::{Connection, params};
+    use rusqlite::{params, Connection};
 
-    use super::fixture::{BASE_TIME_MS, Fixture, FixtureConfig, TABLES as ALL_TABLES};
+    use super::fixture::{Fixture, FixtureConfig, BASE_TIME_MS, TABLES as ALL_TABLES};
     use super::*;
-    use crate::db::{ConnectionOptions, ReadWriteConnection, open_read_write};
-    use crate::paths::{Target, derived_paths};
+    use crate::db::{open_read_write, ConnectionOptions, ReadWriteConnection};
+    use crate::paths::{derived_paths, Target};
     use crate::select::orphans;
 
     const SESSION_TABLES: &[&str] = &["session", "event_sequence", "event"];
@@ -307,13 +313,11 @@ mod tests {
         assert_eq!(report.deletion.table_rows["event_sequence"], 10);
         assert_eq!(report.deletion.table_rows["event"], 10);
         assert_eq!(report.deletion.deleted_session_ids.len(), 3);
-        assert!(
-            report
-                .deletion
-                .deleted_session_ids
-                .iter()
-                .all(|id| !id.starts_with("ses_Orphan"))
-        );
+        assert!(report
+            .deletion
+            .deleted_session_ids
+            .iter()
+            .all(|id| !id.starts_with("ses_Orphan")));
     }
 
     #[test]
@@ -350,6 +354,37 @@ mod tests {
 
         assert_eq!(counts(database.connection()), before);
         assert_eq!(report, OrphanDeletionReport::default());
+    }
+
+    #[test]
+    fn cancellation_after_event_aggregate_batch_skips_dangling_sessions() {
+        let fixture = Fixture::build(&FixtureConfig::default()).expect("fixture should build");
+        let setup = fixture.connect().expect("fixture should connect");
+        insert_orphan_events(&setup, 3);
+        insert_session(
+            &setup,
+            "ses_DanglingAfterCancel",
+            "ses_Gone",
+            BASE_TIME_MS - 1,
+        );
+        drop(setup);
+        let database = open_fixture(&fixture);
+        let raw = raw(&fixture, &database);
+
+        let report = delete_with_progress(&database, &raw, options(0, 32), |_| false)
+            .expect("cancelled sweep should preserve committed work");
+
+        assert_eq!(report.deletion.transactions, 1);
+        assert_eq!(report.deletion.table_rows["event_sequence"], 2);
+        assert_eq!(report.dangling_passes, 0);
+        assert!(database
+            .connection()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM session WHERE id = 'ses_DanglingAfterCancel')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .expect("dangling session existence should query"));
     }
 
     #[test]
