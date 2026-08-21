@@ -1,17 +1,15 @@
 use std::ffi::OsStr;
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use rusqlite::Connection;
-#[cfg(unix)]
-use rustix::fd::{AsFd, OwnedFd};
-#[cfg(unix)]
-use rustix::fs::{AtFlags, Dir, Mode, OFlags, openat, unlinkat};
-
 use crate::db::DatabaseConnection;
 use crate::delete::projects::ProjectIds;
 use crate::error::Error;
+use rusqlite::Connection;
+
+use super::traversal::AnchoredDir;
 
 /// One snapshot directory that could not be removed.
 #[derive(Debug)]
@@ -127,9 +125,11 @@ pub(crate) fn gc_retained_with_path(
                 .to_owned(),
         });
     }
-    if !is_real_directory(snapshot_root)? {
+    let Some(snapshot_directory) =
+        AnchoredDir::open(snapshot_root).map_err(|source| io_error(snapshot_root, source))?
+    else {
         return Ok(GcSnapshotsOutcome::Completed(GcReport::default()));
-    }
+    };
 
     let mut report = GcReport::default();
     for (project_id, project_path) in retained_paths {
@@ -139,16 +139,28 @@ pub(crate) fn gc_retained_with_path(
                 .saturating_add(1);
             continue;
         }
-        if !is_real_directory(&project_path)? {
+        #[cfg(test)]
+        run_before_project_open_hook(&project_path);
+        let Some(project_directory) = snapshot_directory
+            .open_child(OsStr::new(project_id))
+            .map_err(|source| io_error(&project_path, source))?
+        else {
             report.skipped_entries = report.skipped_entries.saturating_add(1);
             continue;
-        }
-        for entry in directory_entries(&project_path)? {
-            if !entry_is_directory(&entry)? {
+        };
+        for repository_name in project_directory
+            .entries()
+            .map_err(|source| io_error(&project_path, source))?
+        {
+            let repository_path = project_path.join(&repository_name);
+            let Some(repository) = project_directory
+                .open_child(&repository_name)
+                .map_err(|source| io_error(&repository_path, source))?
+            else {
                 report.skipped_entries = report.skipped_entries.saturating_add(1);
                 continue;
-            }
-            compact_repository(&entry.path(), path, &mut report)?;
+            };
+            compact_repository(&repository, path, &mut report)?;
         }
     }
     Ok(GcSnapshotsOutcome::Completed(report))
@@ -176,34 +188,36 @@ fn git_is_available(path: Option<&OsStr>) -> Result<bool, Error> {
 }
 
 fn compact_repository(
-    repository: &Path,
+    repository: &AnchoredDir,
     path: Option<&OsStr>,
     report: &mut GcReport,
 ) -> Result<(), Error> {
-    let before_bytes = directory_bytes(repository)?;
+    let before_bytes = repository
+        .directory_bytes()
+        .map_err(|source| io_error(repository.path(), source))?;
     let mut command = Command::new("git");
-    command
-        .arg("--git-dir")
-        .arg(repository)
-        .args(["gc", "--prune=now"]);
+    repository.configure_git_command(&mut command);
+    command.args(["gc", "--prune=now"]);
     set_command_path(&mut command, path);
     match command.output() {
         Ok(output) if output.status.success() => {
-            let after_bytes = directory_bytes(repository)?;
+            let after_bytes = repository
+                .directory_bytes()
+                .map_err(|source| io_error(repository.path(), source))?;
             report.compacted_repositories.push(GcRepositoryReport {
-                path: repository.to_path_buf(),
+                path: repository.path().to_path_buf(),
                 before_bytes,
                 after_bytes,
                 reclaimed_bytes: before_bytes.saturating_sub(after_bytes),
             });
         }
         Ok(output) => report.repository_failures.push(GcRepositoryFailure {
-            path: repository.to_path_buf(),
+            path: repository.path().to_path_buf(),
             exit_code: output.status.code(),
             message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         }),
         Err(source) => report.repository_failures.push(GcRepositoryFailure {
-            path: repository.to_path_buf(),
+            path: repository.path().to_path_buf(),
             exit_code: None,
             message: source.to_string(),
         }),
@@ -215,26 +229,6 @@ fn set_command_path(command: &mut Command, path: Option<&OsStr>) {
     if let Some(path) = path {
         command.env("PATH", path);
     }
-}
-
-fn directory_bytes(path: &Path) -> Result<u64, Error> {
-    let mut bytes = 0_u64;
-    for entry in directory_entries(path)? {
-        let file_type = entry
-            .file_type()
-            .map_err(|source| io_error(&entry.path(), source))?;
-        if file_type.is_dir() {
-            bytes = bytes.saturating_add(directory_bytes(&entry.path())?);
-        } else if file_type.is_file() {
-            bytes = bytes.saturating_add(
-                entry
-                    .metadata()
-                    .map_err(|source| io_error(&entry.path(), source))?
-                    .len(),
-            );
-        }
-    }
-    Ok(bytes)
 }
 
 /// Removes snapshot directories for projects pruned by the current clean operation.
@@ -254,21 +248,15 @@ pub fn remove_pruned(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    #[cfg(unix)]
-    let Some(snapshot_directory) = open_snapshot_root(snapshot_root)? else {
+    let Some(snapshot_directory) =
+        AnchoredDir::open(snapshot_root).map_err(|source| io_error(snapshot_root, source))?
+    else {
         return Ok(RemovalReport::default());
     };
-    #[cfg(not(unix))]
-    if !is_real_directory(snapshot_root)? {
-        return Ok(RemovalReport::default());
-    }
 
     let mut report = RemovalReport::default();
     for (project_id, path) in projects {
-        #[cfg(unix)]
         remove_candidate(&snapshot_directory, project_id.as_ref(), &path, &mut report)?;
-        #[cfg(not(unix))]
-        remove_candidate(&path, &mut report)?;
     }
     Ok(report)
 }
@@ -283,44 +271,22 @@ pub fn remove_orphaned<Access>(
     database: &DatabaseConnection<Access>,
     snapshot_root: &Path,
 ) -> Result<RemovalReport, Error> {
-    #[cfg(unix)]
-    let Some(snapshot_directory) = open_snapshot_root(snapshot_root)? else {
+    let Some(snapshot_directory) =
+        AnchoredDir::open(snapshot_root).map_err(|source| io_error(snapshot_root, source))?
+    else {
         return Ok(RemovalReport::default());
     };
-    #[cfg(not(unix))]
-    if !is_real_directory(snapshot_root)? {
-        return Ok(RemovalReport::default());
-    }
 
     let mut report = RemovalReport::default();
-    #[cfg(unix)]
-    let entries = directory_names(&snapshot_directory, snapshot_root)?;
-    #[cfg(not(unix))]
-    let entries = directory_entries(snapshot_root)?;
+    let entries = snapshot_directory
+        .entries()
+        .map_err(|source| io_error(snapshot_root, source))?;
     for entry in entries {
-        #[cfg(unix)]
-        let (project_id, path) = {
-            let project_id = entry
-                .to_str()
-                .ok_or_else(|| invalid_project_id("snapshot directory name is not valid UTF-8"))?
-                .to_owned();
-            let path = snapshot_project_path(snapshot_root, &project_id)?;
-            (project_id, path)
-        };
-        #[cfg(not(unix))]
-        let (project_id, path) = {
-            if !entry_is_directory(&entry)? {
-                report.skipped_entries = report.skipped_entries.saturating_add(1);
-                continue;
-            }
-            let project_id = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| invalid_project_id("snapshot directory name is not valid UTF-8"))?;
-            let path = snapshot_project_path(snapshot_root, &project_id)?;
-            (project_id, path)
-        };
-        #[cfg(unix)]
+        let project_id = entry
+            .to_str()
+            .ok_or_else(|| invalid_project_id("snapshot directory name is not valid UTF-8"))?
+            .to_owned();
+        let path = snapshot_project_path(snapshot_root, &project_id)?;
         let Some(project_directory) =
             open_candidate(&snapshot_directory, &entry, &path, &mut report)?
         else {
@@ -331,16 +297,13 @@ pub fn remove_orphaned<Access>(
                 report.retained_live_project_directories.saturating_add(1);
             continue;
         }
-        #[cfg(unix)]
         remove_open_candidate(
             &snapshot_directory,
             &entry,
-            &project_directory,
+            project_directory,
             &path,
             &mut report,
         );
-        #[cfg(not(unix))]
-        remove_candidate(&path, &mut report)?;
     }
     Ok(report)
 }
@@ -372,60 +335,24 @@ fn invalid_project_id(project_id: &str) -> Error {
     }
 }
 
-#[cfg(unix)]
-fn open_snapshot_root(path: &Path) -> Result<Option<OwnedFd>, Error> {
-    match openat(
-        rustix::fs::CWD,
-        path,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(directory) => Ok(Some(directory)),
-        Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP) => {
-            Ok(None)
-        }
-        Err(source) => Err(io_error(path, errno_to_io(source))),
-    }
-}
-
-#[cfg(unix)]
-fn directory_names(directory: &OwnedFd, path: &Path) -> Result<Vec<std::ffi::OsString>, Error> {
-    use std::os::unix::ffi::OsStringExt;
-
-    let mut stream =
-        Dir::read_from(directory).map_err(|source| io_error(path, errno_to_io(source)))?;
-    let mut names = Vec::new();
-    for entry in &mut stream {
-        let entry = entry.map_err(|source| io_error(path, errno_to_io(source)))?;
-        let name = entry.file_name().to_bytes();
-        if name != b"." && name != b".." {
-            names.push(std::ffi::OsString::from_vec(name.to_vec()));
-        }
-    }
-    names.sort();
-    Ok(names)
-}
-
-#[cfg(unix)]
 fn open_candidate(
-    parent: &OwnedFd,
+    parent: &AnchoredDir,
     name: &OsStr,
     path: &Path,
     report: &mut RemovalReport,
-) -> Result<Option<OwnedFd>, Error> {
-    match open_directory_at(parent, name) {
-        Ok(directory) => Ok(Some(directory)),
-        Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP) => {
+) -> Result<Option<AnchoredDir>, Error> {
+    match parent.open_child(name) {
+        Ok(Some(directory)) => Ok(Some(directory)),
+        Ok(None) => {
             report.skipped_entries = report.skipped_entries.saturating_add(1);
             Ok(None)
         }
-        Err(source) => Err(io_error(path, errno_to_io(source))),
+        Err(source) => Err(io_error(path, source)),
     }
 }
 
-#[cfg(unix)]
 fn remove_candidate(
-    parent: &OwnedFd,
+    parent: &AnchoredDir,
     name: &OsStr,
     path: &Path,
     report: &mut RemovalReport,
@@ -433,98 +360,25 @@ fn remove_candidate(
     let Some(directory) = open_candidate(parent, name, path, report)? else {
         return Ok(());
     };
-    remove_open_candidate(parent, name, &directory, path, report);
+    remove_open_candidate(parent, name, directory, path, report);
     Ok(())
 }
 
-#[cfg(unix)]
 fn remove_open_candidate(
-    parent: &OwnedFd,
+    parent: &AnchoredDir,
     name: &OsStr,
-    directory: &OwnedFd,
+    directory: AnchoredDir,
     path: &Path,
     report: &mut RemovalReport,
 ) {
-    match remove_directory_contents(directory, path)
-        .and_then(|()| unlinkat(parent, name, AtFlags::REMOVEDIR).map_err(errno_to_io))
-    {
-        Ok(()) => {
-            report.removed_directories = report.removed_directories.saturating_add(1);
-        }
-        Err(source) => report.directory_errors.push(RemovalDirectoryError {
-            path: path.to_path_buf(),
-            source,
-        }),
-    }
-}
-
-#[cfg(unix)]
-fn remove_directory_contents(directory: &OwnedFd, path: &Path) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-
-    let mut stream = Dir::read_from(directory).map_err(errno_to_io)?;
-    while let Some(entry) = stream.read() {
-        let entry = entry.map_err(errno_to_io)?;
-        let name = entry.file_name();
-        if name.to_bytes() == b"." || name.to_bytes() == b".." {
-            continue;
-        }
-        let child_path = path.join(OsStr::from_bytes(name.to_bytes()));
+    let contents_result = directory.remove_contents(&mut |child_path| {
         #[cfg(test)]
-        run_before_descend_hook(&child_path);
-        match open_directory_at(directory, OsStr::from_bytes(name.to_bytes())) {
-            Ok(child_directory) => {
-                remove_directory_contents(&child_directory, &child_path)?;
-                unlinkat(directory, name, AtFlags::REMOVEDIR).map_err(errno_to_io)?;
-            }
-            Err(rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP) => {
-                unlinkat(directory, name, AtFlags::empty()).map_err(errno_to_io)?;
-            }
-            Err(rustix::io::Errno::NOENT) => {}
-            Err(source) => return Err(errno_to_io(source)),
-        }
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn open_directory_at<Fd: AsFd>(parent: Fd, name: &OsStr) -> rustix::io::Result<OwnedFd> {
-    openat(
-        parent,
-        name,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-}
-
-#[cfg(unix)]
-fn errno_to_io(source: rustix::io::Errno) -> std::io::Error {
-    std::io::Error::from_raw_os_error(source.raw_os_error())
-}
-
-fn is_real_directory(path: &Path) -> Result<bool, Error> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => Ok(metadata.file_type().is_dir()),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(source) => Err(io_error(path, source)),
-    }
-}
-
-#[cfg(not(unix))]
-fn remove_candidate(path: &Path, report: &mut RemovalReport) -> Result<(), Error> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            report.skipped_entries = report.skipped_entries.saturating_add(1);
-            return Ok(());
-        }
-        Err(source) => return Err(io_error(path, source)),
-    };
-    if !metadata.file_type().is_dir() {
-        report.skipped_entries = report.skipped_entries.saturating_add(1);
-        return Ok(());
-    }
-    match remove_directory_tree(path) {
+        run_before_descend_hook(child_path);
+        #[cfg(not(test))]
+        let _ = child_path;
+    });
+    drop(directory);
+    match contents_result.and_then(|()| parent.remove_child_directory(name)) {
         Ok(()) => {
             report.removed_directories = report.removed_directories.saturating_add(1);
         }
@@ -533,27 +387,6 @@ fn remove_candidate(path: &Path, report: &mut RemovalReport) -> Result<(), Error
             source,
         }),
     }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn remove_directory_tree(path: &Path) -> std::io::Result<()> {
-    if !fs::symlink_metadata(path)?.file_type().is_dir() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "refusing to traverse a non-directory snapshot entry",
-        ));
-    }
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let child = entry.path();
-        if entry.file_type()?.is_dir() {
-            remove_directory_tree(&child)?;
-        } else {
-            fs::remove_file(child)?;
-        }
-    }
-    fs::remove_dir(path)
 }
 
 #[cfg(all(test, unix))]
@@ -566,6 +399,10 @@ struct BeforeDescendHook {
 
 #[cfg(all(test, unix))]
 static BEFORE_DESCEND_HOOK: std::sync::Mutex<Option<BeforeDescendHook>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(all(test, unix))]
+static BEFORE_PROJECT_OPEN_HOOK: std::sync::Mutex<Option<BeforeDescendHook>> =
     std::sync::Mutex::new(None);
 
 #[cfg(all(test, unix))]
@@ -587,6 +424,31 @@ fn run_before_descend_hook(path: &Path) {
     }
 }
 
+#[cfg(all(test, not(unix)))]
+fn run_before_descend_hook(_path: &Path) {}
+
+#[cfg(all(test, unix))]
+fn run_before_project_open_hook(path: &Path) {
+    let hook = {
+        let mut slot = BEFORE_PROJECT_OPEN_HOOK
+            .lock()
+            .expect("before-project-open hook lock should remain available");
+        if slot.as_ref().is_some_and(|hook| hook.target == path) {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        fs::rename(path, &hook.replacement).expect("project should move before it is reopened");
+        std::os::unix::fs::symlink(&hook.symlink_target, path)
+            .expect("replacement project symlink should be created");
+    }
+}
+
+#[cfg(all(test, not(unix)))]
+fn run_before_project_open_hook(_path: &Path) {}
+
 fn project_exists(connection: &Connection, project_id: &str) -> Result<bool, Error> {
     connection
         .query_row(
@@ -595,26 +457,6 @@ fn project_exists(connection: &Connection, project_id: &str) -> Result<bool, Err
             |row| row.get(0),
         )
         .map_err(|source| sqlite_error("re-validating a snapshot directory project", source))
-}
-
-fn directory_entries(path: &Path) -> Result<Vec<fs::DirEntry>, Error> {
-    let read_dir = match fs::read_dir(path) {
-        Ok(read_dir) => read_dir,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(source) => return Err(io_error(path, source)),
-    };
-    let mut entries = read_dir
-        .map(|entry| entry.map_err(|source| io_error(path, source)))
-        .collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(fs::DirEntry::file_name);
-    Ok(entries)
-}
-
-fn entry_is_directory(entry: &fs::DirEntry) -> Result<bool, Error> {
-    entry
-        .file_type()
-        .map(|file_type| file_type.is_dir())
-        .map_err(|source| io_error(&entry.path(), source))
 }
 
 fn io_error(path: &Path, source: std::io::Error) -> Error {
@@ -948,5 +790,52 @@ mod tests {
         assert_eq!(report.compacted_repositories[0].path, retained);
         assert_eq!(report.repository_failures, Vec::new());
         assert!(doomed.join("sentinel").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_swap_cannot_redirect_gc_outside_snapshot_root() {
+        let fixture = Fixture::new();
+        let _repository =
+            bare_repository_with_loose_objects(&fixture, "project-retained", "worktree-hash");
+        let project = fixture.snapshot_root.join("project-retained");
+        let displaced = fixture.directory.path().join("displaced-project");
+        let outside =
+            bare_repository_with_loose_objects(&fixture, "outside-project", "outside-repository");
+        let outside_object = outside.join("objects");
+        let outside_directory = super::AnchoredDir::open(&outside_object)
+            .expect("outside loose objects should be opened")
+            .expect("outside loose objects should be a directory");
+        let outside_before = outside_directory
+            .directory_bytes()
+            .expect("outside loose objects should be measurable");
+        *super::BEFORE_PROJECT_OPEN_HOOK
+            .lock()
+            .expect("before-project-open hook lock should remain available") =
+            Some(super::BeforeDescendHook {
+                target: project,
+                replacement: displaced.clone(),
+                symlink_target: fixture.snapshot_root.join("outside-project"),
+            });
+
+        let outcome = gc_retained(
+            &fixture.snapshot_root,
+            &project_ids(&["project-retained"]),
+            &ProjectIds::new(),
+        )
+        .expect("project substitution should be handled safely");
+
+        let outside_after = outside_directory
+            .directory_bytes()
+            .expect("outside loose objects should remain measurable");
+        assert_eq!(
+            outside_after, outside_before,
+            "git gc escaped snapshot root"
+        );
+        assert!(displaced.exists());
+        let GcSnapshotsOutcome::Completed(report) = outcome else {
+            panic!("git should be available");
+        };
+        assert_eq!(report.compacted_repositories.len(), 0);
     }
 }

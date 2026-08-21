@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -6,6 +7,8 @@ use rusqlite::Connection;
 use crate::db::DatabaseConnection;
 use crate::error::Error;
 use crate::select::predicates::SessionIds;
+
+use super::traversal::AnchoredDir;
 
 /// Selects the conforming storage files eligible for an orphan sweep.
 #[derive(Clone, Copy, Debug)]
@@ -47,27 +50,38 @@ pub fn sweep<Access>(
     storage_root: &Path,
     scope: SweepScope<'_>,
 ) -> Result<SweepReport, Error> {
-    let metadata = match fs::symlink_metadata(storage_root) {
-        Ok(metadata) => metadata,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(SweepReport::default());
-        }
-        Err(source) => return Err(io_error(storage_root, source)),
-    };
-    if !metadata.file_type().is_dir() {
+    let Some(storage_directory) =
+        AnchoredDir::open(storage_root).map_err(|source| io_error(storage_root, source))?
+    else {
         return Ok(SweepReport::default());
-    }
+    };
 
     let mut report = SweepReport::default();
-    for bucket in directory_entries(storage_root)? {
-        if !entry_is_directory(&bucket)? {
+    for bucket_name in storage_directory
+        .entries()
+        .map_err(|source| io_error(storage_root, source))?
+    {
+        let bucket_path = storage_root.join(&bucket_name);
+        #[cfg(test)]
+        run_before_bucket_open_hook(&bucket_path);
+        let Some(bucket_directory) = storage_directory
+            .open_child(&bucket_name)
+            .map_err(|source| io_error(&bucket_path, source))?
+        else {
             continue;
-        }
-        for entry in directory_entries(&bucket.path())? {
-            if !entry_is_file(&entry)? {
+        };
+        for filename in bucket_directory
+            .entries()
+            .map_err(|source| io_error(&bucket_path, source))?
+        {
+            if bucket_directory
+                .regular_file_len(&filename)
+                .map_err(|source| io_error(&bucket_path.join(&filename), source))?
+                .is_none()
+            {
                 continue;
             }
-            let path = entry.path();
+            let path = bucket_path.join(&filename);
             let Some(session_id) = session_id_from_path(&path) else {
                 report.non_conforming_files = report.non_conforming_files.saturating_add(1);
                 continue;
@@ -80,7 +94,7 @@ pub fn sweep<Access>(
                     report.retained_live_session_files.saturating_add(1);
                 continue;
             }
-            match fs::remove_file(&path) {
+            match bucket_directory.unlink_file(&filename) {
                 Ok(()) => report.deleted_files = report.deleted_files.saturating_add(1),
                 Err(source) => report.file_errors.push(SweepFileError { path, source }),
             }
@@ -120,33 +134,6 @@ fn is_session_id(value: &str) -> bool {
     })
 }
 
-fn directory_entries(path: &Path) -> Result<Vec<fs::DirEntry>, Error> {
-    let read_dir = match fs::read_dir(path) {
-        Ok(read_dir) => read_dir,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(source) => return Err(io_error(path, source)),
-    };
-    let mut entries = read_dir
-        .map(|entry| entry.map_err(|source| io_error(path, source)))
-        .collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(fs::DirEntry::file_name);
-    Ok(entries)
-}
-
-fn entry_is_directory(entry: &fs::DirEntry) -> Result<bool, Error> {
-    entry
-        .file_type()
-        .map(|file_type| file_type.is_dir())
-        .map_err(|source| io_error(&entry.path(), source))
-}
-
-fn entry_is_file(entry: &fs::DirEntry) -> Result<bool, Error> {
-    entry
-        .file_type()
-        .map(|file_type| file_type.is_file())
-        .map_err(|source| io_error(&entry.path(), source))
-}
-
 fn io_error(path: &Path, source: std::io::Error) -> Error {
     Error::Io {
         path: path.to_path_buf(),
@@ -160,6 +147,40 @@ fn sqlite_error(context: &str, source: rusqlite::Error) -> Error {
         source,
     }
 }
+
+#[cfg(all(test, unix))]
+#[derive(Debug)]
+struct BeforeBucketOpenHook {
+    target: PathBuf,
+    replacement: PathBuf,
+    symlink_target: PathBuf,
+}
+
+#[cfg(all(test, unix))]
+static BEFORE_BUCKET_OPEN_HOOK: std::sync::Mutex<Option<BeforeBucketOpenHook>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(all(test, unix))]
+fn run_before_bucket_open_hook(path: &Path) {
+    let hook = {
+        let mut slot = BEFORE_BUCKET_OPEN_HOOK
+            .lock()
+            .expect("before-bucket-open hook lock should remain available");
+        if slot.as_ref().is_some_and(|hook| hook.target == path) {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        fs::rename(path, &hook.replacement).expect("bucket should move before it is reopened");
+        std::os::unix::fs::symlink(&hook.symlink_target, path)
+            .expect("replacement bucket symlink should be created");
+    }
+}
+
+#[cfg(all(test, not(unix)))]
+fn run_before_bucket_open_hook(_path: &Path) {}
 
 #[cfg(test)]
 mod tests {
@@ -440,5 +461,39 @@ mod tests {
         assert_eq!(report.retained_live_session_files, 0);
         assert!(report.file_errors.is_empty());
         assert!(outside_file.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bucket_swap_cannot_redirect_deletion_outside_storage_root() {
+        let fixture = Fixture::new();
+        let bucket = fixture.storage_root.join(BUCKETS[0]);
+        let displaced = fixture.directory.path().join("displaced-storage-bucket");
+        let outside = fixture.directory.path().join("outside-storage-bucket");
+        fs::create_dir_all(&bucket).expect("storage bucket should be created");
+        fs::create_dir_all(&outside).expect("outside bucket should be created");
+        let original = bucket.join("ses_Original.json");
+        let sentinel = outside.join("ses_Outside.json");
+        fs::write(&original, b"original").expect("original file should be written");
+        fs::write(&sentinel, b"outside").expect("outside sentinel should be written");
+        *super::BEFORE_BUCKET_OPEN_HOOK
+            .lock()
+            .expect("before-bucket-open hook lock should remain available") =
+            Some(super::BeforeBucketOpenHook {
+                target: bucket,
+                replacement: displaced.clone(),
+                symlink_target: outside,
+            });
+
+        let report = sweep(
+            &fixture.database(),
+            &fixture.storage_root,
+            SweepScope::AllOrphans,
+        )
+        .expect("bucket substitution should be handled safely");
+
+        assert!(sentinel.exists(), "deletion escaped the storage root");
+        assert!(displaced.join("ses_Original.json").exists());
+        assert_eq!(report.deleted_files, 0);
     }
 }
