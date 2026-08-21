@@ -119,15 +119,18 @@ pub struct SessionDetails {
     pub message_count: u64,
 }
 
+// OpenCode stores messages under two coexisting models: the legacy `message` table and the
+// event-sourced `session_message` projection. A session can be represented in either or both,
+// and when both are populated they describe the same conversation. Summing them would report
+// double the real message count, so the larger of the two is the honest answer.
 const DESCRIBE_SQL: &str = r"
 SELECT
     session.id,
     session.title,
     session.time_updated,
-    (
-        SELECT COUNT(*) FROM message WHERE message.session_id = session.id
-    ) + (
-        SELECT COUNT(*) FROM session_message WHERE session_message.session_id = session.id
+    MAX(
+        (SELECT COUNT(*) FROM message WHERE message.session_id = session.id),
+        (SELECT COUNT(*) FROM session_message WHERE session_message.session_id = session.id)
     )
 FROM session
 WHERE session.id = ?1
@@ -329,8 +332,99 @@ fn sqlite_error(context: &str, source: rusqlite::Error) -> Error {
 }
 
 #[cfg(test)]
+#[allow(clippy::duplicate_mod, dead_code)]
+#[path = "../../tests/support/fixture.rs"]
+mod fixture;
+
+#[cfg(test)]
 mod tests {
+    use super::fixture::{Fixture, FixtureConfig};
     use super::*;
+    use crate::db::{ConnectionOptions, open_read_only};
+    use crate::paths::Target;
+
+    fn described(session_count: usize, messages_per_session: usize) -> Vec<SessionAttribution> {
+        let fixture = Fixture::build(&FixtureConfig {
+            session_count,
+            messages_per_session,
+            parts_per_message: 1,
+            ..FixtureConfig::default()
+        })
+        .expect("fixture should build");
+        let database = open_read_only(
+            &Target::File(fixture.database_path.clone()),
+            ConnectionOptions::default(),
+        )
+        .expect("fixture should open read-only");
+
+        let mut sessions = analyze(&database, session_count)
+            .expect("attribution should succeed")
+            .sessions;
+        describe(database.connection(), &mut sessions).expect("description should succeed");
+        sessions
+    }
+
+    #[test]
+    fn description_attaches_the_title_activity_date_and_message_count() {
+        let sessions = described(2, 3);
+
+        assert_eq!(sessions.len(), 2);
+        for session in &sessions {
+            let details = session
+                .details
+                .as_ref()
+                .expect("a live session should be described");
+            assert!(
+                !details.title.is_empty(),
+                "OpenCode's schema declares session.title NOT NULL"
+            );
+            assert!(details.time_updated_ms > 0);
+            assert_eq!(
+                details.message_count, 3,
+                "the fixture writes each message under both storage models, and the count \
+                 must report the conversation's real length rather than their sum"
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_that_disappeared_is_left_undescribed_rather_than_failing() {
+        let fixture = Fixture::build(&FixtureConfig {
+            session_count: 1,
+            messages_per_session: 1,
+            parts_per_message: 1,
+            ..FixtureConfig::default()
+        })
+        .expect("fixture should build");
+        let database = open_read_only(
+            &Target::File(fixture.database_path.clone()),
+            ConnectionOptions::default(),
+        )
+        .expect("fixture should open read-only");
+
+        let mut sessions = vec![SessionAttribution {
+            session_id: "ses_vanished".to_owned(),
+            project_id: "prj_vanished".to_owned(),
+            self_bytes: 0,
+            subtree_bytes: 0,
+            details: None,
+        }];
+        describe(database.connection(), &mut sessions).expect("a missing row is not a failure");
+
+        assert!(sessions[0].details.is_none());
+    }
+
+    #[test]
+    fn describing_an_empty_slice_touches_the_database_not_at_all() {
+        let fixture = Fixture::build(&FixtureConfig::default()).expect("fixture should build");
+        let database = open_read_only(
+            &Target::File(fixture.database_path.clone()),
+            ConnectionOptions::default(),
+        )
+        .expect("fixture should open read-only");
+
+        describe(database.connection(), &mut []).expect("an empty slice is a no-op");
+    }
 
     #[test]
     fn sqlite_busy_maps_to_exit_five() {

@@ -18,5 +18,8 @@ mod clean;
 #[path = "e2e/exit_codes.rs"]
 mod exit_codes;
 
+#[path = "e2e/presentation.rs"]
+mod presentation;
+
 #[path = "e2e/exit_contract.rs"]
 mod exit_contract;
