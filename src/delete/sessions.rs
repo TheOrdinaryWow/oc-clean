@@ -8,7 +8,7 @@ use crate::db::{DatabaseConnection, ReadWrite};
 use crate::error::Error;
 use crate::select::predicates::SessionIds;
 
-const DEFAULT_BATCH_SIZE: usize = 5_000;
+const DEFAULT_BATCH_SIZE: usize = 2_500;
 const DEFAULT_BATCH_TIME_LIMIT: Duration = Duration::from_secs(30);
 const PROGRESS_HANDLER_OPS: i32 = 1_000;
 const DELETE_SESSION_SQL: &str = "DELETE FROM session WHERE id IN (SELECT id FROM batch_ids)";

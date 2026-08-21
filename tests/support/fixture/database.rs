@@ -1,6 +1,6 @@
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 
-use super::{BASE_TIME_MS, FixtureConfig, FixtureResult};
+use super::{FixtureConfig, FixtureResult, BASE_TIME_MS};
 
 pub(super) fn populate(
     connection: &mut Connection,

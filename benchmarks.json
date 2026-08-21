@@ -1,0 +1,43 @@
+{
+  "analyze": {
+    "full_cold_ms": 1687.796159,
+    "full_warm_ms": 1576.022567,
+    "quick_ms": 8.662215
+  },
+  "delete_batch_tuning": [
+    {
+      "batch_size": 1000,
+      "elapsed_ms": 3198.647649,
+      "session_count": 2675,
+      "transactions": 3
+    },
+    {
+      "batch_size": 2500,
+      "elapsed_ms": 2934.797987,
+      "session_count": 2675,
+      "transactions": 2
+    },
+    {
+      "batch_size": 5000,
+      "elapsed_ms": 3035.0920220000003,
+      "session_count": 2675,
+      "transactions": 1
+    },
+    {
+      "batch_size": 10000,
+      "elapsed_ms": 3187.3248200000003,
+      "session_count": 2675,
+      "transactions": 1
+    }
+  ],
+  "fixture": {
+    "achieved_size_bytes": 1962291200,
+    "generation_ms": 8077.819162999999,
+    "message_count": 53500,
+    "part_count": 214000,
+    "project_count": 32,
+    "session_count": 2675,
+    "target_size_bytes": 2000000000
+  },
+  "schema_version": 1
+}

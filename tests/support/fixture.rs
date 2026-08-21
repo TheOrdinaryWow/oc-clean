@@ -6,10 +6,12 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 #[path = "fixture/database.rs"]
+#[rustfmt::skip]
 mod database;
 #[cfg(feature = "bench-large")]
 #[path = "fixture/large.rs"]
 #[allow(dead_code)]
+#[rustfmt::skip]
 mod large;
 #[path = "fixture/trees.rs"]
 mod trees;
