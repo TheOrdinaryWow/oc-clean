@@ -388,9 +388,23 @@ fn swap_critical_section<Ops: FileOperations, Hooks: SwapHooks>(
                 backup_path,
             });
         }
-        return Err(platform::rename_error(database_path, source));
+        return Err(annotate_swap_failure(
+            platform::rename_error(database_path, source),
+            "renaming the compacted database over the source",
+        ));
     }
     Ok(backup_path)
+}
+
+/// Adds the failing swap step to an error whose message would otherwise name only a path.
+fn annotate_swap_failure(error: Error, step: &str) -> Error {
+    match error {
+        Error::Io { path, source } => Error::Io {
+            path,
+            source: io::Error::new(source.kind(), format!("{step}: {source}")),
+        },
+        other => other,
+    }
 }
 
 fn checkpoint_source(connection: &Connection) -> Result<(), Error> {
@@ -1430,6 +1444,25 @@ mod tests {
         );
     }
 
+    /// Compares two directories by identity so a symlinked prefix does not fail the comparison.
+    ///
+    /// macOS spells the same temporary directory as both `/var/...` and `/private/var/...`.
+    fn same_directory(left: &Path, right: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let (Ok(left), Ok(right)) = (fs::metadata(left), fs::metadata(right)) else {
+                return false;
+            };
+            left.dev() == right.dev() && left.ino() == right.ino()
+        }
+        #[cfg(not(unix))]
+        {
+            left == right
+        }
+    }
+
     #[test]
     fn generated_siblings_use_resolved_filename_and_windows_legal_timestamp() {
         let fixture = Fixture::new("opencode-nightly.db");
@@ -1462,7 +1495,19 @@ mod tests {
             .expect("temporary path lock")
             .clone()
             .expect("temporary path should be recorded");
-        assert_eq!(temporary.parent(), fixture.path.parent());
+        let temporary_parent = temporary
+            .parent()
+            .expect("temporary path should have a parent");
+        let fixture_parent = fixture
+            .path
+            .parent()
+            .expect("fixture path should have a parent");
+        assert!(
+            same_directory(temporary_parent, fixture_parent),
+            "temporary sibling should live beside the database: {} vs {}",
+            temporary_parent.display(),
+            fixture_parent.display()
+        );
         assert!(
             temporary
                 .file_name()
