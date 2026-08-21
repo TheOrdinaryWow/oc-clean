@@ -168,12 +168,12 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
-    use rusqlite::{params, Connection};
+    use rusqlite::{Connection, params};
 
-    use super::fixture::{Fixture, FixtureConfig, BASE_TIME_MS, TABLES as ALL_TABLES};
+    use super::fixture::{BASE_TIME_MS, Fixture, FixtureConfig, TABLES as ALL_TABLES};
     use super::*;
-    use crate::db::{open_read_write, ConnectionOptions, ReadWriteConnection};
-    use crate::paths::{derived_paths, Target};
+    use crate::db::{ConnectionOptions, ReadWriteConnection, open_read_write};
+    use crate::paths::{Target, derived_paths};
     use crate::select::orphans;
 
     const SESSION_TABLES: &[&str] = &["session", "event_sequence", "event"];
@@ -307,11 +307,13 @@ mod tests {
         assert_eq!(report.deletion.table_rows["event_sequence"], 10);
         assert_eq!(report.deletion.table_rows["event"], 10);
         assert_eq!(report.deletion.deleted_session_ids.len(), 3);
-        assert!(report
-            .deletion
-            .deleted_session_ids
-            .iter()
-            .all(|id| !id.starts_with("ses_Orphan")));
+        assert!(
+            report
+                .deletion
+                .deleted_session_ids
+                .iter()
+                .all(|id| !id.starts_with("ses_Orphan"))
+        );
     }
 
     #[test]
