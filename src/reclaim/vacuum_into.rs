@@ -18,7 +18,10 @@ use super::platform;
 static G_BACKUP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// How often the rebuild progress poller re-reads the output file's size.
-const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(200);
+///
+/// Short enough that a rebuild lasting only a few hundred milliseconds still shows motion,
+/// while a `stat` at this rate is negligible next to the rebuild's own I/O.
+const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct VacuumIntoOptions {
@@ -580,10 +583,10 @@ fn vacuum_to(connection: &Connection, path: &Path) -> Result<(), Error> {
     let result = thread::scope(|scope| {
         scope.spawn(|| {
             while !done.load(Ordering::Relaxed) {
-                thread::sleep(OUTPUT_POLL_INTERVAL);
                 if let Ok(metadata) = fs::metadata(path) {
                     bar.set_position(metadata.len().min(projected_bytes));
                 }
+                thread::sleep(OUTPUT_POLL_INTERVAL);
             }
         });
         let result = connection.execute("VACUUM INTO ?1", [path_value]);

@@ -56,11 +56,13 @@ oc-clean clean --older-than 90D --apply
 
 `analyze` 以只读方式打开数据库。完整模式会报告数据库空间分配、表与行分布、会话年龄与体积分布、孤儿数据计数、最大的会话、项目汇总，以及关联的外部存储。快速模式只做文件级统计和行数统计。
 
+报告中的每个会话除体积外还会给出标题、最后活跃时间和消息数量，因为会话 ID 只是一串随机字符，无法说明会话内容。这些描述信息只会为报告实际展示的会话查询，因此 `--top` 决定了它们的开销上限。
+
 ```sh
 oc-clean analyze
 oc-clean analyze --top 25
 oc-clean analyze --quick --json
-oc-clean analyze --json --log-format json
+oc-clean analyze --json --log json
 ```
 
 ### `doctor`
@@ -97,6 +99,8 @@ oc-clean clean --older-than 6M --gc-snapshots --apply
 oc-clean clean --older-than 1Y --apply --dangerously-skip-confirm --json
 ```
 
+试运行会在任何删除之前列出体积最大的待删会话及其标题，条数由 `--top` 限制，让选择结果可以被辨认而不只是被计数。
+
 应用清理时，会以每批 2,500 个候选的有界事务删除会话，显式删除匹配的事件聚合，清理受影响的空项目，移除对应的存储和快照产物，运行完整性检查，并默认重建数据库。`--no-vacuum` 会提交删除但把空闲页留在数据库文件中。`--incremental` 使用增量 auto-vacuum，要求源数据库此前已按 `auto_vacuum=INCREMENTAL` 配置并重建过。`--gc-snapshots` 还会压缩保留下来的快照仓库。
 
 ### `vacuum`
@@ -123,13 +127,13 @@ oc-clean vacuum --incremental --apply
 |---|---|---|---|
 | Global | `--db <PATH>` | `OCC_DB` | 选择数据库路径，或用 `:memory:` 指定一个全新的内存分析目标。优先级高于 `OPENCODE_DB` 和平台发现。 |
 | Global | `--channel <NAME>` | `OCC_CHANNEL` | 选择用于推导默认数据库文件名的 OpenCode 通道。 |
+| Global | `--log <MODE>` | `OCC_LOG` | 选择 stderr 诊断输出：`off`、`text` 或 `json`，默认 `off`。设置 `RUST_LOG` 会隐式选择 `text`。 |
 | Global | `--apply` | 仅命令行 | 为 `clean` 或 `vacuum` 启用实际修改；不加时两者都保持试运行。 |
 | Global | `--force` | 仅命令行 | 对已应用的 `clean` 或 `vacuum`，把「存在持有者」或「无法判定」的持有者关卡降级为警告。 |
 | Global | `--force-schema` | 仅命令行 | 把第 3 层 schema 语义发现降级为警告；第 1 层仍然强制，第 2 层本就被容忍。 |
 | Global | `--dangerously-skip-confirm` | 仅命令行 | 跳过已应用的 `clean` 和 `vacuum` 所需的交互式确认，包括 JSON 输出和管道执行场景。 |
 | Global | `--skip-backup` | 仅命令行 | 在完整重建成功后删除临时回滚副本，而不是保留默认的 `.bak` 文件。 |
 | analyze | `--json` | `OCC_JSON` | 在 stdout 输出一个稳定的 JSON 报告。 |
-| analyze | `--log-format <LOG_FORMAT>` | `OCC_LOG_FORMAT` | 选择 stderr 诊断信息为 `text` 或 `json`，默认 `text`。 |
 | analyze | `--top <N>` | `OCC_TOP` | 限制最大会话汇总的条数，默认 `10`。 |
 | analyze | `--quick` | `OCC_QUICK` | 只输出文件统计和行数，不做完整分布与汇总。 |
 | doctor | `--json` | `OCC_JSON` | 在 stdout 输出一个稳定的 JSON 诊断报告。 |
@@ -143,17 +147,16 @@ oc-clean vacuum --incremental --apply
 | clean | `--no-vacuum` | `OCC_NO_VACUUM` | 提交选中的删除，跳过页面回收。 |
 | clean | `--gc-snapshots` | `OCC_GC_SNAPSHOTS` | 清理之后压缩保留下来的快照仓库。 |
 | clean | `--prune-empty-projects` | `OCC_PRUNE_EMPTY_PROJECTS` | 同时清理在本次清理之前就已经为空的项目。 |
+| clean | `--top <N>` | `OCC_TOP` | 限制删除前列出的待删会话预览条数，默认 `10`。 |
 | clean | `--json` | `OCC_JSON` | 在 stdout 以 JSON 输出清理报告。 |
-| clean | `--log-format <LOG_FORMAT>` | `OCC_LOG_FORMAT` | 选择 stderr 诊断信息为 `text` 或 `json`，默认 `text`。 |
 | vacuum | `--json` | `OCC_JSON` | 在 stdout 以 JSON 输出 vacuum 报告。 |
-| vacuum | `--log-format <LOG_FORMAT>` | `OCC_LOG_FORMAT` | 选择 stderr 诊断信息为 `text` 或 `json`，默认 `text`。 |
 | vacuum | `--incremental` | `OCC_INCREMENTAL` | 用增量 vacuum 回收空闲列表页面，而不是完整重建。 |
 
 ## 环境变量
 
 可执行文件名为 `oc-clean`，而它自己的环境变量前缀是 `OCC_`。当前 clap 接口为全部四个子命令的每个非破坏性选项都提供了 `OCC_*` 环境变量绑定；破坏性开关有意要求在命令行上可见地传入。
 
-`OCC_CHANNEL` 是 `--channel` 的环境变量等价物；显式的 `--db`/`OCC_DB` 和 `OPENCODE_DB` 路径选择器优先于通道命名。`OPENCODE_DB` 属于 OpenCode，在 `--db` 和 `OCC_DB` 之后参与数据库发现回退。`XDG_DATA_HOME`、`HOME`、`USERPROFILE` 和 `OPENCODE_DISABLE_CHANNEL_DB` 也可能影响平台发现。`NO_COLOR` 会关闭人类可读分析输出中的颜色。
+`OCC_CHANNEL` 是 `--channel` 的环境变量等价物；显式的 `--db`/`OCC_DB` 和 `OPENCODE_DB` 路径选择器优先于通道命名。`OPENCODE_DB` 属于 OpenCode，在 `--db` 和 `OCC_DB` 之后参与数据库发现回退。`XDG_DATA_HOME`、`HOME`、`USERPROFILE` 和 `OPENCODE_DISABLE_CHANNEL_DB` 也可能影响平台发现。`NO_COLOR` 会关闭人类可读报告输出中的颜色。`RUST_LOG` 用于选择 tracing 过滤级别，并在未设置 `--log`/`OCC_LOG` 时隐式启用 `text` 诊断输出。
 
 ## 时长与体积语法
 
@@ -199,7 +202,11 @@ oc-clean vacuum --incremental --apply
 
 ## 输出与自动化
 
-人类可读报告输出到 stdout，诊断信息输出到 stderr。`--json` 会在 stdout 输出一个稳定的报告对象；`--log-format json` 则独立地把 stderr 诊断改成结构化 JSON。这种分离让报告可以被单独捕获，而不会混入运行日志。
+人类可读报告输出到 stdout，其余内容都输出到 stderr。`--json` 会在 stdout 输出一个稳定的报告对象。
+
+诊断输出默认关闭，因此常规运行的 stderr 保持干净，上面只会绘制进度条。`--log text` 或 `--log json` 会打开 tracing 诊断；设置 `RUST_LOG` 则隐式选择 `text`。当使用 `--json` 或 stderr 不是终端时，进度渲染会被抑制，因此重定向运行不会捕获到任何重绘序列。
+
+失败输出不依赖 `--log`。命令失败时会向 stderr 写一行 `error:`，在存在明确后续动作时再写一行 `hint:`；使用 `--json` 时改为向 stderr 写一个可解析的失败对象，包含 `kind`、`exit_code`、`message` 和可选的 `hint`。字段契约见 [docs/json-report.md](docs/json-report.md)。
 
 ```sh
 oc-clean analyze --json > analysis.json

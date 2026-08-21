@@ -56,11 +56,13 @@ The applied command requires an interactive `yes` confirmation. Automation must 
 
 `analyze` opens the database read-only. Full mode reports database allocation, table and row distribution, session age and size distributions, orphan counts, largest sessions, project rollups, and associated external storage. Quick mode limits work to file-level accounting and row counts.
 
+Each reported session carries its title, last-activity date, and message count alongside its size, because a session identifier is a random string that tells an operator nothing about what the session contains. Those descriptions are looked up only for the sessions the report displays, so `--top` bounds their cost.
+
 ```sh
 oc-clean analyze
 oc-clean analyze --top 25
 oc-clean analyze --quick --json
-oc-clean analyze --json --log-format json
+oc-clean analyze --json --log json
 ```
 
 ### `doctor`
@@ -97,6 +99,8 @@ oc-clean clean --older-than 6M --gc-snapshots --apply
 oc-clean clean --older-than 1Y --apply --dangerously-skip-confirm --json
 ```
 
+The dry run lists the largest selected sessions with their titles before any deletion, capped by `--top`, so a selection can be recognized rather than only counted.
+
 Applied cleanup deletes sessions in bounded transactions of 2,500 candidates, deletes matching event aggregates explicitly, prunes affected empty projects, removes corresponding storage and snapshot artifacts, runs integrity checks, and rebuilds the database by default. `--no-vacuum` commits deletion while leaving free pages in the database file. `--incremental` uses incremental auto-vacuum and requires the source database to have been configured and rebuilt previously with `auto_vacuum=INCREMENTAL`. `--gc-snapshots` also compacts retained snapshot repositories.
 
 ### `vacuum`
@@ -123,13 +127,13 @@ The table is the complete set of long flags defined by the current clap interfac
 |---|---|---|---|
 | Global | `--db <PATH>` | `OCC_DB` | Select the database path or `:memory:` for a fresh in-memory analysis target. This takes precedence over `OPENCODE_DB` and platform discovery. |
 | Global | `--channel <NAME>` | `OCC_CHANNEL` | Select the OpenCode channel used for the discovered database filename. |
+| Global | `--log <MODE>` | `OCC_LOG` | Select stderr diagnostics: `off`, `text`, or `json`; default is `off`. Setting `RUST_LOG` implicitly selects `text`. |
 | Global | `--apply` | CLI only | Enable mutation for `clean` or `vacuum`; both remain dry runs without it. |
 | Global | `--force` | CLI only | Downgrade a held or indeterminate holder gate to a warning for applied `clean` or `vacuum`. |
 | Global | `--force-schema` | CLI only | Downgrade Tier 3 schema-semantic findings to warnings; Tier 1 remains mandatory and Tier 2 is already tolerated. |
 | Global | `--dangerously-skip-confirm` | CLI only | Bypass the interactive confirmation required by applied `clean` and `vacuum`, including JSON and piped execution. |
 | Global | `--skip-backup` | CLI only | Remove the temporary rollback copy after a successful full rebuild instead of retaining the default `.bak` file. |
 | analyze | `--json` | `OCC_JSON` | Emit one stable JSON report on stdout. |
-| analyze | `--log-format <LOG_FORMAT>` | `OCC_LOG_FORMAT` | Select `text` or `json` diagnostics on stderr; default is `text`. |
 | analyze | `--top <N>` | `OCC_TOP` | Limit the largest-session rollup; default is `10`. |
 | analyze | `--quick` | `OCC_QUICK` | Emit file accounting and row counts without full distributions and rollups. |
 | doctor | `--json` | `OCC_JSON` | Emit one stable JSON diagnostic report on stdout. |
@@ -143,17 +147,16 @@ The table is the complete set of long flags defined by the current clap interfac
 | clean | `--no-vacuum` | `OCC_NO_VACUUM` | Commit selected deletion and skip page reclamation. |
 | clean | `--gc-snapshots` | `OCC_GC_SNAPSHOTS` | Compact retained snapshot repositories after cleanup. |
 | clean | `--prune-empty-projects` | `OCC_PRUNE_EMPTY_PROJECTS` | Also prune projects that were already empty before cleanup. |
+| clean | `--top <N>` | `OCC_TOP` | Limit the selected-session preview listed before deletion; default is `10`. |
 | clean | `--json` | `OCC_JSON` | Emit the cleanup report as JSON on stdout. |
-| clean | `--log-format <LOG_FORMAT>` | `OCC_LOG_FORMAT` | Select `text` or `json` diagnostics on stderr; default is `text`. |
 | vacuum | `--json` | `OCC_JSON` | Emit the vacuum report as JSON on stdout. |
-| vacuum | `--log-format <LOG_FORMAT>` | `OCC_LOG_FORMAT` | Select `text` or `json` diagnostics on stderr; default is `text`. |
 | vacuum | `--incremental` | `OCC_INCREMENTAL` | Reclaim freelist pages with incremental vacuum instead of a full rebuild. |
 
 ## Environment Variables
 
 The executable is named `oc-clean`, while its own environment-variable prefix is `OCC_`. The current clap interface exposes an `OCC_*` environment binding for every non-destructive option across all four subcommands; destructive switches intentionally require visible command-line input.
 
-`OCC_CHANNEL` is the environment equivalent of `--channel`; explicit `--db`/`OCC_DB` and `OPENCODE_DB` path selectors take precedence over channel naming. `OPENCODE_DB` belongs to OpenCode and participates in fallback database discovery after `--db` and `OCC_DB`. `XDG_DATA_HOME`, `HOME`, `USERPROFILE`, and `OPENCODE_DISABLE_CHANNEL_DB` may also influence platform discovery. `NO_COLOR` disables color in human analysis output.
+`OCC_CHANNEL` is the environment equivalent of `--channel`; explicit `--db`/`OCC_DB` and `OPENCODE_DB` path selectors take precedence over channel naming. `OPENCODE_DB` belongs to OpenCode and participates in fallback database discovery after `--db` and `OCC_DB`. `XDG_DATA_HOME`, `HOME`, `USERPROFILE`, and `OPENCODE_DISABLE_CHANNEL_DB` may also influence platform discovery. `NO_COLOR` disables color in human report output. `RUST_LOG` selects the tracing filter and, when `--log`/`OCC_LOG` is unset, implicitly enables `text` diagnostics.
 
 ## Duration And Size Grammars
 
@@ -199,7 +202,11 @@ Let `O` be the original database size, `L` the projected post-delete live bytes,
 
 ## Output And Automation
 
-Human reports go to stdout and diagnostics go to stderr. `--json` emits one stable report object on stdout; `--log-format json` independently changes stderr diagnostics to structured JSON. This separation permits report capture without mixing operational logs.
+Human reports go to stdout and everything else goes to stderr. `--json` emits one stable report object on stdout.
+
+Diagnostics are off by default, so a normal run's stderr stays empty and progress bars are the only thing drawn there. `--log text` or `--log json` turns tracing diagnostics on; setting `RUST_LOG` selects `text` implicitly. Progress rendering is suppressed whenever `--json` is used or stderr is not a terminal, so a redirected run captures no redraw sequences.
+
+Failures never depend on `--log`. A failed command writes an `error:` line to stderr, plus a `hint:` line when a specific next step applies; under `--json` it writes one parsable failure object to stderr instead, carrying `kind`, `exit_code`, `message`, and an optional `hint`. See [docs/json-report.md](docs/json-report.md) for the field contract.
 
 ```sh
 oc-clean analyze --json > analysis.json
