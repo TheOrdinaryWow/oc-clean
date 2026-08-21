@@ -1,7 +1,9 @@
-use std::fs;
+use std::collections::HashMap;
+use std::fs::{self, File};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use rusqlite::{Connection, ErrorCode, InterruptHandle, OpenFlags};
@@ -18,6 +20,8 @@ const OPENCODE_SCHEMA: &str = include_str!("opencode_schema.sql");
 const FRESH_SCHEMA_MARKER: &str = "-- @shape fresh";
 const SCHEMA_END_MARKER: &str = "-- @end";
 static G_LINK_PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static DATABASE_ANCHORS: OnceLock<Mutex<HashMap<PathBuf, Arc<AnchoredDatabaseFile>>>> =
+    OnceLock::new();
 
 /// Capabilities discovered for the active SQLite build and database filesystem.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -53,15 +57,23 @@ pub struct ReadOnly;
 #[derive(Debug)]
 pub struct ReadWrite;
 
-/// `(size, mtime seconds, mtime nanoseconds, inode or file index)`.
-pub type FileIdentity = (u64, i64, i64, u64);
+/// `(size, mtime seconds, mtime nanoseconds, device, inode or file index)`.
+pub type FileIdentity = (u64, i64, i64, u64, u64);
+
+/// An opened database file paired with the resolved path naming the same file.
+#[derive(Debug)]
+pub(crate) struct AnchoredDatabaseFile {
+    descriptor: File,
+    lexical_path: PathBuf,
+    resolved_path: PathBuf,
+}
 
 /// A configured SQLite connection whose access mode is encoded in its type.
 #[derive(Debug)]
 pub struct DatabaseConnection<Access> {
     connection: Connection,
     capabilities: Capabilities,
-    database_path: Option<PathBuf>,
+    database_anchor: Option<Arc<AnchoredDatabaseFile>>,
     access: PhantomData<Access>,
 }
 
@@ -90,15 +102,14 @@ pub fn open_read_only(
     options: ConnectionOptions,
 ) -> Result<ReadOnlyConnection, Error> {
     match target {
-        Target::File(path) => {
-            ensure_exists(path)?;
-            let connection = Connection::open_with_flags(
-                path,
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )
-            .map_err(|source| sqlite_error("opening database read-only", source))?;
-            finish_open(connection, Some(path.clone()), options)
-        }
+        Target::File(path) => open_file(
+            path,
+            options,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            "opening database read-only",
+            AnchorRetention::Retain,
+            || {},
+        ),
         Target::Memory => {
             let connection = fresh_memory_connection()?;
             finish_open(connection, None, options)
@@ -117,18 +128,182 @@ pub fn open_read_write(
     options: ConnectionOptions,
 ) -> Result<ReadWriteConnection, Error> {
     match target {
-        Target::File(path) => {
-            ensure_exists(path)?;
-            let connection = Connection::open_with_flags(
-                path,
-                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )
-            .map_err(|source| sqlite_error("opening database read-write", source))?;
-            finish_open(connection, Some(path.clone()), options)
-        }
+        Target::File(path) => open_file(
+            path,
+            options,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            "opening database read-write",
+            AnchorRetention::Consume,
+            || {},
+        ),
         Target::Memory => {
             let connection = fresh_memory_connection()?;
             finish_open(connection, None, options)
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AnchorRetention {
+    Retain,
+    Consume,
+}
+
+fn open_file<Access>(
+    path: &Path,
+    options: ConnectionOptions,
+    flags: OpenFlags,
+    context: &str,
+    retention: AnchorRetention,
+    before_open: impl FnOnce(),
+) -> Result<DatabaseConnection<Access>, Error> {
+    let anchor = database_anchor(path, retention)?;
+    before_open();
+    anchor.ensure_path_matches(path, "database target changed before SQLite open")?;
+    anchor.ensure_resolved_path_matches("resolved database target changed before SQLite open")?;
+    let connection = Connection::open_with_flags(anchor.resolved_path(), flags)
+        .map_err(|source| sqlite_error(context, source))?;
+    anchor.ensure_resolved_path_matches("resolved database target changed during SQLite open")?;
+    finish_open(connection, Some(anchor), options)
+}
+
+#[cfg(test)]
+fn open_read_only_with_hook(
+    target: &Target,
+    options: ConnectionOptions,
+    before_open: impl FnOnce(),
+) -> Result<ReadOnlyConnection, Error> {
+    match target {
+        Target::File(path) => open_file(
+            path,
+            options,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            "opening database read-only",
+            AnchorRetention::Retain,
+            before_open,
+        ),
+        Target::Memory => open_read_only(target, options),
+    }
+}
+
+impl AnchoredDatabaseFile {
+    fn open(path: &Path) -> Result<Self, Error> {
+        let resolved_path =
+            resolve_database_target(path).map_err(|source| path_open_error(path, source))?;
+        let descriptor = File::open(path).map_err(|source| path_open_error(path, source))?;
+        let anchor = Self {
+            descriptor,
+            lexical_path: path.to_path_buf(),
+            resolved_path,
+        };
+        anchor.ensure_resolved_path_matches("database target changed while it was anchored")?;
+        Ok(anchor)
+    }
+
+    pub(crate) fn resolved_path(&self) -> &Path {
+        &self.resolved_path
+    }
+
+    pub(crate) fn identity(&self) -> Result<FileIdentity, Error> {
+        let metadata = self.descriptor.metadata().map_err(|source| Error::Io {
+            path: self.lexical_path.clone(),
+            source,
+        })?;
+        file_identity_from_metadata(&self.lexical_path, &metadata)
+    }
+
+    pub(crate) fn ensure_path_matches(&self, path: &Path, reason: &str) -> Result<(), Error> {
+        let candidate = File::open(path).map_err(|source| path_open_error(path, source))?;
+        let metadata = candidate
+            .metadata()
+            .map_err(|source| path_open_error(path, source))?;
+        let candidate_identity = file_identity_from_metadata(path, &metadata)?;
+        self.ensure_same_file(candidate_identity, reason)
+    }
+
+    pub(crate) fn ensure_resolved_path_matches(&self, reason: &str) -> Result<(), Error> {
+        let candidate_identity = file_identity(&self.resolved_path)?;
+        self.ensure_same_file(candidate_identity, reason)
+    }
+
+    pub(crate) fn ensure_identity(
+        &self,
+        expected: FileIdentity,
+        reason: &str,
+    ) -> Result<(), Error> {
+        if self.identity()? == expected {
+            Ok(())
+        } else {
+            Err(database_target_changed(reason))
+        }
+    }
+
+    fn ensure_same_file(&self, candidate: FileIdentity, reason: &str) -> Result<(), Error> {
+        if same_file(self.identity()?, candidate) {
+            Ok(())
+        } else {
+            Err(database_target_changed(reason))
+        }
+    }
+}
+
+pub(crate) fn anchor_for_holder_scan(path: &Path) -> Result<Arc<AnchoredDatabaseFile>, Error> {
+    database_anchor(path, AnchorRetention::Retain)
+}
+
+fn database_anchor(
+    path: &Path,
+    retention: AnchorRetention,
+) -> Result<Arc<AnchoredDatabaseFile>, Error> {
+    let anchors = DATABASE_ANCHORS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut anchors = anchors
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let existing = match retention {
+        AnchorRetention::Retain => anchors.get(path).cloned(),
+        AnchorRetention::Consume => anchors.remove(path),
+    };
+    drop(anchors);
+
+    if let Some(anchor) = existing {
+        anchor.ensure_path_matches(path, "database target changed between safety checks")?;
+        return Ok(anchor);
+    }
+
+    let anchor = Arc::new(AnchoredDatabaseFile::open(path)?);
+    if matches!(retention, AnchorRetention::Retain) {
+        let mut anchors = DATABASE_ANCHORS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let retained = anchors
+            .entry(path.to_path_buf())
+            .or_insert_with(|| Arc::clone(&anchor));
+        retained.ensure_path_matches(path, "database target changed while retaining anchor")?;
+        return Ok(Arc::clone(retained));
+    }
+    Ok(anchor)
+}
+
+fn same_file(left: FileIdentity, right: FileIdentity) -> bool {
+    left.3 == right.3 && left.4 == right.4
+}
+
+fn database_target_changed(reason: &str) -> Error {
+    Error::DatabaseBusy {
+        holders: vec![reason.to_owned()],
+    }
+}
+
+fn path_open_error(path: &Path, source: std::io::Error) -> Error {
+    if source.kind() == std::io::ErrorKind::NotFound {
+        Error::NotFound {
+            path: path.to_path_buf(),
+        }
+    } else {
+        Error::Io {
+            path: path.to_path_buf(),
+            source,
         }
     }
 }
@@ -193,14 +368,24 @@ impl<Access> DatabaseConnection<Access> {
     /// Returns [`Error::InvalidArgument`] for an in-memory database and [`Error::Io`] when file
     /// metadata cannot be read.
     pub fn file_identity(&self) -> Result<FileIdentity, Error> {
-        let path = self
-            .database_path
+        let anchor = self
+            .database_anchor
             .as_deref()
             .ok_or_else(|| Error::InvalidArgument {
                 argument: ":memory:".to_owned(),
                 reason: "file identity requires a file-backed database".to_owned(),
             })?;
-        file_identity(path)
+        anchor.ensure_resolved_path_matches("database target changed while connection was open")?;
+        anchor.identity()
+    }
+
+    pub(crate) fn database_anchor(&self) -> Result<Arc<AnchoredDatabaseFile>, Error> {
+        self.database_anchor
+            .clone()
+            .ok_or_else(|| Error::InvalidArgument {
+                argument: ":memory:".to_owned(),
+                reason: "database anchoring requires a file-backed database".to_owned(),
+            })
     }
 }
 
@@ -225,15 +410,18 @@ impl DatabaseConnection<ReadWrite> {
 
 fn finish_open<Access>(
     connection: Connection,
-    database_path: Option<PathBuf>,
+    database_anchor: Option<Arc<AnchoredDatabaseFile>>,
     options: ConnectionOptions,
 ) -> Result<DatabaseConnection<Access>, Error> {
+    let database_path = database_anchor
+        .as_deref()
+        .map(|anchor| anchor.resolved_path().to_path_buf());
     apply_pragmas(&connection, options)?;
     let capabilities = probe_capabilities(&connection, database_path.as_deref())?;
     Ok(DatabaseConnection {
         connection,
         capabilities,
-        database_path,
+        database_anchor,
         access: PhantomData,
     })
 }
@@ -299,19 +487,6 @@ fn probe_hard_links(database_path: &Path) -> Result<bool, Error> {
     Ok(true)
 }
 
-fn ensure_exists(path: &Path) -> Result<(), Error> {
-    match resolve_database_target(path) {
-        Ok(_) => Ok(()),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Err(Error::NotFound {
-            path: path.to_path_buf(),
-        }),
-        Err(source) => Err(Error::Io {
-            path: path.to_path_buf(),
-            source,
-        }),
-    }
-}
-
 pub(crate) fn sqlite_error(context: &str, source: rusqlite::Error) -> Error {
     if matches!(
         source.sqlite_error_code(),
@@ -329,23 +504,48 @@ pub(crate) fn sqlite_error(context: &str, source: rusqlite::Error) -> Error {
 }
 
 #[cfg(unix)]
-fn file_identity(path: &Path) -> Result<FileIdentity, Error> {
-    use std::os::unix::fs::MetadataExt;
-
+pub(crate) fn file_identity(path: &Path) -> Result<FileIdentity, Error> {
     let metadata = fs::metadata(path).map_err(|source| Error::Io {
         path: path.to_path_buf(),
         source,
     })?;
+    file_identity_from_metadata(path, &metadata)
+}
+
+#[cfg(unix)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "Windows metadata conversion shares this fallible cross-platform contract"
+)]
+fn file_identity_from_metadata(
+    _path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<FileIdentity, Error> {
+    use std::os::unix::fs::MetadataExt;
+
     Ok((
         metadata.size(),
         metadata.mtime(),
         metadata.mtime_nsec(),
+        metadata.dev(),
         metadata.ino(),
     ))
 }
 
 #[cfg(windows)]
-fn file_identity(path: &Path) -> Result<FileIdentity, Error> {
+pub(crate) fn file_identity(path: &Path) -> Result<FileIdentity, Error> {
+    let metadata = fs::metadata(path).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    file_identity_from_metadata(path, &metadata)
+}
+
+#[cfg(windows)]
+fn file_identity_from_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<FileIdentity, Error> {
     use std::io;
     use std::os::windows::fs::MetadataExt;
 
@@ -353,10 +553,6 @@ fn file_identity(path: &Path) -> Result<FileIdentity, Error> {
     const TICKS_PER_SECOND: u64 = 10_000_000;
     const NANOS_PER_TICK: u64 = 100;
 
-    let metadata = fs::metadata(path).map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
     let modified = metadata.last_write_time();
     let seconds = modified
         .checked_div(TICKS_PER_SECOND)
@@ -375,12 +571,65 @@ fn file_identity(path: &Path) -> Result<FileIdentity, Error> {
         path: path.to_path_buf(),
         source: io::Error::new(io::ErrorKind::Unsupported, "file index is unavailable"),
     })?;
-    Ok((metadata.file_size(), seconds, nanoseconds, file_index))
+    Ok((metadata.file_size(), seconds, nanoseconds, 0, file_index))
 }
 
 #[cfg(not(any(unix, windows)))]
-fn file_identity(path: &Path) -> Result<FileIdentity, Error> {
+pub(crate) fn file_identity(path: &Path) -> Result<FileIdentity, Error> {
     Err(Error::UnsupportedPlatform {
         platform: format!("{} ({})", std::env::consts::OS, path.display()),
     })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_identity_from_metadata(
+    path: &Path,
+    _metadata: &fs::Metadata,
+) -> Result<FileIdentity, Error> {
+    Err(Error::UnsupportedPlatform {
+        platform: format!("{} ({})", std::env::consts::OS, path.display()),
+    })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::symlink;
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn create_database(path: &Path, marker: &str) {
+        let connection = Connection::open(path).expect("fixture database should open");
+        connection
+            .execute("CREATE TABLE marker (value TEXT NOT NULL)", [])
+            .expect("marker table should be created");
+        connection
+            .execute("INSERT INTO marker (value) VALUES (?1)", [marker])
+            .expect("marker row should be inserted");
+    }
+
+    #[test]
+    fn symlink_retarget_between_resolution_and_open_is_rejected() {
+        let directory = TempDir::new().expect("temporary directory should be created");
+        let original = directory.path().join("original.db");
+        let replacement = directory.path().join("replacement.db");
+        let link = directory.path().join("opencode.db");
+        create_database(&original, "original");
+        create_database(&replacement, "replacement");
+        symlink("original.db", &link).expect("database symlink should be created");
+
+        let error = open_read_only_with_hook(
+            &Target::File(link.clone()),
+            ConnectionOptions::default(),
+            || {
+                fs::remove_file(&link).expect("old database symlink should be removed");
+                symlink("replacement.db", &link)
+                    .expect("replacement database symlink should be created");
+            },
+        )
+        .expect_err("retargeted database symlink should abort open");
+
+        assert!(matches!(error, Error::DatabaseBusy { .. }));
+    }
 }

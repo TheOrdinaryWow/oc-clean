@@ -7,9 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rusqlite::{Connection, ErrorCode, OptionalExtension};
 use tracing::warn;
 
-use crate::db::{FileIdentity, ReadWriteConnection};
+use crate::db::{AnchoredDatabaseFile, FileIdentity, ReadWriteConnection, file_identity};
 use crate::error::Error;
-use crate::safety::holders::resolve_database_target;
 
 use super::platform;
 
@@ -184,9 +183,15 @@ fn vacuum_into_with_runtime<Ops: FileOperations, Hooks: SwapHooks>(
     hooks: &Hooks,
 ) -> Result<VacuumIntoReport, Error> {
     validate_file_target(database_path)?;
-    let database_path =
-        resolve_database_target(database_path).map_err(|source| io_error(database_path, source))?;
-    let database_path = database_path.as_path();
+    let requested_database_path = database_path;
+    let database_anchor = database.database_anchor()?;
+    database_anchor.ensure_path_matches(
+        requested_database_path,
+        "database target changed before VACUUM INTO",
+    )?;
+    let database_path = database_anchor.resolved_path();
+    database_anchor
+        .ensure_resolved_path_matches("resolved database target changed before VACUUM INTO")?;
     let original_bytes = file_size(database_path)?;
     checkpoint_source(database.connection())?;
     let snapshot = source_snapshot(database.connection())?;
@@ -209,16 +214,25 @@ fn vacuum_into_with_runtime<Ops: FileOperations, Hooks: SwapHooks>(
     if database.data_version()? != locked_data_version {
         return Err(database_busy("source data_version changed before swap"));
     }
-    let identity = database.file_identity()?;
+    let identity = database_anchor.identity()?;
     ensure_wal_truncated(database_path)?;
     let hard_links = database.capabilities().hard_links;
     drop(database);
     hooks.after_lock_closed(database_path, &temporary.path);
+    database_anchor.ensure_path_matches(
+        requested_database_path,
+        "database target changed after the VACUUM lock closed",
+    )?;
+    database_anchor.ensure_resolved_path_matches(
+        "resolved database target changed after the VACUUM lock closed",
+    )?;
 
     let proposed_backup_path = generated_path(database_path, ".bak.", &timestamp)?;
     hooks.enter_swap()?;
     let swap_result = swap_critical_section(
+        requested_database_path,
         database_path,
+        database_anchor.as_ref(),
         &temporary.path,
         &proposed_backup_path,
         identity,
@@ -265,7 +279,9 @@ fn vacuum_into_with_runtime<Ops: FileOperations, Hooks: SwapHooks>(
 
 #[allow(clippy::too_many_arguments)]
 fn swap_critical_section<Ops: FileOperations, Hooks: SwapHooks>(
+    requested_database_path: &Path,
     database_path: &Path,
+    database_anchor: &AnchoredDatabaseFile,
     temporary_path: &Path,
     backup_path: &Path,
     expected_identity: FileIdentity,
@@ -274,7 +290,12 @@ fn swap_critical_section<Ops: FileOperations, Hooks: SwapHooks>(
     operations: &Ops,
     hooks: &Hooks,
 ) -> Result<Option<PathBuf>, Error> {
-    if identity_for_path(database_path)? != expected_identity {
+    database_anchor.ensure_path_matches(
+        requested_database_path,
+        "database target changed before swap",
+    )?;
+    database_anchor.ensure_resolved_path_matches("resolved database target changed before swap")?;
+    if file_identity(database_path)? != expected_identity {
         return Err(database_busy("source file identity changed before swap"));
     }
     ensure_sidecars_quiescent(database_path)?;
@@ -290,6 +311,17 @@ fn swap_critical_section<Ops: FileOperations, Hooks: SwapHooks>(
     if let Some(backup_path) = &backup_path {
         hooks.backup_created(backup_path);
     }
+    database_anchor.ensure_path_matches(
+        requested_database_path,
+        "database target changed after the recovery backup was created",
+    )?;
+    database_anchor.ensure_resolved_path_matches(
+        "resolved database target changed after the recovery backup was created",
+    )?;
+    database_anchor.ensure_identity(
+        expected_identity,
+        "anchored database changed before replacement",
+    )?;
     if let Err(source) = operations.rename(temporary_path, database_path) {
         if let Some(backup_path) = &backup_path
             && operations.remove_file(backup_path).is_err()
@@ -734,64 +766,6 @@ fn remove_if_present<Ops: FileOperations>(operations: &Ops, path: &Path) {
     {
         warn!(path = %path.display(), error = %source, "failed to clean temporary database file");
     }
-}
-
-fn identity_for_path(path: &Path) -> Result<FileIdentity, Error> {
-    identity_for_path_platform(path)
-}
-
-#[cfg(unix)]
-fn identity_for_path_platform(path: &Path) -> Result<FileIdentity, Error> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = fs::metadata(path).map_err(|source| io_error(path, source))?;
-    Ok((
-        metadata.size(),
-        metadata.mtime(),
-        metadata.mtime_nsec(),
-        metadata.ino(),
-    ))
-}
-
-#[cfg(windows)]
-fn identity_for_path_platform(path: &Path) -> Result<FileIdentity, Error> {
-    use std::os::windows::fs::MetadataExt;
-
-    const WINDOWS_TO_UNIX_SECONDS: u64 = 11_644_473_600;
-    const TICKS_PER_SECOND: u64 = 10_000_000;
-    const NANOS_PER_TICK: u64 = 100;
-
-    let metadata = fs::metadata(path).map_err(|source| io_error(path, source))?;
-    let modified = metadata.last_write_time();
-    let seconds = modified
-        .checked_div(TICKS_PER_SECOND)
-        .and_then(|value| value.checked_sub(WINDOWS_TO_UNIX_SECONDS))
-        .and_then(|value| i64::try_from(value).ok())
-        .ok_or_else(|| {
-            io_error(
-                path,
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid Windows modification time",
-                ),
-            )
-        })?;
-    let nanoseconds = i64::try_from((modified % TICKS_PER_SECOND) * NANOS_PER_TICK)
-        .expect("subsecond Windows timestamp always fits i64");
-    let file_index = metadata.file_index().ok_or_else(|| {
-        io_error(
-            path,
-            io::Error::new(io::ErrorKind::Unsupported, "file index is unavailable"),
-        )
-    })?;
-    Ok((metadata.file_size(), seconds, nanoseconds, file_index))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn identity_for_path_platform(_path: &Path) -> Result<FileIdentity, Error> {
-    Err(Error::UnsupportedPlatform {
-        platform: std::env::consts::OS.to_owned(),
-    })
 }
 
 fn open_output(path: &Path) -> Result<Connection, Error> {
@@ -1340,6 +1314,21 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    struct ReplaceTargetAfterBackupHooks {
+        source: PathBuf,
+        displaced: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl SwapHooks for ReplaceTargetAfterBackupHooks {
+        fn backup_created(&self, _backup: &Path) {
+            fs::rename(&self.source, &self.displaced).expect("anchored source should be displaced");
+            fs::write(&self.source, b"attacker replacement")
+                .expect("attacker replacement should be created");
+        }
+    }
+
     #[test]
     fn verified_swap_shrinks_database_and_preserves_every_database_invariant() {
         let fixture = Fixture::new("opencode-nightly.db");
@@ -1599,6 +1588,35 @@ mod tests {
                 })
                 .expect("concurrent row count should be readable"),
             1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn target_replacement_after_backup_aborts_before_swap() {
+        let fixture = Fixture::new("target-replacement.db");
+        let displaced = fixture.path.with_extension("displaced");
+        let hooks = ReplaceTargetAfterBackupHooks {
+            source: fixture.path.clone(),
+            displaced: displaced.clone(),
+        };
+
+        let error = run_with(
+            &fixture,
+            VacuumIntoOptions::default(),
+            &SystemFileOperations,
+            &hooks,
+        )
+        .expect_err("replaced swap target should abort");
+
+        assert!(matches!(error, Error::DatabaseBusy { .. }));
+        assert_eq!(
+            fs::read(&fixture.path).expect("replacement should remain readable"),
+            b"attacker replacement"
+        );
+        assert_eq!(
+            fs::read(displaced).expect("original source should remain readable"),
+            fixture.original_bytes
         );
     }
 

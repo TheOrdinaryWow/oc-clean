@@ -5,6 +5,7 @@ use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::db::anchor_for_holder_scan;
 use crate::error::Error;
 
 #[cfg(target_os = "linux")]
@@ -129,7 +130,84 @@ pub fn inspect_and_decide(
     command: CommandMode,
     force: bool,
 ) -> (Inspection, GateDecision) {
-    let mut inspection = inspector.inspect(database_path);
+    let anchor = match anchor_for_holder_scan(database_path) {
+        Ok(anchor) => Some(anchor),
+        Err(Error::NotFound { .. }) => None,
+        Err(error @ Error::DatabaseBusy { .. }) => {
+            return holder_target_change(database_path, &error);
+        }
+        Err(error) => {
+            return holder_resolution_failure(database_path, &error, command, force);
+        }
+    };
+    let inspection_path = anchor
+        .as_deref()
+        .map_or(database_path, |anchor| anchor.resolved_path());
+    let mut inspection = inspector.inspect(inspection_path);
+    if let Some(anchor) = anchor.as_deref() {
+        remap_holder_paths(&mut inspection, inspection_path, database_path);
+        if let Err(error) = anchor.ensure_path_matches(
+            database_path,
+            "database target changed during holder inspection",
+        ) {
+            return holder_target_change(database_path, &error);
+        }
+    }
+    decide(inspection, command, force)
+}
+
+fn holder_target_change(database_path: &Path, error: &Error) -> (Inspection, GateDecision) {
+    let reason = format!(
+        "database target {} changed during holder inspection: {error}",
+        database_path.display()
+    );
+    (
+        Inspection {
+            verdict: Verdict::CannotDetermine(reason.clone()),
+            completeness: Completeness::Unsupported,
+        },
+        GateDecision::RefuseCannotDetermine(reason),
+    )
+}
+
+fn remap_holder_paths(inspection: &mut Inspection, resolved_path: &Path, lexical_path: &Path) {
+    let resolved = database_related_paths(resolved_path);
+    let lexical = database_related_paths(lexical_path);
+    if let Verdict::Held(holders) = &mut inspection.verdict {
+        for holder in holders {
+            for matched_path in &mut holder.matched_paths {
+                if let Some(index) = resolved.iter().position(|path| path == matched_path) {
+                    matched_path.clone_from(&lexical[index]);
+                }
+            }
+        }
+    }
+}
+
+fn holder_resolution_failure(
+    database_path: &Path,
+    error: &Error,
+    command: CommandMode,
+    force: bool,
+) -> (Inspection, GateDecision) {
+    decide(
+        Inspection {
+            verdict: Verdict::CannotDetermine(format!(
+                "cannot anchor database target {}: {error}",
+                database_path.display()
+            )),
+            completeness: Completeness::Unsupported,
+        },
+        command,
+        force,
+    )
+}
+
+fn decide(
+    mut inspection: Inspection,
+    command: CommandMode,
+    force: bool,
+) -> (Inspection, GateDecision) {
     if let Verdict::Held(holders) = &mut inspection.verdict {
         holders.retain(|holder| holder.pid != std::process::id());
         if holders.is_empty() {
@@ -287,6 +365,21 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    struct RetargetingInspector {
+        link: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl HolderInspector for RetargetingInspector {
+        fn inspect(&self, _database_path: &Path) -> Inspection {
+            std::fs::remove_file(&self.link).expect("old database symlink should be removed");
+            symlink("replacement.db", &self.link)
+                .expect("replacement database symlink should be created");
+            not_held()
+        }
+    }
+
     fn held() -> Inspection {
         Inspection {
             verdict: Verdict::Held(vec![HolderInfo {
@@ -342,6 +435,36 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("symlink cycle"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn holder_scan_rejects_symlink_retarget_during_inspection() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let original = directory.path().join("original.db");
+        let replacement = directory.path().join("replacement.db");
+        let link = directory.path().join("opencode.db");
+        std::fs::write(&original, b"original").expect("original fixture should be created");
+        std::fs::write(&replacement, b"replacement")
+            .expect("replacement fixture should be created");
+        symlink("original.db", &link).expect("database symlink should be created");
+
+        let (inspection, decision) = inspect_and_decide(
+            &RetargetingInspector { link: link.clone() },
+            &link,
+            CommandMode::Vacuum { apply: true },
+            true,
+        );
+
+        assert!(matches!(inspection.verdict, Verdict::CannotDetermine(_)));
+        assert!(matches!(decision, GateDecision::RefuseCannotDetermine(_)));
+        assert_eq!(
+            decision
+                .into_result()
+                .expect_err("retargeted holder scan should abort")
+                .exit_code(),
+            5
+        );
     }
 
     #[cfg(unix)]
