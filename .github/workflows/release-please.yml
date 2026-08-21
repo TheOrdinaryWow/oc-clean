@@ -1,0 +1,28 @@
+name: Release Please
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: Maintain release pull request
+    runs-on: ubuntu-latest
+    steps:
+      # This job only maintains the release pull request and, once that pull
+      # request is merged, the tag and GitHub release. Publishing to crates.io
+      # and uploading binary artifacts are intentionally not wired up yet.
+      - name: Run release-please
+        uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
