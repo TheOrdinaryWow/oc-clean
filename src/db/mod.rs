@@ -461,14 +461,13 @@ impl AnchoredDatabaseFile {
     }
 }
 
-#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+/// Names an open descriptor through `/proc`, which reopens the same inode when used as a path.
+///
+/// Only Linux offers this. Other unices expose `/dev/fd/N`, which duplicates the descriptor
+/// rather than naming a directory entry, so those platforms use resolved paths instead.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn descriptor_path(descriptor: &File) -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{}", descriptor.as_raw_fd()))
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-fn descriptor_path(descriptor: &File) -> PathBuf {
-    PathBuf::from(format!("/dev/fd/{}", descriptor.as_raw_fd()))
 }
 
 /// Opens a path for an identity probe without disturbing handles already held on the file.
