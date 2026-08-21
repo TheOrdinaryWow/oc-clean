@@ -21,56 +21,60 @@ pub fn expand<Access>(
         return Ok(SessionIds::new());
     }
 
-    let placeholders = std::iter::repeat_n("?", selected.len())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        r"
-        WITH RECURSIVE subtree(root_id, session_id, path, cycle) AS (
-            SELECT id, id, char(31) || id || char(31), 0
-            FROM session
-            WHERE id IN ({placeholders})
-            UNION ALL
-            SELECT
-                subtree.root_id,
-                child.id,
-                subtree.path || child.id || char(31),
-                instr(subtree.path, char(31) || child.id || char(31)) > 0
-            FROM subtree
-            JOIN session AS child ON child.parent_id = subtree.session_id
-            WHERE subtree.cycle = 0
-        )
-        SELECT root_id, session_id, cycle
-        FROM subtree
-        ORDER BY root_id, session_id
-        "
-    );
-    let mut statement = database
-        .connection()
-        .prepare(&sql)
-        .map_err(|source| sqlite_error("preparing selected session subtree expansion", source))?;
-    let mut rows = statement
-        .query(params_from_iter(selected.iter()))
-        .map_err(|source| sqlite_error("querying selected session subtree expansion", source))?;
     let mut expanded = SessionIds::new();
 
-    while let Some(row) = rows
-        .next()
-        .map_err(|source| sqlite_error("reading selected session subtree expansion", source))?
-    {
-        let root_id = row
-            .get::<_, String>(0)
-            .map_err(|source| sqlite_error("reading subtree expansion root id", source))?;
-        let session_id = row
-            .get::<_, String>(1)
-            .map_err(|source| sqlite_error("reading expanded session id", source))?;
-        let cycle = row
-            .get::<_, i64>(2)
-            .map_err(|source| sqlite_error("reading subtree expansion cycle marker", source))?;
-        if cycle != 0 {
-            return Err(parent_cycle(&root_id));
+    for selected_chunk in selected.iter().collect::<Vec<_>>().chunks(500) {
+        let placeholders = std::iter::repeat_n("?", selected_chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r"
+            WITH RECURSIVE subtree(root_id, session_id, path, cycle) AS (
+                SELECT id, id, char(31) || id || char(31), 0
+                FROM session
+                WHERE id IN ({placeholders})
+                UNION ALL
+                SELECT
+                    subtree.root_id,
+                    child.id,
+                    subtree.path || child.id || char(31),
+                    instr(subtree.path, char(31) || child.id || char(31)) > 0
+                FROM subtree
+                JOIN session AS child ON child.parent_id = subtree.session_id
+                WHERE subtree.cycle = 0
+            )
+            SELECT root_id, session_id, cycle
+            FROM subtree
+            ORDER BY root_id, session_id
+            "
+        );
+        let mut statement = database.connection().prepare(&sql).map_err(|source| {
+            sqlite_error("preparing selected session subtree expansion", source)
+        })?;
+        let mut rows = statement
+            .query(params_from_iter(selected_chunk.iter().copied()))
+            .map_err(|source| {
+                sqlite_error("querying selected session subtree expansion", source)
+            })?;
+
+        while let Some(row) = rows
+            .next()
+            .map_err(|source| sqlite_error("reading selected session subtree expansion", source))?
+        {
+            let root_id = row
+                .get::<_, String>(0)
+                .map_err(|source| sqlite_error("reading subtree expansion root id", source))?;
+            let session_id = row
+                .get::<_, String>(1)
+                .map_err(|source| sqlite_error("reading expanded session id", source))?;
+            let cycle = row
+                .get::<_, i64>(2)
+                .map_err(|source| sqlite_error("reading subtree expansion cycle marker", source))?;
+            if cycle != 0 {
+                return Err(parent_cycle(&root_id));
+            }
+            expanded.insert(session_id);
         }
-        expanded.insert(session_id);
     }
 
     Ok(expanded)
@@ -223,6 +227,23 @@ mod tests {
         let database = open_fixture(&fixture);
 
         let expanded = expand(&database, &ids(&["ses_0"])).unwrap();
+
+        assert_eq!(
+            expanded,
+            ids(&["ses_0", "ses_0_d0_c0", "ses_0_d0_c0_d1_c0"])
+        );
+    }
+
+    #[test]
+    fn expansion_supports_more_ids_than_sqlites_default_variable_limit() {
+        let fixture = tree_fixture();
+        let database = open_fixture(&fixture);
+        let mut selected = (0..33_000)
+            .map(|index| format!("missing_{index:05}"))
+            .collect::<SessionIds>();
+        selected.insert("ses_0".to_owned());
+
+        let expanded = expand(&database, &selected).unwrap();
 
         assert_eq!(
             expanded,
