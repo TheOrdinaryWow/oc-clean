@@ -861,6 +861,73 @@ mod tests {
         assert_eq!(table_counts(&fixture.database_path), before_rows);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn sigint_during_incremental_vacuum_is_exit_eight_and_preserves_database() {
+        let fixture = Fixture::build(&FixtureConfig {
+            session_count: 200,
+            messages_per_session: 2,
+            parts_per_message: 2,
+            blob_size_per_part: 64 * 1_024,
+            ..FixtureConfig::default()
+        })
+        .expect("fixture should build");
+        prepare_incremental_bloat(&fixture);
+        let before_rows = table_counts(&fixture.database_path);
+        let before_size = fs::metadata(&fixture.database_path)
+            .expect("fixture metadata should exist")
+            .len();
+        let database_path = fixture.database_path.clone();
+        let signals = SignalController::new();
+        signals.install().expect("signal handler should install");
+        let interrupter = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let current_size = fs::metadata(&database_path)
+                    .expect("fixture metadata should remain readable")
+                    .len();
+                if current_size < before_size {
+                    let status = Command::new("kill")
+                        .args(["-s", "INT", &std::process::id().to_string()])
+                        .status()
+                        .expect("kill should send SIGINT");
+                    assert!(status.success());
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "incremental vacuum should reclaim at least one page"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let cli = cli(&fixture.database_path, true, true);
+        let mut input = Cursor::new(b"yes\n");
+        let mut output = Vec::new();
+
+        let result = run_with(
+            &cli,
+            &arguments(true),
+            &mut input,
+            &mut output,
+            &FixedFreeSpaceProvider(u64::MAX),
+            &NotHeldInspector,
+            RuntimeContext::piped(),
+            &signals,
+        );
+
+        interrupter.join().expect("interrupter should join");
+        let error = result.expect_err("SIGINT should interrupt incremental vacuum");
+        assert_eq!(error.exit_code(), 8);
+        assert_eq!(table_counts(&fixture.database_path), before_rows);
+        let integrity: String = fixture
+            .connect()
+            .expect("fixture should reconnect")
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .expect("integrity check should run");
+        assert_eq!(integrity, "ok");
+    }
+
     #[test]
     fn applied_default_vacuum_shrinks_file_and_preserves_every_row() {
         let fixture = fixture();
