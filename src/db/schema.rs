@@ -168,6 +168,9 @@ fn inspect_extensions(
     report: &mut SchemaReport,
 ) -> Result<(), Error> {
     for table_name in table_names {
+        if is_foreign_bookkeeping(table_name) {
+            continue;
+        }
         let Some(known_columns) = known_columns(table_name) else {
             report
                 .tier_two_warnings
@@ -431,6 +434,19 @@ const REQUIRED_TABLES: &[RequiredTable] = &[
         columns: &[text("aggregate_id"), text("data")],
     },
 ];
+
+/// Bookkeeping tables owned by a third-party tool rather than by `OpenCode`'s own schema.
+///
+/// `OpenCode` uses Drizzle ORM, which maintains `__drizzle_migrations` inside the main
+/// database to record applied migrations. Its shape belongs to Drizzle and changes on
+/// Drizzle's schedule, so reporting either the table or its columns as an unknown extension
+/// produces noise about a table this tool never reads or writes.
+///
+/// `OpenCode`'s own `migration` and `data_migration` tables are deliberately excluded here:
+/// they are part of the application schema and stay registered with their real columns.
+fn is_foreign_bookkeeping(table_name: &str) -> bool {
+    table_name == "__drizzle_migrations"
+}
 
 fn known_columns(table_name: &str) -> Option<&'static [&'static str]> {
     known_session_columns(table_name)

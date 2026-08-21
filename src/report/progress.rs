@@ -11,13 +11,23 @@ use std::time::Duration;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
-const TICK: Duration = Duration::from_millis(120);
+const TICK: Duration = Duration::from_millis(100);
 
-const PHASE_TEMPLATE: &str = "{prefix:>12.cyan.bold} [{pos:>2}/{len:<2}] {bar:24.cyan/blue} {msg}";
-const COUNT_TEMPLATE: &str =
-    "{prefix:>12.green.bold} {bar:24.green/blue} {percent:>3}% {pos}/{len} {msg}";
-const BYTES_TEMPLATE: &str =
-    "{prefix:>12.green.bold} {bar:24.green/blue} {percent:>3}% {bytes}/{total_bytes} {msg}";
+/// Bar fill characters: filled, leading edge, remaining.
+const PROGRESS_CHARS: &str = "█▓░";
+
+/// Braille frames for indeterminate work.
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "⠿"];
+
+// Phase bars deliberately carry no ETA. Phases measure heterogeneous work — a schema
+// inspection and a full-table delete are both "one phase" — so a rate extrapolated from
+// completed phases predicts the remaining ones badly enough to be worse than no estimate.
+const PHASE_TEMPLATE: &str =
+    "{prefix:>12.cyan.bold} [{pos:>2}/{len:<2}] {wide_bar:.cyan/blue} {msg}";
+const COUNT_TEMPLATE: &str = "{prefix:>12.green.bold} {wide_bar:.green/blue} {percent:>3}% \
+     {pos}/{len} {per_sec} eta {eta} {msg}";
+const BYTES_TEMPLATE: &str = "{prefix:>12.green.bold} {wide_bar:.green/blue} {percent:>3}% \
+     {bytes}/{total_bytes} {binary_bytes_per_sec} eta {eta} {msg}";
 const SPINNER_TEMPLATE: &str = "{prefix:>12.green.bold} {spinner:.green} {msg} ({elapsed})";
 
 static RENDERER: OnceLock<Option<MultiProgress>> = OnceLock::new();
@@ -55,27 +65,36 @@ pub fn is_enabled() -> bool {
 /// Creates the top-level bar tracking a command's ordered phases.
 #[must_use]
 pub fn phases(prefix: &'static str, total: u64) -> Bar {
-    Bar::new(prefix, total, PHASE_TEMPLATE, false)
+    Bar::new(prefix, total, PHASE_TEMPLATE, Motion::Driven)
 }
 
 /// Creates a bar measuring discrete units of work such as sessions, files, or directories.
 #[must_use]
 pub fn counted(prefix: &'static str, total: u64) -> Bar {
-    Bar::new(prefix, total, COUNT_TEMPLATE, false)
+    Bar::new(prefix, total, COUNT_TEMPLATE, Motion::Driven)
 }
 
 /// Creates a bar measuring byte progress.
 #[must_use]
 pub fn bytes(prefix: &'static str, total: u64) -> Bar {
-    Bar::new(prefix, total, BYTES_TEMPLATE, false)
+    Bar::new(prefix, total, BYTES_TEMPLATE, Motion::Driven)
 }
 
 /// Creates an indeterminate spinner for work with no measurable completion signal.
 #[must_use]
-pub fn spinner(prefix: &'static str, message: &'static str) -> Bar {
-    let bar = Bar::new(prefix, 0, SPINNER_TEMPLATE, true);
-    bar.set_message(message);
+pub fn spinner(prefix: &'static str, message: impl Into<String>) -> Bar {
+    let bar = Bar::new(prefix, 0, SPINNER_TEMPLATE, Motion::Animated);
+    bar.set_message(message.into());
     bar
+}
+
+/// Whether a bar advances only when the caller reports progress, or animates on its own.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Motion {
+    /// The caller drives every redraw by reporting completed work.
+    Driven,
+    /// A background ticker animates the bar while the caller is blocked.
+    Animated,
 }
 
 /// A progress handle that renders when enabled and does nothing when it is not.
@@ -85,17 +104,14 @@ pub struct Bar {
 }
 
 impl Bar {
-    fn new(prefix: &'static str, total: u64, template: &str, steady: bool) -> Self {
+    fn new(prefix: &'static str, total: u64, template: &str, motion: Motion) -> Self {
         let Some(Some(renderer)) = RENDERER.get() else {
             return Self { inner: None };
         };
-        let style = ProgressStyle::with_template(template)
-            .expect("progress templates are validated by unit tests")
-            .progress_chars("=>-");
         let bar = renderer.add(ProgressBar::new(total));
-        bar.set_style(style);
+        bar.set_style(style(template));
         bar.set_prefix(prefix);
-        if steady {
+        if motion == Motion::Animated {
             bar.enable_steady_tick(TICK);
         }
         Self { inner: Some(bar) }
@@ -153,6 +169,13 @@ impl Drop for Bar {
     }
 }
 
+fn style(template: &str) -> ProgressStyle {
+    ProgressStyle::with_template(template)
+        .expect("progress templates are validated by unit tests")
+        .progress_chars(PROGRESS_CHARS)
+        .tick_strings(SPINNER_FRAMES)
+}
+
 fn stderr_is_terminal() -> bool {
     use std::io::IsTerminal;
 
@@ -161,23 +184,54 @@ fn stderr_is_terminal() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use indicatif::ProgressStyle;
-
     use super::{
-        BYTES_TEMPLATE, Bar, COUNT_TEMPLATE, PHASE_TEMPLATE, SPINNER_TEMPLATE, is_enabled, suspend,
+        BYTES_TEMPLATE, Bar, COUNT_TEMPLATE, PHASE_TEMPLATE, PROGRESS_CHARS, SPINNER_FRAMES,
+        SPINNER_TEMPLATE, is_enabled, style, suspend,
     };
 
+    const TEMPLATES: [&str; 4] = [
+        PHASE_TEMPLATE,
+        COUNT_TEMPLATE,
+        BYTES_TEMPLATE,
+        SPINNER_TEMPLATE,
+    ];
+
     #[test]
-    fn every_template_is_a_valid_progress_style() {
-        for template in [
-            PHASE_TEMPLATE,
-            COUNT_TEMPLATE,
-            BYTES_TEMPLATE,
-            SPINNER_TEMPLATE,
-        ] {
+    fn every_template_builds_a_style_with_the_shared_decorations() {
+        // `style` panics on an invalid template or an under-length character set, so a
+        // successful call over every template is the assertion.
+        for template in TEMPLATES {
+            let _ = style(template);
+        }
+    }
+
+    #[test]
+    fn bar_characters_cover_filled_edge_and_remaining() {
+        assert_eq!(PROGRESS_CHARS.chars().count(), 3);
+        assert!(SPINNER_FRAMES.len() >= 2, "indicatif requires two frames");
+    }
+
+    #[test]
+    fn only_measurable_work_advertises_a_rate_and_an_estimate() {
+        for template in [COUNT_TEMPLATE, BYTES_TEMPLATE] {
             assert!(
-                ProgressStyle::with_template(template).is_ok(),
-                "template `{template}` must parse"
+                template.contains("{eta}"),
+                "`{template}` should show an ETA"
+            );
+        }
+        assert!(COUNT_TEMPLATE.contains("{per_sec}"));
+        assert!(BYTES_TEMPLATE.contains("{binary_bytes_per_sec}"));
+        // Phases measure heterogeneous work, so an extrapolated estimate would mislead.
+        assert!(!PHASE_TEMPLATE.contains("{eta}"));
+        assert!(!PHASE_TEMPLATE.contains("{per_sec}"));
+    }
+
+    #[test]
+    fn every_bar_adapts_to_the_terminal_width() {
+        for template in [PHASE_TEMPLATE, COUNT_TEMPLATE, BYTES_TEMPLATE] {
+            assert!(
+                template.contains("{wide_bar"),
+                "`{template}` should fill the available width"
             );
         }
     }

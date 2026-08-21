@@ -360,6 +360,42 @@ mod db {
         }
 
         #[test]
+        fn the_drizzle_migration_table_is_never_reported_as_an_extension() {
+            let (_fixture, connection) = connection();
+            // OpenCode uses Drizzle ORM, which owns this table and its shape. Reporting it
+            // would be noise about a table this tool never reads or writes.
+            connection
+                .execute_batch(
+                    "CREATE TABLE __drizzle_migrations (\
+                       id INTEGER PRIMARY KEY, hash TEXT NOT NULL, created_at NUMERIC\
+                     );",
+                )
+                .unwrap();
+
+            let report = inspect(&connection, false).unwrap();
+
+            assert_eq!(report.tier_two_warnings.as_slice(), &[] as &[String]);
+            assert!(report.is_compatible());
+        }
+
+        #[test]
+        fn opencode_owned_migration_tables_still_report_their_unknown_columns() {
+            let (_fixture, connection) = connection();
+            // `migration` belongs to OpenCode rather than to Drizzle, so it stays registered
+            // and a new column on it remains a genuine schema extension worth reporting.
+            connection
+                .execute_batch("ALTER TABLE migration ADD COLUMN applied_by TEXT")
+                .unwrap();
+
+            let report = inspect(&connection, false).unwrap();
+
+            assert_eq!(
+                report.tier_two_warnings,
+                ["unknown column `migration.applied_by`"]
+            );
+        }
+
+        #[test]
         fn unknown_index_is_only_a_tier_two_warning() {
             let (_fixture, connection) = connection();
             connection

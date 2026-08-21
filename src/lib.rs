@@ -6,6 +6,7 @@ pub mod db;
 pub mod delete;
 pub mod doctor;
 pub mod error;
+pub mod parallel;
 pub mod paths;
 pub mod reclaim;
 pub mod report;
