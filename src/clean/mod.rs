@@ -1,6 +1,7 @@
 mod cleanup;
 pub mod command;
 mod output;
+mod progress;
 mod reclaim;
 mod selection;
 mod signal;
@@ -55,10 +56,4 @@ pub trait PhaseObserver {
     fn entered(&self, phase: PhaseId);
 
     fn performing(&self, _phase: PhaseId, _operation: PhaseOperation) {}
-}
-
-pub(super) struct NoopPhaseObserver;
-
-impl PhaseObserver for NoopPhaseObserver {
-    fn entered(&self, _phase: PhaseId) {}
 }

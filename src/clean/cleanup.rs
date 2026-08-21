@@ -7,6 +7,7 @@ use crate::assets::storage::{self, SweepReport, SweepScope};
 use crate::db::{DatabaseConnection, ReadWrite};
 use crate::delete::projects::{self, ProjectIds};
 use crate::paths::DerivedPaths;
+use crate::report::progress;
 use crate::select::predicates::SessionIds;
 
 #[derive(Debug, Default)]
@@ -23,11 +24,15 @@ impl CleanupOutcome {
         paths: &DerivedPaths,
         deleted_session_ids: &SessionIds,
     ) {
-        match storage::sweep(
+        let bar = progress::spinner("sweep", "scanning storage files");
+        let outcome = storage::sweep_with_progress(
             database,
             &paths.storage,
             SweepScope::ThisRun(deleted_session_ids),
-        ) {
+            |examined| bar.set_message(format!("examined {examined} storage files")),
+        );
+        bar.finish();
+        match outcome {
             Ok(report) => self.record_sweep(report),
             Err(error) => self.partial_failures.push(error.to_string()),
         }
@@ -57,7 +62,15 @@ impl CleanupOutcome {
         paths: &DerivedPaths,
     ) {
         self.remove_orphaned(database, paths);
-        match storage::sweep(database, &paths.storage, SweepScope::AllOrphans) {
+        let bar = progress::spinner("sweep", "scanning storage files");
+        let outcome = storage::sweep_with_progress(
+            database,
+            &paths.storage,
+            SweepScope::AllOrphans,
+            |examined| bar.set_message(format!("examined {examined} storage files")),
+        );
+        bar.finish();
+        match outcome {
             Ok(report) => self.record_sweep(report),
             Err(error) => self.partial_failures.push(error.to_string()),
         }
@@ -77,7 +90,16 @@ impl CleanupOutcome {
                 return;
             }
         };
-        match snapshot::gc_retained_with_path(&paths.snapshot, &retained, pruned, git_path) {
+        let bar = progress::spinner("gc", "compacting snapshot repositories");
+        let outcome = snapshot::gc_retained_with_progress(
+            &paths.snapshot,
+            &retained,
+            pruned,
+            git_path,
+            |compacted| bar.set_message(format!("compacted {compacted} repositories")),
+        );
+        bar.finish();
+        match outcome {
             Ok(GcSnapshotsOutcome::Completed(report)) => {
                 if let Some(error) = report.partial_success_error() {
                     self.partial_failures.push(error.to_string());

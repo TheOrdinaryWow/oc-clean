@@ -16,6 +16,7 @@ use crate::paths::{self, DatabaseOptions, DerivedPaths, Environment, Platform, T
 use crate::reclaim::headroom::{FreeSpaceProvider, Fs2FreeSpaceProvider};
 use crate::reclaim::incremental::{IncrementalVacuumError, check_auto_vacuum};
 use crate::report::impact::{self, Impact};
+use crate::report::progress;
 use crate::safety::confirm::{ConfirmationDecision, ConfirmationOptions, ImpactSummary, confirm};
 use crate::safety::holders::{CommandMode, GateDecision, HolderInspector, inspect_and_decide};
 use crate::select::orphans::RawOrphans;
@@ -23,9 +24,10 @@ use crate::select::predicates::SessionIds;
 
 use super::cleanup::CleanupOutcome;
 use super::output::{self, CleanReport};
+use super::progress::ProgressPhaseObserver;
 use super::selection;
 use super::signal::SignalController;
-use super::{NoopPhaseObserver, PhaseId, PhaseObserver, PhaseOperation, reclaim};
+use super::{PhaseId, PhaseObserver, PhaseOperation, reclaim};
 
 #[derive(Clone, Copy)]
 pub(super) struct RuntimeContext {
@@ -43,7 +45,8 @@ pub fn run(cli: &Cli, arguments: &CleanArgs, output: &mut dyn Write) -> Result<(
     let mut input = stdin.lock();
     let signals = SignalController::new();
     signals.install()?;
-    run_with(
+    let observer = ProgressPhaseObserver::new(arguments, cli.apply);
+    let result = run_with(
         cli,
         arguments,
         &mut input,
@@ -55,8 +58,10 @@ pub fn run(cli: &Cli, arguments: &CleanArgs, output: &mut dyn Write) -> Result<(
             stdout_is_terminal: io::stdout().is_terminal(),
         },
         &signals,
-        &NoopPhaseObserver,
-    )
+        &observer,
+    );
+    observer.finish();
+    result
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -191,10 +196,15 @@ where
     let mut affected_projects = projects::owners_of_sessions(&database, &selected)?;
     signals.begin_delete();
     phase(observer, PhaseId::P12);
+    let delete_bar = progress::counted("delete", selected.len() as u64);
+    delete_bar.set_message("deleting sessions");
     let session_report =
         sessions::delete_with_progress(&database, &selected, DeleteOptions::default(), |report| {
+            delete_bar.set_position(report.deleted_session_ids.len() as u64);
             batch_committed(report, signals)
-        })?;
+        });
+    delete_bar.finish();
+    let session_report = session_report?;
     stop_after_delete_if_cancelled(&session_report, arguments, output, signals)?;
 
     let mut orphan_report = None;
@@ -203,6 +213,7 @@ where
         observer.performing(PhaseId::P13, PhaseOperation::OrphanSelection);
         let raw_orphans = crate::select::orphans::select(&database, &paths)?;
         affected_projects.extend(orphan_project_owners(&database, &raw_orphans)?);
+        let orphan_bar = progress::spinner("orphans", "deleting orphaned rows");
         let report = orphans::delete_with_progress(
             &database,
             &raw_orphans,
@@ -210,8 +221,13 @@ where
                 keep_recent: arguments.keep_recent,
                 ..OrphanDeleteOptions::default()
             },
-            |report| batch_committed(report, signals),
-        )?;
+            |report| {
+                orphan_bar.set_message(format!("committed {} transactions", report.transactions));
+                batch_committed(report, signals)
+            },
+        );
+        orphan_bar.finish();
+        let report = report?;
         let combined = combine_reports(&session_report, &report.deletion);
         stop_after_delete_if_cancelled(&combined, arguments, output, signals)?;
         orphan_report = Some(report.deletion);

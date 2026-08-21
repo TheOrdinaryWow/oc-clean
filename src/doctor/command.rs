@@ -7,6 +7,7 @@ use crate::cli::{Cli, DoctorArgs};
 use crate::db::{self, ConnectionOptions};
 use crate::error::Error;
 use crate::paths::{self, DatabaseOptions, Environment, Platform, Target};
+use crate::report::progress;
 
 /// Runs the read-only diagnostics and writes the selected report format.
 ///
@@ -24,27 +25,43 @@ pub fn run(cli: &Cli, arguments: &DoctorArgs, output: &mut dyn Write) -> Result<
     let database = db::open_read_only(&target, ConnectionOptions::default())?;
     let connection = database.connection();
 
+    // An integrity check on a large database runs for minutes with no output of its own,
+    // so every step is announced; a silent terminal is indistinguishable from a hang.
+    let bar = progress::phases("doctor", 8);
+    bar.set_message("running the integrity check");
     let integrity_check = super::checks::integrity_check(connection)?;
+    bar.step("inspecting the schema");
     let schema = db::schema::inspect_report(connection)?;
     ensure_schema_compatible(&schema)?;
+    bar.step("running the foreign-key check");
     let foreign_key_check = super::checks::foreign_key_check(connection)?;
+    bar.step("accounting for file space");
     let file_space = space::analyze(&database)?.file;
+    bar.step("counting orphans");
+    let orphans = orphans::analyze(&database, &derived_paths)?;
+    bar.step("scanning for database holders");
+    let holders = super::checks::holders(database_path);
+    bar.step("estimating rebuild headroom");
+    let vacuum_headroom = vacuum_headroom(
+        &target,
+        database_path,
+        file_space.live_bytes,
+        database.capabilities().hard_links,
+    )?;
+    bar.step("reading auto-vacuum and timestamp state");
     let report = DoctorReport {
         database_path: database_path.to_owned(),
         schema,
         integrity_check,
         foreign_key_check,
-        orphans: orphans::analyze(&database, &derived_paths)?,
-        holders: super::checks::holders(database_path),
-        vacuum_headroom: vacuum_headroom(
-            &target,
-            database_path,
-            file_space.live_bytes,
-            database.capabilities().hard_links,
-        )?,
+        orphans,
+        holders,
+        vacuum_headroom,
         auto_vacuum: super::checks::auto_vacuum(connection)?,
         timestamp_sanity: super::checks::timestamp_sanity(connection)?,
     };
+    bar.step("writing the report");
+    bar.finish();
 
     if arguments.json {
         super::json::write(&report, output)?;

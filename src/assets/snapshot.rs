@@ -109,6 +109,33 @@ pub(crate) fn gc_retained_with_path(
     deleting_project_ids: &ProjectIds,
     program: Option<&OsStr>,
 ) -> Result<GcSnapshotsOutcome, Error> {
+    gc_retained_with_progress(
+        snapshot_root,
+        retained_project_ids,
+        deleting_project_ids,
+        program,
+        |_| {},
+    )
+}
+
+/// Compacts retained snapshot repositories while reporting each repository as it is compacted.
+///
+/// `compacted` receives the running count of repositories processed so far, which lets a caller
+/// drive a progress indicator without this module knowing how progress is rendered.
+///
+/// # Errors
+///
+/// Returns the same typed failures as [`gc_retained`].
+pub(crate) fn gc_retained_with_progress<Progress>(
+    snapshot_root: &Path,
+    retained_project_ids: &ProjectIds,
+    deleting_project_ids: &ProjectIds,
+    program: Option<&OsStr>,
+    mut compacted: Progress,
+) -> Result<GcSnapshotsOutcome, Error>
+where
+    Progress: FnMut(u64),
+{
     let retained_paths = retained_project_ids
         .iter()
         .map(|project_id| {
@@ -132,6 +159,7 @@ pub(crate) fn gc_retained_with_path(
     };
 
     let mut report = GcReport::default();
+    let mut processed = 0_u64;
     for (project_id, project_path) in retained_paths {
         if deleting_project_ids.contains(project_id) {
             report.skipped_deleting_project_directories = report
@@ -161,6 +189,8 @@ pub(crate) fn gc_retained_with_path(
                 continue;
             };
             compact_repository(&repository, program, &mut report)?;
+            processed = processed.saturating_add(1);
+            compacted(processed);
         }
     }
     Ok(GcSnapshotsOutcome::Completed(report))

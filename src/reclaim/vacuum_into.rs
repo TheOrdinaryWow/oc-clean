@@ -2,17 +2,23 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use rusqlite::{Connection, ErrorCode, OptionalExtension};
 use tracing::warn;
 
 use crate::db::{AnchoredDatabaseFile, FileIdentity, ReadWriteConnection};
 use crate::error::Error;
+use crate::report::progress;
 
 use super::platform;
 
 static G_BACKUP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// How often the rebuild progress poller re-reads the output file's size.
+const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct VacuumIntoOptions {
@@ -563,8 +569,30 @@ fn vacuum_to(connection: &Connection, path: &Path) -> Result<(), Error> {
         argument: path.display().to_string(),
         reason: "SQLite VACUUM INTO requires a UTF-8 path".to_owned(),
     })?;
-    connection
-        .execute("VACUUM INTO ?1", [path_value])
+    let projected_bytes = projected_output_bytes(connection);
+    let bar = progress::bytes("rebuild", projected_bytes);
+    bar.set_message("rebuilding the database");
+    let done = AtomicBool::new(false);
+
+    // SQLite exposes no progress callback for VACUUM INTO, so the rebuilt file's own growth
+    // toward the projected live size is the only available signal. It is an approximation:
+    // the projection ignores per-page overhead differences between source and rebuild.
+    let result = thread::scope(|scope| {
+        scope.spawn(|| {
+            while !done.load(Ordering::Relaxed) {
+                thread::sleep(OUTPUT_POLL_INTERVAL);
+                if let Ok(metadata) = fs::metadata(path) {
+                    bar.set_position(metadata.len().min(projected_bytes));
+                }
+            }
+        });
+        let result = connection.execute("VACUUM INTO ?1", [path_value]);
+        done.store(true, Ordering::Relaxed);
+        result
+    });
+
+    bar.finish();
+    result
         .map(|_| ())
         .map_err(|source| match source.sqlite_error_code() {
             Some(ErrorCode::CannotOpen | ErrorCode::ReadOnly) => io_error(
@@ -573,6 +601,25 @@ fn vacuum_to(connection: &Connection, path: &Path) -> Result<(), Error> {
             ),
             _ => sqlite_error("running VACUUM INTO", source),
         })
+}
+
+/// Estimates the rebuilt file's final size from the source's live pages.
+///
+/// Returns zero when the pragmas cannot be read, which renders an indeterminate bar rather
+/// than a wrong percentage.
+fn projected_output_bytes(connection: &Connection) -> u64 {
+    let pragma = |name: &str| -> Option<u64> {
+        connection
+            .query_row(&format!("PRAGMA {name}"), [], |row| row.get::<_, i64>(0))
+            .ok()
+            .and_then(|value| u64::try_from(value).ok())
+    };
+    let page_count = pragma("page_count").unwrap_or(0);
+    let freelist_count = pragma("freelist_count").unwrap_or(0);
+    let page_size = pragma("page_size").unwrap_or(0);
+    page_count
+        .saturating_sub(freelist_count)
+        .saturating_mul(page_size)
 }
 
 fn utc_compact_timestamp(connection: &Connection) -> Result<String, Error> {

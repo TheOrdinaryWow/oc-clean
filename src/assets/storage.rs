@@ -50,6 +50,26 @@ pub fn sweep<Access>(
     storage_root: &Path,
     scope: SweepScope<'_>,
 ) -> Result<SweepReport, Error> {
+    sweep_with_progress(database, storage_root, scope, |_| {})
+}
+
+/// Sweeps orphaned storage files while reporting each examined conforming file.
+///
+/// `examined` receives the running count of conforming files considered so far, which lets a
+/// caller drive a progress indicator without this module knowing how progress is rendered.
+///
+/// # Errors
+///
+/// Returns the same typed failures as [`sweep`].
+pub fn sweep_with_progress<Access, Progress>(
+    database: &DatabaseConnection<Access>,
+    storage_root: &Path,
+    scope: SweepScope<'_>,
+    mut examined: Progress,
+) -> Result<SweepReport, Error>
+where
+    Progress: FnMut(u64),
+{
     let Some(storage_directory) =
         AnchoredDir::open(storage_root).map_err(|source| io_error(storage_root, source))?
     else {
@@ -57,6 +77,7 @@ pub fn sweep<Access>(
     };
 
     let mut report = SweepReport::default();
+    let mut conforming = 0_u64;
     for bucket_name in storage_directory
         .entries()
         .map_err(|source| io_error(storage_root, source))?
@@ -86,6 +107,8 @@ pub fn sweep<Access>(
                 report.non_conforming_files = report.non_conforming_files.saturating_add(1);
                 continue;
             };
+            conforming = conforming.saturating_add(1);
+            examined(conforming);
             if !scope.includes(session_id) {
                 continue;
             }
