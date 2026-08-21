@@ -5,6 +5,10 @@ use serde_json::json;
 use tracing::{info, info_span, warn};
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 
+#[allow(clippy::duplicate_mod, dead_code)]
+#[path = "../clean/signal.rs"]
+mod signal;
+
 use super::headroom::{
     FreeSpaceProvider, Fs2FreeSpaceProvider, HeadroomEstimate, HeadroomInput, HeadroomVerdict,
     evaluate_headroom,
@@ -12,7 +16,7 @@ use super::headroom::{
 use super::incremental::{
     DEFAULT_PAGES_PER_BATCH, IncrementalVacuumError, check_auto_vacuum, incremental_vacuum,
 };
-use super::vacuum_into::{VacuumIntoOptions, vacuum_into};
+use super::vacuum_into::{VacuumIntoOptions, vacuum_into_with_observer};
 use crate::analyze::space;
 use crate::cli::{Cli, VacuumArgs};
 use crate::db::{self, ConnectionOptions};
@@ -20,6 +24,8 @@ use crate::error::Error;
 use crate::paths::{self, DatabaseOptions, Environment, Platform, Target};
 use crate::safety::confirm::{ConfirmationDecision, ConfirmationOptions, ImpactSummary, confirm};
 use crate::safety::holders::{CommandMode, GateDecision, HolderInspector, inspect_and_decide};
+
+use signal::SignalController;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RuntimeContext {
@@ -80,6 +86,8 @@ struct VacuumReport {
 pub fn run(cli: &Cli, arguments: &VacuumArgs, output: &mut dyn Write) -> Result<(), Error> {
     let stdin = io::stdin();
     let mut input = stdin.lock();
+    let signals = SignalController::new();
+    signals.install()?;
     let runtime = RuntimeContext {
         stdin_is_terminal: stdin.is_terminal(),
         stdout_is_terminal: io::stdout().is_terminal(),
@@ -93,9 +101,11 @@ pub fn run(cli: &Cli, arguments: &VacuumArgs, output: &mut dyn Write) -> Result<
         &Fs2FreeSpaceProvider,
         inspector.as_ref(),
         runtime,
+        &signals,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_with<R, W, P>(
     cli: &Cli,
     arguments: &VacuumArgs,
@@ -104,6 +114,7 @@ fn run_with<R, W, P>(
     free_space: &P,
     holder_inspector: &dyn HolderInspector,
     runtime: RuntimeContext,
+    signals: &SignalController,
 ) -> Result<(), Error>
 where
     R: BufRead + ?Sized,
@@ -149,7 +160,9 @@ where
     };
 
     if arguments.incremental {
-        run_incremental(cli, arguments, input, output, runtime, &target, report)
+        run_incremental(
+            cli, arguments, input, output, runtime, &target, report, signals,
+        )
     } else {
         run_vacuum_into(
             cli,
@@ -162,10 +175,12 @@ where
             database_path,
             hardlink_supported,
             report,
+            signals,
         )
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_incremental<R, W>(
     cli: &Cli,
     arguments: &VacuumArgs,
@@ -174,6 +189,7 @@ fn run_incremental<R, W>(
     runtime: RuntimeContext,
     target: &Target,
     mut report: VacuumReport,
+    signals: &SignalController,
 ) -> Result<(), Error>
 where
     R: BufRead + ?Sized,
@@ -185,6 +201,8 @@ where
         return write_report(arguments, &report, output);
     }
     ensure_confirmed(cli, arguments, input, output, runtime, &report)?;
+    signals.set_interrupt_handle(database.interrupt_handle());
+    signals.begin_reclaim();
     let progress_span = info_span!("incremental vacuum");
     progress_span.pb_set_length(report.freelist_bytes);
     progress_span.pb_set_message("reclaiming freelist pages");
@@ -193,7 +211,7 @@ where
     let vacuum_report = incremental_vacuum(
         &database,
         DEFAULT_PAGES_PER_BATCH,
-        || false,
+        || signals.cancelled(),
         |progress| {
             progress_span.pb_set_position(progress.bytes_reclaimed);
             info!(
@@ -202,8 +220,12 @@ where
                 "incremental vacuum progress"
             );
         },
-    )
-    .map_err(incremental_error)?;
+    );
+    let vacuum_report = match vacuum_report {
+        Ok(_) | Err(_) if signals.cancelled() => return Err(interrupted("incremental vacuum")),
+        Ok(report) => report,
+        Err(error) => return Err(incremental_error(error)),
+    };
     report.bytes_reclaimed = Some(vacuum_report.bytes_reclaimed);
     write_report(arguments, &report, output)
 }
@@ -220,6 +242,7 @@ fn run_vacuum_into<R, W, P>(
     database_path: &Path,
     hardlink_supported: bool,
     mut report: VacuumReport,
+    signals: &SignalController,
 ) -> Result<(), Error>
 where
     R: BufRead + ?Sized,
@@ -252,16 +275,28 @@ where
     }
     ensure_confirmed(cli, arguments, input, output, runtime, &report)?;
     let database = db::open_read_write(target, ConnectionOptions::default())?;
+    signals.set_interrupt_handle(database.interrupt_handle());
+    signals.begin_reclaim();
+    if signals.cancelled() {
+        return Err(interrupted("zero database mutations"));
+    }
     database.acquire_exclusive_lock()?;
     let data_version = database.data_version()?;
-    let vacuum_report = vacuum_into(
+    let vacuum_report = vacuum_into_with_observer(
         database,
         database_path,
         data_version,
         VacuumIntoOptions {
             skip_backup: cli.skip_backup,
         },
-    )?;
+        signals,
+    );
+    let vacuum_report = match vacuum_report {
+        Ok(_) if signals.cancelled() => return Err(interrupted("atomic database swap")),
+        Ok(report) => report,
+        Err(_) if signals.cancelled() => return Err(interrupted("VACUUM output cleanup")),
+        Err(error) => return Err(error),
+    };
     report.bytes_reclaimed = Some(vacuum_report.bytes_reclaimed);
     report.estimated_post_vacuum_size = vacuum_report.compacted_bytes;
     write_report(arguments, &report, output)
@@ -397,17 +432,6 @@ fn write_headroom_refusal(
 
 fn incremental_error(error: IncrementalVacuumError) -> Error {
     match error {
-        IncrementalVacuumError::AutoVacuumNotIncremental { actual_mode } => {
-            Error::InvalidArgument {
-                argument: "--incremental".to_owned(),
-                reason: IncrementalVacuumError::AutoVacuumNotIncremental { actual_mode }
-                    .to_string(),
-            }
-        }
-        IncrementalVacuumError::InvalidBatchSize => Error::InvalidArgument {
-            argument: "--incremental".to_owned(),
-            reason: IncrementalVacuumError::InvalidBatchSize.to_string(),
-        },
         IncrementalVacuumError::Cancelled { progress } => Error::Interrupted {
             completed: format!(
                 "{} pages and {} bytes reclaimed",
@@ -418,6 +442,15 @@ fn incremental_error(error: IncrementalVacuumError) -> Error {
             context: context.to_owned(),
             source,
         },
+        other => Error::ReclaimUnavailable {
+            reason: other.to_string(),
+        },
+    }
+}
+
+fn interrupted(completed: &str) -> Error {
+    Error::Interrupted {
+        completed: completed.to_owned(),
     }
 }
 
@@ -503,6 +536,12 @@ mod tests {
     use std::hash::{DefaultHasher, Hash, Hasher};
     use std::io::{self, Cursor};
     use std::path::Path;
+    #[cfg(unix)]
+    use std::process::Command;
+    #[cfg(unix)]
+    use std::thread;
+    #[cfg(unix)]
+    use std::time::{Duration, Instant};
 
     use rusqlite::Connection;
 
@@ -642,6 +681,7 @@ mod tests {
             provider,
             &NotHeldInspector,
             runtime,
+            &SignalController::new(),
         );
         (
             result,
@@ -728,6 +768,97 @@ mod tests {
             6
         );
         assert_eq!(provider.calls.get(), 1);
+    }
+
+    #[test]
+    fn incremental_unavailable_is_exit_six_and_preserves_database() {
+        let fixture = fixture();
+        let before = file_hash(&fixture.database_path);
+        let cli = cli(&fixture.database_path, true, true);
+
+        let (result, _) = invoke(
+            &cli,
+            &arguments(true),
+            &FixedFreeSpaceProvider(u64::MAX),
+            RuntimeContext::piped(),
+        );
+
+        let error = result.expect_err("incremental vacuum should be unavailable");
+        assert_eq!(error.exit_code(), 6);
+        assert_eq!(file_hash(&fixture.database_path), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigint_during_full_vacuum_is_exit_eight_and_preserves_database() {
+        let fixture = Fixture::build(&FixtureConfig {
+            session_count: 200,
+            messages_per_session: 2,
+            parts_per_message: 2,
+            blob_size_per_part: 64 * 1_024,
+            ..FixtureConfig::default()
+        })
+        .expect("fixture should build");
+        let before_hash = file_hash(&fixture.database_path);
+        let before_rows = table_counts(&fixture.database_path);
+        let database_path = fixture.database_path.clone();
+        let signals = signal::SignalController::new();
+        signals.install().expect("signal handler should install");
+        let interrupter = thread::spawn(move || {
+            let parent = database_path
+                .parent()
+                .expect("fixture should have a parent");
+            let database_name = database_path
+                .file_name()
+                .expect("fixture should have a file name")
+                .to_string_lossy();
+            let temporary_prefix = format!("{database_name}.oc-clean-tmp-");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let temporary_exists = fs::read_dir(parent)
+                    .expect("fixture directory should be readable")
+                    .filter_map(Result::ok)
+                    .any(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(&temporary_prefix)
+                    });
+                if temporary_exists {
+                    let status = Command::new("kill")
+                        .args(["-s", "INT", &std::process::id().to_string()])
+                        .status()
+                        .expect("kill should send SIGINT");
+                    assert!(status.success());
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "VACUUM temporary file should appear"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let cli = cli(&fixture.database_path, true, true);
+        let mut input = Cursor::new(b"yes\n");
+        let mut output = Vec::new();
+
+        let result = run_with(
+            &cli,
+            &arguments(false),
+            &mut input,
+            &mut output,
+            &FixedFreeSpaceProvider(u64::MAX),
+            &NotHeldInspector,
+            RuntimeContext::piped(),
+            &signals,
+        );
+
+        interrupter.join().expect("interrupter should join");
+        let error = result.expect_err("SIGINT should interrupt vacuum");
+        assert_eq!(error.exit_code(), 8);
+        assert_eq!(file_hash(&fixture.database_path), before_hash);
+        assert_eq!(table_counts(&fixture.database_path), before_rows);
     }
 
     #[test]
