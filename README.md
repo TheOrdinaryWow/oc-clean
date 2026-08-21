@@ -12,11 +12,9 @@ Deleting rows alone places pages on SQLite's freelist; it does not normally shri
 
 ## Installation From Source
 
-The project uses Rust edition 2024, declares Rust 1.85 as its minimum version, and develops against the nightly toolchain. Install the binary from a checked-out source tree with:
+The project uses Rust edition 2024, declares Rust 1.85 as its minimum version, and develops against nightly. `rust-toolchain.toml` pins that toolchain, so rustup selects and installs it automatically for commands run inside the checkout. Install the binary from a checked-out source tree with:
 
 ```sh
-rustup toolchain install nightly
-rustup override set nightly
 cargo install --locked --path .
 oc-clean --help
 ```
@@ -264,16 +262,32 @@ Exit codes are a stable process contract. Several error variants intentionally s
 
 ## Development
 
-The default quality gates use the nightly toolchain, rustfmt, Clippy's configured `all` and `pedantic` lint groups, cargo-nextest, and line coverage of at least 80 percent.
+The default quality gates use the pinned nightly toolchain, rustfmt, Clippy's configured `all` and `pedantic` lint groups, cargo-nextest, and line coverage of at least 80 percent. `Taskfile.yml` wraps them; run `task` with no arguments to list every target.
+
+```sh
+task ci         # fmt:check, then lint, then test
+task test       # cargo nextest run --no-tests=pass
+task test:doc   # doctests, which nextest does not run
+task coverage   # line coverage report against the 80 percent floor
+task lint       # clippy --all-targets --all-features -- -D warnings
+task audit      # cargo audit dependency advisory scan
+```
+
+The equivalent direct cargo invocations are:
 
 ```sh
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo nextest run
-cargo llvm-cov --all-features nextest --fail-under-lines 80
+cargo nextest run --no-tests=pass
+cargo test --doc
+cargo llvm-cov --all-features nextest --no-tests=pass --fail-under-lines 80
 ```
 
 Tests create disposable SQLite fixtures under temporary directories. Development and testing must never target a live OpenCode database.
+
+Continuous integration runs the fmt, lint, build, test, and doctest sequence natively on Ubuntu, macOS, and Windows, because holder detection has a distinct implementation per platform. Separate jobs enforce the coverage floor and scan dependencies for advisories.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the commit format, the branch and pull request workflow, release automation, and the documentation tests that gate changes to this file.
 
 ## License
 
