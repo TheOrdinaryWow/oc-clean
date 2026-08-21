@@ -34,6 +34,9 @@ fn sigint_after_a_committed_delete_batch_stops_safely() {
             "--apply",
             "--dangerously-skip-confirm",
             "--skip-backup",
+            // Diagnostics are off by default; this test observes the committed-batch marker.
+            "--log",
+            "text",
             "clean",
             "--archived",
             "--keep-recent",

@@ -124,6 +124,54 @@ impl Error {
             Self::SwapRollbackFailed { .. } => 11,
         }
     }
+
+    /// Returns the stable machine-readable identifier for this failure category.
+    ///
+    /// The identifier is part of the JSON error contract and changes only alongside
+    /// the exit-code table, so automation can branch on it without parsing prose.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Io { .. } => "io",
+            Self::Sqlite { .. } => "sqlite",
+            Self::InvalidArgument { .. } => "invalid_argument",
+            Self::NotFound { .. } => "not_found",
+            Self::SchemaIncompatible { .. } => "schema_incompatible",
+            Self::DatabaseBusy { .. } => "database_busy",
+            Self::InsufficientDiskSpace { .. } => "insufficient_disk_space",
+            Self::ReclaimUnavailable { .. } => "reclaim_unavailable",
+            Self::IntegrityCheckFailed { .. } => "integrity_check_failed",
+            Self::Interrupted { .. } => "interrupted",
+            Self::UnsupportedPlatform { .. } => "unsupported_platform",
+            Self::PartialSuccess { .. } => "partial_success",
+            Self::SwapRollbackFailed { .. } => "swap_rollback_failed",
+        }
+    }
+
+    /// Returns the next action an operator can take, when one is well defined.
+    #[must_use]
+    pub const fn hint(&self) -> Option<&'static str> {
+        match self {
+            Self::DatabaseBusy { .. } => {
+                Some("stop OpenCode, then retry; `--force` downgrades the holder gate to a warning")
+            }
+            Self::SchemaIncompatible { .. } => {
+                Some("`--force-schema` downgrades Tier 3 findings; Tier 1 always stops the command")
+            }
+            Self::InsufficientDiskSpace { .. } => {
+                Some("free disk space, or use `--no-vacuum` to delete rows without a rebuild")
+            }
+            Self::ReclaimUnavailable { .. } => {
+                Some("a full rebuild reclaims space when incremental auto-vacuum is unavailable")
+            }
+            Self::Interrupted { .. } => Some("completed batches are committed; rerun to continue"),
+            Self::PartialSuccess { .. } => Some("remove the listed leftovers manually"),
+            Self::SwapRollbackFailed { .. } => {
+                Some("restore the named backup by hand before running any further command")
+            }
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

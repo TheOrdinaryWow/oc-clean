@@ -4,10 +4,10 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tracing::{info, info_span};
-use tracing_indicatif::span_ext::IndicatifSpanExt;
+use tracing::info;
 
 use super::AnalysisReport;
+use super::progress;
 use crate::analyze::{attribution, distribution, orphans, space};
 use crate::cli::{AnalyzeArgs, Cli};
 use crate::db::{self, ConnectionOptions, DatabaseConnection};
@@ -56,26 +56,20 @@ fn full_report<Access>(
     paths: &DerivedPaths,
     top: usize,
 ) -> Result<AnalysisReport, Error> {
-    let progress = info_span!("analyze", "indicatif.pb_show" = true);
-    progress.pb_set_length(5);
-    let _entered = progress.enter();
+    let progress = progress::phases("analyze", 5);
 
-    progress.pb_set_message("counting rows");
+    progress.set_message("counting rows");
     let row_counts = row_counts(database.connection())?;
-    progress.pb_inc(1);
-    progress.pb_set_message("accounting for SQLite space");
+    progress.step("accounting for SQLite space");
     let space = space::analyze(database)?;
-    progress.pb_inc(1);
-    progress.pb_set_message("attributing project and session bytes");
+    progress.step("attributing project and session bytes");
     let attribution = attribution::analyze(database, top)?;
-    progress.pb_inc(1);
-    progress.pb_set_message("counting orphans");
+    progress.step("counting orphans");
     let orphans = orphans::analyze(database, paths)?;
-    progress.pb_inc(1);
-    progress.pb_set_message("building age and directory overview");
+    progress.step("building age and directory overview");
     let distribution = distribution::analyze(database, paths, now_ms()?)?;
-    progress.pb_inc(1);
-    progress.pb_set_finish_message("analysis complete");
+    progress.step("done");
+    progress.finish();
 
     Ok(AnalysisReport::full(
         space,

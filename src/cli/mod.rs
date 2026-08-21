@@ -26,6 +26,20 @@ pub struct Cli {
     #[arg(long, env = "OCC_CHANNEL", value_name = "NAME", global = true)]
     pub channel: Option<String>,
 
+    /// Select the diagnostic log destination written to stderr.
+    ///
+    /// Logging stays off by default so human reports and progress rendering remain readable.
+    /// Setting `RUST_LOG` implicitly enables text logging while this option stays unset.
+    #[arg(
+        long,
+        env = "OCC_LOG",
+        value_enum,
+        default_value_t = LogMode::Off,
+        value_name = "MODE",
+        global = true
+    )]
+    pub log: LogMode,
+
     #[arg(long, global = true)]
     pub apply: bool,
 
@@ -40,6 +54,19 @@ pub struct Cli {
 
     #[arg(long, global = true)]
     pub skip_backup: bool,
+}
+
+impl Cli {
+    /// Reports whether the selected subcommand emits a JSON report on stdout.
+    #[must_use]
+    pub const fn json(&self) -> bool {
+        match &self.command {
+            Commands::Analyze(arguments) => arguments.json,
+            Commands::Doctor(arguments) => arguments.json,
+            Commands::Clean(arguments) => arguments.json,
+            Commands::Vacuum(arguments) => arguments.json,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -97,24 +124,33 @@ pub struct CleanArgs {
     #[arg(long, env = "OCC_PRUNE_EMPTY_PROJECTS")]
     pub prune_empty_projects: bool,
 
+    /// Limit the selected-session preview listed before deletion.
+    #[arg(long, env = "OCC_TOP", default_value_t = 10, value_name = "N")]
+    pub top: usize,
+
     /// Emit the report as JSON on stdout.
     #[arg(long, env = "OCC_JSON")]
     pub json: bool,
-
-    /// Select the tracing diagnostic format written to stderr.
-    #[arg(
-        long,
-        env = "OCC_LOG_FORMAT",
-        value_enum,
-        default_value_t = LogFormat::Text
-    )]
-    pub log_format: LogFormat,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub enum LogFormat {
+/// Diagnostic logging destination selected by `--log`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum LogMode {
+    /// Suppress tracing diagnostics entirely.
+    #[default]
+    Off,
+    /// Write human-readable tracing diagnostics to stderr.
     Text,
+    /// Write structured JSON tracing diagnostics to stderr.
     Json,
+}
+
+impl LogMode {
+    /// Reports whether any tracing diagnostics should reach stderr.
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
 }
 
 #[derive(Debug, Args)]
@@ -122,15 +158,6 @@ pub struct AnalyzeArgs {
     /// Emit the report as one stable JSON object on stdout.
     #[arg(long, env = "OCC_JSON")]
     pub json: bool,
-
-    /// Select the tracing diagnostic format written to stderr.
-    #[arg(
-        long,
-        env = "OCC_LOG_FORMAT",
-        value_enum,
-        default_value_t = LogFormat::Text
-    )]
-    pub log_format: LogFormat,
 
     /// Limit the largest-session rollup.
     #[arg(long, env = "OCC_TOP", default_value_t = 10, value_name = "N")]
@@ -154,15 +181,6 @@ pub struct VacuumArgs {
     #[arg(long, env = "OCC_JSON")]
     pub json: bool,
 
-    /// Select the tracing diagnostic format written to stderr.
-    #[arg(
-        long,
-        env = "OCC_LOG_FORMAT",
-        value_enum,
-        default_value_t = LogFormat::Text
-    )]
-    pub log_format: LogFormat,
-
     /// Reclaim freelist pages from a database already using incremental auto-vacuum.
     #[arg(long, env = "OCC_INCREMENTAL")]
     pub incremental: bool,
@@ -174,7 +192,7 @@ mod tests {
 
     use clap::{Command, CommandFactory, Parser};
 
-    use super::{Cli, Commands, LogFormat};
+    use super::{Cli, Commands, LogMode};
 
     #[test]
     fn clean_accepts_every_command_specific_option() {
@@ -183,6 +201,8 @@ mod tests {
             "--db",
             "/tmp/opencode.db",
             "--apply",
+            "--log",
+            "json",
             "clean",
             "--older-than",
             "30d",
@@ -198,12 +218,13 @@ mod tests {
             "--no-vacuum",
             "--gc-snapshots",
             "--prune-empty-projects",
+            "--top",
+            "7",
             "--json",
-            "--log-format",
-            "json",
         ])
         .expect("clean arguments should parse");
 
+        assert_eq!(cli.log, LogMode::Json);
         let Commands::Clean(arguments) = cli.command else {
             panic!("clean command should parse");
         };
@@ -220,8 +241,25 @@ mod tests {
         assert!(arguments.no_vacuum);
         assert!(arguments.gc_snapshots);
         assert!(arguments.prune_empty_projects);
+        assert_eq!(arguments.top, 7);
         assert!(arguments.json);
-        assert_eq!(arguments.log_format, LogFormat::Json);
+    }
+
+    #[test]
+    fn logging_is_off_unless_requested() {
+        let cli = Cli::try_parse_from(["oc-clean", "analyze"]).expect("analyze should parse");
+        assert_eq!(cli.log, LogMode::Off);
+        assert!(!cli.log.is_enabled());
+    }
+
+    #[test]
+    fn log_option_is_global_for_every_subcommand() {
+        for subcommand in ["analyze", "doctor", "clean", "vacuum"] {
+            let cli = Cli::try_parse_from(["oc-clean", subcommand, "--log", "text"])
+                .expect("global --log should parse after every subcommand");
+            assert_eq!(cli.log, LogMode::Text);
+            assert!(cli.log.is_enabled());
+        }
     }
 
     #[test]
@@ -286,5 +324,6 @@ mod tests {
         };
 
         assert_eq!(arguments.keep_recent, 100);
+        assert_eq!(arguments.top, 10);
     }
 }

@@ -1,9 +1,5 @@
 use std::io::{self, BufRead, Write};
 
-use tracing::Subscriber;
-use tracing_indicatif::{IndicatifLayer, IndicatifWriter, writer};
-use tracing_subscriber::registry::LookupSpan;
-
 /// Minimal confirmation view of the impact report.
 ///
 /// Todo 19 may replace this adapter with its report type once that module is available.
@@ -81,60 +77,11 @@ where
     }
 }
 
-/// Progress rendering policy for tracing spans.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ProgressOptions {
-    pub stderr_is_terminal: bool,
-    pub json: bool,
-}
-
-impl ProgressOptions {
-    #[must_use]
-    pub const fn enabled(self) -> bool {
-        self.stderr_is_terminal && !self.json
-    }
-
-    #[must_use]
-    pub const fn stream(self) -> Option<ProgressStream> {
-        if self.enabled() {
-            Some(ProgressStream::Stderr)
-        } else {
-            None
-        }
-    }
-
-    /// Creates the tracing progress layer and its coordinated stderr diagnostics writer.
-    #[must_use]
-    pub fn tracing_layer<S>(self) -> Option<StderrProgress<S>>
-    where
-        S: Subscriber + for<'lookup> LookupSpan<'lookup>,
-    {
-        if !self.enabled() {
-            return None;
-        }
-
-        let layer = IndicatifLayer::new();
-        let writer = layer.get_stderr_writer();
-        Some((layer, writer))
-    }
-}
-
-/// The only stream available to progress rendering.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProgressStream {
-    Stderr,
-}
-
-pub type StderrProgress<S> = (IndicatifLayer<S>, IndicatifWriter<writer::Stderr>);
-
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
 
-    use super::{
-        ConfirmationDecision, ConfirmationOptions, ImpactSummary, ProgressOptions, ProgressStream,
-        confirm,
-    };
+    use super::{ConfirmationDecision, ConfirmationOptions, ImpactSummary, confirm};
 
     fn summary() -> ImpactSummary<'static> {
         ImpactSummary {
@@ -188,16 +135,12 @@ mod tests {
     }
 
     #[test]
-    fn json_disables_prompts_and_progress() {
+    fn json_disables_prompts() {
         let confirmation = ConfirmationOptions {
             stdin_is_terminal: true,
             stdout_is_terminal: true,
             json: true,
             dangerously_skip_confirm: false,
-        };
-        let progress = ProgressOptions {
-            stderr_is_terminal: true,
-            json: true,
         };
         let mut input = Cursor::new(b"yes\n");
         let mut output = Vec::new();
@@ -207,7 +150,6 @@ mod tests {
             ConfirmationDecision::Refuse
         );
         assert_eq!(output, b"");
-        assert!(!progress.enabled());
     }
 
     #[test]
@@ -239,36 +181,5 @@ mod tests {
             assert!(rendered.contains("3 root sessions"));
             assert!(rendered.contains("Proceed? [y/N]"));
         }
-    }
-
-    #[test]
-    fn progress_targets_stderr_and_non_tty_output_has_no_ansi() {
-        let interactive = ProgressOptions {
-            stderr_is_terminal: true,
-            json: false,
-        };
-        let piped = ProgressOptions {
-            stderr_is_terminal: false,
-            json: false,
-        };
-        let stdout = Vec::<u8>::new();
-        let stderr = Vec::<u8>::new();
-
-        assert!(interactive.enabled());
-        assert_eq!(interactive.stream(), Some(ProgressStream::Stderr));
-        assert!(
-            interactive
-                .tracing_layer::<tracing_subscriber::Registry>()
-                .is_some()
-        );
-        assert!(!piped.enabled());
-        assert_eq!(piped.stream(), None);
-        assert!(
-            piped
-                .tracing_layer::<tracing_subscriber::Registry>()
-                .is_none()
-        );
-        assert!(!stdout.contains(&0x1b));
-        assert!(!stderr.contains(&0x1b));
     }
 }

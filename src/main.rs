@@ -1,3 +1,5 @@
+use std::io::{self, Write};
+
 use clap::Parser;
 use oc_clean::{
     cli::{Cli, Commands},
@@ -8,19 +10,19 @@ use oc_clean::{
 
 fn main() {
     let cli = Cli::parse();
-    let result = initialize_logging(&cli).and_then(|()| dispatch(&cli));
-    handle_result(result);
+    let json = cli.json();
+    let result = initialize(&cli).and_then(|()| dispatch(&cli));
+    handle_result(result, json);
 }
 
-fn initialize_logging(cli: &Cli) -> Result<(), Error> {
-    match &cli.command {
-        Commands::Analyze(arguments) => {
-            report::logging::init(arguments.log_format, !arguments.json)
-        }
-        Commands::Doctor(_) => report::logging::init(oc_clean::cli::LogFormat::Text, false),
-        Commands::Clean(arguments) => report::logging::init(arguments.log_format, !arguments.json),
-        Commands::Vacuum(arguments) => report::logging::init(arguments.log_format, !arguments.json),
-    }
+/// Installs diagnostics and progress rendering before any command runs.
+///
+/// Progress is drawn on stderr, so it is suppressed whenever the command emits a JSON
+/// report; that keeps a piped `--json` run byte-clean on both streams.
+fn initialize(cli: &Cli) -> Result<(), Error> {
+    report::logging::init(cli.log)?;
+    report::progress::init(!cli.json());
+    Ok(())
 }
 
 fn dispatch(cli: &Cli) -> Result<(), Error> {
@@ -48,9 +50,26 @@ fn dispatch(cli: &Cli) -> Result<(), Error> {
     }
 }
 
-fn handle_result(result: Result<(), Error>) {
-    if let Err(error) = result {
-        tracing::error!(exit_code = error.exit_code(), error = %error, "command failed");
-        std::process::exit(error.exit_code());
+/// Renders a failure on stderr in the requested format and exits with its stable code.
+///
+/// Failures never depend on `--log` being enabled, because diagnostics are off by default
+/// and a silent non-zero exit would leave an operator with no way to learn what went wrong.
+/// They also never reach stdout: a command such as `doctor --json` writes its report before
+/// returning a failure, and stdout must keep carrying exactly one report object.
+fn handle_result(result: Result<(), Error>, json: bool) {
+    let Err(error) = result else {
+        return;
+    };
+    tracing::error!(exit_code = error.exit_code(), error = %error, "command failed");
+    let stderr = io::stderr();
+    let mut output = stderr.lock();
+    let rendered = if json {
+        report::failure::write_json(&error, &mut output)
+    } else {
+        report::failure::write_human(&error, &mut output)
     }
+    .and_then(|()| output.flush());
+    // A broken pipe on the diagnostic stream must not mask the original failure's exit code.
+    drop(rendered);
+    std::process::exit(error.exit_code());
 }

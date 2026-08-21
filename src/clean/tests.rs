@@ -4,7 +4,7 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
-use crate::cli::{CleanArgs, Cli, Commands, LogFormat};
+use crate::cli::{CleanArgs, Cli, Commands, LogMode};
 use crate::reclaim::headroom::FreeSpaceProvider;
 use crate::safety::holders::{Completeness, HolderInspector, Inspection, Verdict};
 use clap::Parser;
@@ -92,8 +92,8 @@ fn arguments(incremental: bool) -> CleanArgs {
         no_vacuum: false,
         gc_snapshots: true,
         prune_empty_projects: false,
+        top: 10,
         json: false,
-        log_format: LogFormat::Text,
     }
 }
 
@@ -102,6 +102,7 @@ fn cli(path: &Path, incremental: bool) -> Cli {
         command: Commands::Clean(arguments(incremental)),
         db: Some(path.to_owned()),
         channel: None,
+        log: LogMode::Off,
         apply: true,
         force: false,
         force_schema: false,

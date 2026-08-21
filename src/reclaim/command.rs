@@ -2,8 +2,7 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
-use tracing::{info, info_span, warn};
-use tracing_indicatif::span_ext::IndicatifSpanExt;
+use tracing::{info, warn};
 
 #[allow(clippy::duplicate_mod, dead_code)]
 #[path = "../clean/signal.rs"]
@@ -22,6 +21,7 @@ use crate::cli::{Cli, VacuumArgs};
 use crate::db::{self, ConnectionOptions};
 use crate::error::Error;
 use crate::paths::{self, DatabaseOptions, Environment, Platform, Target};
+use crate::report::progress;
 use crate::safety::confirm::{ConfirmationDecision, ConfirmationOptions, ImpactSummary, confirm};
 use crate::safety::holders::{CommandMode, GateDecision, HolderInspector, inspect_and_decide};
 
@@ -203,17 +203,14 @@ where
     ensure_confirmed(cli, arguments, input, output, runtime, &report)?;
     signals.set_interrupt_handle(database.interrupt_handle());
     signals.begin_reclaim();
-    let progress_span = info_span!("incremental vacuum");
-    progress_span.pb_set_length(report.freelist_bytes);
-    progress_span.pb_set_message("reclaiming freelist pages");
-    progress_span.pb_start();
-    let _entered = progress_span.enter();
+    let bar = progress::bytes("vacuum", report.freelist_bytes);
+    bar.set_message("reclaiming freelist pages");
     let vacuum_report = incremental_vacuum(
         &database,
         DEFAULT_PAGES_PER_BATCH,
         || signals.cancelled(),
         |progress| {
-            progress_span.pb_set_position(progress.bytes_reclaimed);
+            bar.set_position(progress.bytes_reclaimed);
             info!(
                 pages_reclaimed = progress.pages_reclaimed,
                 bytes_reclaimed = progress.bytes_reclaimed,
@@ -221,6 +218,7 @@ where
             );
         },
     );
+    bar.finish();
     let vacuum_report = match vacuum_report {
         Ok(_) | Err(_) if signals.cancelled() => return Err(interrupted("incremental vacuum")),
         Ok(report) => report,
@@ -543,7 +541,7 @@ mod tests {
     use rusqlite::Connection;
 
     use super::*;
-    use crate::cli::{Cli, Commands, LogFormat, VacuumArgs};
+    use crate::cli::{Cli, Commands, LogMode, VacuumArgs};
     use crate::reclaim::headroom::{FixedFreeSpaceProvider, FreeSpaceProvider};
     use crate::safety::holders::{Completeness, HolderInspector, Inspection, Verdict};
 
@@ -597,11 +595,11 @@ mod tests {
         Cli {
             command: Commands::Vacuum(VacuumArgs {
                 json: false,
-                log_format: LogFormat::Text,
                 incremental: false,
             }),
             db: Some(path.to_owned()),
             channel: None,
+            log: LogMode::Off,
             apply,
             force: false,
             force_schema: false,
@@ -613,7 +611,6 @@ mod tests {
     fn arguments(incremental: bool) -> VacuumArgs {
         VacuumArgs {
             json: false,
-            log_format: LogFormat::Text,
             incremental,
         }
     }

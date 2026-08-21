@@ -319,6 +319,9 @@ fn interrupt_after_committed_batch_produces_exit_eight() {
             "--apply",
             "--dangerously-skip-confirm",
             "--skip-backup",
+            // Diagnostics are off by default; this test observes the committed-batch marker.
+            "--log",
+            "text",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

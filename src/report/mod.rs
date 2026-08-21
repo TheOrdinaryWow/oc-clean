@@ -1,10 +1,12 @@
 //! Stable report model and stdout renderers for analysis commands.
 
 pub mod command;
+pub mod failure;
 mod human;
 pub mod impact;
 mod json;
 pub mod logging;
+pub mod progress;
 
 use std::collections::BTreeMap;
 use std::io::Write;

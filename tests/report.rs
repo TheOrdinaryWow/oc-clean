@@ -122,9 +122,9 @@ mod report {
     }
 
     #[test]
-    fn json_log_format_changes_stderr_without_touching_report_json() {
+    fn json_logging_changes_stderr_without_touching_report_json() {
         let fixture = Fixture::build(&FixtureConfig::default()).unwrap();
-        let output = run(&fixture, &["--json", "--log-format", "json"]);
+        let output = run(&fixture, &["--json", "--log", "json"]);
         assert!(output.status.success());
         serde_json::from_slice::<Value>(&output.stdout).expect("report should remain JSON");
         let diagnostics = String::from_utf8(output.stderr).unwrap();
@@ -135,9 +135,9 @@ mod report {
     }
 
     #[test]
-    fn json_log_format_keeps_the_default_human_report() {
+    fn json_logging_keeps_the_default_human_report() {
         let fixture = Fixture::build(&FixtureConfig::default()).unwrap();
-        let output = run(&fixture, &["--log-format", "json"]);
+        let output = run(&fixture, &["--log", "json"]);
         assert!(output.status.success());
         assert!(stdout(&output).contains("Database File Space"));
         for line in String::from_utf8(output.stderr)
@@ -147,6 +147,19 @@ mod report {
         {
             serde_json::from_str::<Value>(line).expect("each diagnostic should be JSON");
         }
+    }
+
+    #[test]
+    fn diagnostics_stay_silent_unless_logging_is_requested() {
+        let fixture = Fixture::build(&FixtureConfig::default()).unwrap();
+        let output = run(&fixture, &[]);
+        assert!(output.status.success());
+        assert!(stdout(&output).contains("Database File Space"));
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap().trim(),
+            "",
+            "stderr must stay empty while --log is off"
+        );
     }
 }
 

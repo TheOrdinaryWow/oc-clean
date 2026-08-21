@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use oc_clean::cli::{AnalyzeArgs, Cli, Commands, LogFormat};
+use oc_clean::cli::{AnalyzeArgs, Cli, Commands, LogMode};
 use oc_clean::db::{self, ConnectionOptions};
 use oc_clean::delete::sessions::{self, DeleteOptions};
 use oc_clean::paths::Target;
@@ -83,12 +83,12 @@ fn measure_report(database_path: &Path, quick: bool) -> BaselineResult<Duration>
     let cli = Cli {
         command: Commands::Analyze(AnalyzeArgs {
             json: true,
-            log_format: LogFormat::Text,
             top: 10,
             quick,
         }),
         db: Some(database_path.to_owned()),
         channel: None,
+        log: LogMode::Off,
         apply: false,
         force: false,
         force_schema: false,
