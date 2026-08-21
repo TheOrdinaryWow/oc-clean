@@ -15,12 +15,12 @@ use crate::error::Error;
 use crate::parallel;
 use crate::paths::{self, DatabaseOptions, DerivedPaths, Environment, Platform, Target};
 use crate::reclaim::headroom::{FreeSpaceProvider, Fs2FreeSpaceProvider};
-use crate::reclaim::incremental::{check_auto_vacuum, IncrementalVacuumError};
+use crate::reclaim::incremental::{IncrementalVacuumError, check_auto_vacuum};
 use crate::report::format::Style;
 use crate::report::impact::{self, Impact};
 use crate::report::progress;
-use crate::safety::confirm::{confirm, ConfirmationDecision, ConfirmationOptions, ImpactSummary};
-use crate::safety::holders::{inspect_and_decide, CommandMode, GateDecision, HolderInspector};
+use crate::safety::confirm::{ConfirmationDecision, ConfirmationOptions, ImpactSummary, confirm};
+use crate::safety::holders::{CommandMode, GateDecision, HolderInspector, inspect_and_decide};
 use crate::select::orphans::RawOrphans;
 use crate::select::predicates::SessionIds;
 
@@ -29,7 +29,7 @@ use super::output::{self, CleanReport};
 use super::progress::ProgressPhaseObserver;
 use super::selection;
 use super::signal::SignalController;
-use super::{reclaim, PhaseId, PhaseObserver, PhaseOperation};
+use super::{PhaseId, PhaseObserver, PhaseOperation, reclaim};
 
 #[derive(Clone, Copy)]
 pub(super) struct RuntimeContext {
