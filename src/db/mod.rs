@@ -13,7 +13,7 @@ pub mod schema;
 
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 const DEFAULT_CACHE_SIZE: i32 = -64_000;
-static LINK_PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static G_LINK_PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Capabilities discovered for the active SQLite build and database filesystem.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -251,7 +251,7 @@ fn probe_hard_links(database_path: &Path) -> Result<bool, Error> {
     let Some(parent) = database_path.parent() else {
         return Ok(false);
     };
-    let sequence = LINK_PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let sequence = G_LINK_PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let probe_path = parent.join(format!(
         ".oc-clean-link-probe-{}-{sequence}",
         std::process::id()
