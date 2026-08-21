@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use rusqlite::types::ValueRef;
 
 use crate::analyze::{attribution, orphans as orphan_census, space};
-use crate::cli::types::Duration;
-use crate::db::{DatabaseConnection, ReadOnly};
+use crate::cli::types::{Duration, Size};
+use crate::db::DatabaseConnection;
 use crate::error::Error;
 use crate::paths::DerivedPaths;
 use crate::select::orphans;
@@ -99,6 +99,7 @@ pub struct ImpactSelection {
     pub older_than: Option<OlderThanSelection>,
     pub archived: bool,
     pub project: Option<ProjectSelection>,
+    pub larger_than: Option<Size>,
     pub keep_recent: u64,
     pub sweep_orphans: bool,
 }
@@ -194,8 +195,8 @@ struct AssetImpact {
 ///
 /// Returns an infrastructure error when a predicate, aggregation, space query, or filesystem
 /// census cannot be completed.
-pub fn summarize(
-    database: &DatabaseConnection<ReadOnly>,
+pub fn summarize<Access>(
+    database: &DatabaseConnection<Access>,
     paths: &DerivedPaths,
     selection: &ImpactSelection,
 ) -> Result<Impact, Error> {
@@ -272,8 +273,8 @@ pub fn write_human(summary: &ImpactSummary, output: &mut dyn Write) -> io::Resul
     Ok(())
 }
 
-fn plan_selection(
-    database: &DatabaseConnection<ReadOnly>,
+fn plan_selection<Access>(
+    database: &DatabaseConnection<Access>,
     paths: &DerivedPaths,
     selection: &ImpactSelection,
 ) -> Result<PlannedSelection, Error> {
@@ -316,8 +317,8 @@ fn plan_selection(
     })
 }
 
-fn database_impact(
-    database: &DatabaseConnection<ReadOnly>,
+fn database_impact<Access>(
+    database: &DatabaseConnection<Access>,
     paths: &DerivedPaths,
     selection: &ImpactSelection,
     planned: &PlannedSelection,
@@ -370,8 +371,8 @@ fn database_impact(
     })
 }
 
-fn selected_session_payload_bytes(
-    database: &DatabaseConnection<ReadOnly>,
+fn selected_session_payload_bytes<Access>(
+    database: &DatabaseConnection<Access>,
     session_ids: &SessionIds,
 ) -> Result<u64, Error> {
     let session_count = database
@@ -427,8 +428,8 @@ struct TableImpact {
     bytes: u64,
 }
 
-fn candidate_roots(
-    database: &DatabaseConnection<ReadOnly>,
+fn candidate_roots<Access>(
+    database: &DatabaseConnection<Access>,
     selection: &ImpactSelection,
 ) -> Result<(SessionIds, Option<ProjectSelectionImpact>), Error> {
     let mut sets = Vec::new();
@@ -437,6 +438,9 @@ fn candidate_roots(
     }
     if selection.archived {
         sets.push(predicates::archived(database)?);
+    }
+    if let Some(threshold) = selection.larger_than {
+        sets.push(subtree::larger_than(database, threshold)?);
     }
     let project_selection = if let Some(project) = &selection.project {
         let project_sessions =
@@ -456,8 +460,8 @@ fn candidate_roots(
     ))
 }
 
-fn selection_roots(
-    database: &DatabaseConnection<ReadOnly>,
+fn selection_roots<Access>(
+    database: &DatabaseConnection<Access>,
     candidates: &SessionIds,
 ) -> Result<SessionIds, Error> {
     let mut statement = database
@@ -483,8 +487,8 @@ fn selection_roots(
     Ok(roots)
 }
 
-fn projects_emptied_by(
-    database: &DatabaseConnection<ReadOnly>,
+fn projects_emptied_by<Access>(
+    database: &DatabaseConnection<Access>,
     session_ids: &SessionIds,
 ) -> Result<BTreeSet<String>, Error> {
     let mut statement = database
@@ -514,8 +518,8 @@ fn projects_emptied_by(
         .collect())
 }
 
-fn table_impact(
-    database: &DatabaseConnection<ReadOnly>,
+fn table_impact<Access>(
+    database: &DatabaseConnection<Access>,
     specs: &[TableSpec],
     owners: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, TableImpact>, Error> {
@@ -809,6 +813,30 @@ mod tests {
 
         assert_eq!(impact.summary.root_session_count, 1);
         assert_eq!(impact.summary.total_session_count, 2);
+    }
+
+    #[test]
+    fn larger_than_participates_in_the_predicate_intersection() {
+        let fixture = Fixture::build(&FixtureConfig {
+            session_count: 2,
+            blob_size_per_part: 600_000,
+            ..FixtureConfig::default()
+        })
+        .expect("fixture should build");
+        let database = open_fixture(&fixture);
+
+        let impact = summarize(
+            &database,
+            &derived_paths(fixture.root()),
+            &ImpactSelection {
+                archived: true,
+                larger_than: Some("1MB".parse().expect("size should parse")),
+                ..ImpactSelection::default()
+            },
+        )
+        .expect("size impact should succeed");
+
+        assert!(impact.session_ids.is_empty());
     }
 
     #[test]

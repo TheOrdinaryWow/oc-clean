@@ -22,6 +22,19 @@ pub struct VacuumIntoReport {
     pub backup_path: Option<PathBuf>,
 }
 
+/// Observes the atomic filesystem swap boundary without changing the swap algorithm.
+pub trait SwapObserver {
+    /// Enters the signal-deferred section before source sidecars are touched.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed interruption when cancellation was already pending.
+    fn enter(&self) -> Result<(), Error>;
+
+    /// Leaves the signal-deferred section after the rename attempt finishes.
+    fn leave(&self);
+}
+
 /// Rebuilds a locked database into a verified sibling file and atomically replaces the source.
 ///
 /// `locked_data_version` must have been read from `database` immediately after the caller acquired
@@ -45,6 +58,29 @@ pub fn vacuum_into(
         options,
         &SystemFileOperations,
         &NoopHooks,
+    )
+}
+
+/// Rebuilds and swaps a database while reporting the exact atomic swap boundary.
+///
+/// # Errors
+///
+/// Returns the same typed database, integrity, filesystem, and interruption errors as
+/// [`vacuum_into`].
+pub fn vacuum_into_with_observer(
+    database: ReadWriteConnection,
+    database_path: &Path,
+    locked_data_version: i64,
+    options: VacuumIntoOptions,
+    observer: &dyn SwapObserver,
+) -> Result<VacuumIntoReport, Error> {
+    vacuum_into_with_runtime(
+        database,
+        database_path,
+        locked_data_version,
+        options,
+        &SystemFileOperations,
+        &ObserverHooks { observer },
     )
 }
 
@@ -138,6 +174,10 @@ trait SwapHooks {
     }
     fn after_vacuum(&self, _source: &Path, _temporary: &Path) {}
     fn after_lock_closed(&self, _source: &Path, _temporary: &Path) {}
+    fn enter_swap(&self) -> Result<(), Error> {
+        Ok(())
+    }
+    fn leave_swap(&self) {}
     fn backup_created(&self, _backup: &Path) {}
     fn after_rename(&self, _database: &Path) {}
 }
@@ -145,6 +185,20 @@ trait SwapHooks {
 struct NoopHooks;
 
 impl SwapHooks for NoopHooks {}
+
+struct ObserverHooks<'observer> {
+    observer: &'observer dyn SwapObserver,
+}
+
+impl SwapHooks for ObserverHooks<'_> {
+    fn enter_swap(&self) -> Result<(), Error> {
+        self.observer.enter()
+    }
+
+    fn leave_swap(&self) {
+        self.observer.leave();
+    }
+}
 
 struct TemporaryDatabase<'ops, Ops: FileOperations> {
     path: PathBuf,
@@ -197,7 +251,8 @@ fn vacuum_into_with_runtime<Ops: FileOperations, Hooks: SwapHooks>(
     hooks.after_lock_closed(database_path, &temporary.path);
 
     let backup_path = generated_path(database_path, ".bak.", &timestamp)?;
-    let backup_created = swap_critical_section(
+    hooks.enter_swap()?;
+    let swap_result = swap_critical_section(
         database_path,
         &temporary.path,
         &backup_path,
@@ -206,7 +261,9 @@ fn vacuum_into_with_runtime<Ops: FileOperations, Hooks: SwapHooks>(
         options.skip_backup,
         operations,
         hooks,
-    )?;
+    );
+    hooks.leave_swap();
+    let backup_created = swap_result?;
 
     hooks.after_rename(database_path);
     sync_file_and_parent(database_path)?;
@@ -1090,6 +1147,44 @@ mod tests {
         rename_source_was_canonical: AtomicBool,
     }
 
+    struct FailingSidecarRemovalOperations;
+
+    impl FileOperations for FailingSidecarRemovalOperations {
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "db-wal")
+                || path.to_string_lossy().ends_with(".db-wal")
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected sidecar removal failure",
+                ));
+            }
+            fs::remove_file(path)
+        }
+
+        fn hard_link(&self, source: &Path, destination: &Path) -> io::Result<()> {
+            fs::hard_link(source, destination)
+        }
+
+        fn copy(&self, source: &Path, destination: &Path) -> io::Result<u64> {
+            fs::copy(source, destination)
+        }
+
+        fn rename(&self, source: &Path, destination: &Path) -> io::Result<()> {
+            fs::rename(source, destination)
+        }
+    }
+
+    struct EmptySidecarHooks;
+
+    impl SwapHooks for EmptySidecarHooks {
+        fn after_lock_closed(&self, source: &Path, _temporary: &Path) {
+            fs::write(sidecar_path(source, "-wal"), []).expect("empty WAL should be created");
+        }
+    }
+
     impl FailingRenameOperations {
         fn new() -> Self {
             Self {
@@ -1334,6 +1429,29 @@ mod tests {
         assert_eq!(
             directory_names(fixture.path.parent().expect("fixture parent")),
             vec!["rename-failure.db".to_owned()]
+        );
+    }
+
+    #[test]
+    fn sidecar_unlink_failure_aborts_before_swap_and_cleans_temporary_output() {
+        let fixture = Fixture::new("sidecar-unlink-failure.db");
+        let source_hash = content_hash(&fixture.path);
+        let error = run_with(
+            &fixture,
+            VacuumIntoOptions { skip_backup: true },
+            &FailingSidecarRemovalOperations,
+            &EmptySidecarHooks,
+        )
+        .expect_err("injected sidecar removal should fail");
+
+        assert!(matches!(error, Error::Io { .. }));
+        assert_eq!(content_hash(&fixture.path), source_hash);
+        assert_eq!(
+            directory_names(fixture.path.parent().expect("fixture parent")),
+            vec![
+                "sidecar-unlink-failure.db".to_owned(),
+                "sidecar-unlink-failure.db-wal".to_owned(),
+            ]
         );
     }
 

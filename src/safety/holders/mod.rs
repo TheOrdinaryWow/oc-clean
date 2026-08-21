@@ -126,7 +126,21 @@ pub fn inspect_and_decide(
     command: CommandMode,
     force: bool,
 ) -> (Inspection, GateDecision) {
-    let inspection = inspector.inspect(database_path);
+    let mut inspection = inspector.inspect(database_path);
+    if let Verdict::Held(holders) = &mut inspection.verdict {
+        holders.retain(|holder| holder.pid != std::process::id());
+        if holders.is_empty() {
+            inspection.verdict = match inspection.completeness {
+                Completeness::CompleteForVisibleProcesses => Verdict::NotHeld,
+                Completeness::PartialDueToPermissions | Completeness::Unsupported => {
+                    Verdict::CannotDetermine(
+                        "holder inspection could not establish whether another process holds the database"
+                            .to_owned(),
+                    )
+                }
+            };
+        }
+    }
     let destructive = matches!(
         command,
         CommandMode::Clean { apply: true } | CommandMode::Vacuum { apply: true }

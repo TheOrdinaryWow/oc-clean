@@ -1,6 +1,6 @@
 use thiserror::Error as ThisError;
 
-use crate::db::ReadWriteConnection;
+use crate::db::{DatabaseConnection, ReadWriteConnection};
 
 /// Default maximum number of freelist pages requested from SQLite per batch.
 pub const DEFAULT_PAGES_PER_BATCH: u32 = 256;
@@ -58,7 +58,9 @@ pub enum IncrementalVacuumError {
 /// Returns [`IncrementalVacuumError::AutoVacuumNotIncremental`] when the existing database does
 /// not already report mode `2`, or [`IncrementalVacuumError::Sqlite`] when SQLite cannot read the
 /// pragma.
-pub fn check_auto_vacuum(database: &ReadWriteConnection) -> Result<(), IncrementalVacuumError> {
+pub fn check_auto_vacuum<Access>(
+    database: &DatabaseConnection<Access>,
+) -> Result<(), IncrementalVacuumError> {
     let actual_mode = database
         .connection()
         .pragma_query_value(None, "auto_vacuum", |row| row.get(0))

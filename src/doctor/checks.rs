@@ -16,7 +16,7 @@ const YEAR_2100_SECONDS: i64 = 4_102_444_800;
 const YEAR_2020_MILLISECONDS: i64 = YEAR_2020_SECONDS * 1_000;
 const YEAR_2100_MILLISECONDS: i64 = YEAR_2100_SECONDS * 1_000;
 
-pub(super) fn integrity_check(connection: &Connection) -> Result<CheckReport, Error> {
+pub(crate) fn integrity_check(connection: &Connection) -> Result<CheckReport, Error> {
     let findings = string_rows(
         connection,
         "PRAGMA integrity_check",
@@ -27,7 +27,7 @@ pub(super) fn integrity_check(connection: &Connection) -> Result<CheckReport, Er
     Ok(CheckReport { ok, findings })
 }
 
-pub(super) fn foreign_key_check(connection: &Connection) -> Result<ForeignKeyReport, Error> {
+pub(crate) fn foreign_key_check(connection: &Connection) -> Result<ForeignKeyReport, Error> {
     let mut statement = connection
         .prepare("PRAGMA foreign_key_check")
         .map_err(|source| sqlite_error("preparing PRAGMA foreign_key_check", source))?;

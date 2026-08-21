@@ -18,6 +18,7 @@ fn initialize_logging(cli: &Cli) -> Result<(), Error> {
             report::logging::init(arguments.log_format, !arguments.json)
         }
         Commands::Doctor(_) => report::logging::init(oc_clean::cli::LogFormat::Text, false),
+        Commands::Clean(arguments) => report::logging::init(arguments.log_format, !arguments.json),
         Commands::Vacuum(arguments) => report::logging::init(arguments.log_format, !arguments.json),
     }
 }
@@ -33,6 +34,11 @@ fn dispatch(cli: &Cli) -> Result<(), Error> {
             let stdout = std::io::stdout();
             let mut output = stdout.lock();
             doctor::command::run(cli, arguments, &mut output)
+        }
+        Commands::Clean(arguments) => {
+            let stdout = std::io::stdout();
+            let mut output = stdout.lock();
+            oc_clean::clean::command::run(cli, arguments, &mut output)
         }
         Commands::Vacuum(arguments) => {
             let stdout = std::io::stdout();

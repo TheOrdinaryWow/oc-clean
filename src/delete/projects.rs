@@ -4,6 +4,7 @@ use rusqlite::{Transaction, TransactionBehavior};
 
 use crate::db::{DatabaseConnection, ReadWrite};
 use crate::error::Error;
+use crate::select::predicates::SessionIds;
 
 const DELETE_EMPTY_PROJECTS_SQL: &str = r"
 DELETE FROM project
@@ -25,6 +26,46 @@ RETURNING id
 
 /// A deterministic set of project identifiers.
 pub type ProjectIds = BTreeSet<String>;
+
+/// Returns project owners for sessions before those sessions are deleted.
+///
+/// # Errors
+///
+/// Returns a typed SQLite error when the ownership query fails.
+pub fn owners_of_sessions(
+    database: &DatabaseConnection<ReadWrite>,
+    session_ids: &SessionIds,
+) -> Result<ProjectIds, Error> {
+    let mut owners = ProjectIds::new();
+    let mut statement = database
+        .connection()
+        .prepare("SELECT project_id FROM session WHERE id = ?1")
+        .map_err(|source| sqlite_error("preparing deleted-session project owners", source))?;
+    for session_id in session_ids {
+        let project_id = statement
+            .query_row([session_id], |row| row.get::<_, String>(0))
+            .map_err(|source| sqlite_error("reading deleted-session project owner", source))?;
+        owners.insert(project_id);
+    }
+    Ok(owners)
+}
+
+/// Returns every current project identifier.
+///
+/// # Errors
+///
+/// Returns a typed SQLite error when the project census fails.
+pub fn all_ids(database: &DatabaseConnection<ReadWrite>) -> Result<ProjectIds, Error> {
+    let mut statement = database
+        .connection()
+        .prepare("SELECT id FROM project ORDER BY id")
+        .map_err(|source| sqlite_error("preparing project census", source))?;
+    statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|source| sqlite_error("querying project census", source))?
+        .collect::<Result<ProjectIds, _>>()
+        .map_err(|source| sqlite_error("reading project census", source))
+}
 
 /// Prunes projects that are empty after session deletion.
 ///

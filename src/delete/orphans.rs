@@ -46,6 +46,23 @@ pub fn delete(
     raw_orphans: &RawOrphans,
     options: OrphanDeleteOptions,
 ) -> Result<OrphanDeletionReport, Error> {
+    delete_with_progress(database, raw_orphans, options, |_| true)
+}
+
+/// Deletes orphan batches and reports every committed batch to the caller.
+///
+/// # Errors
+///
+/// Returns the same typed failures as [`delete`].
+pub fn delete_with_progress<Progress>(
+    database: &DatabaseConnection<ReadWrite>,
+    raw_orphans: &RawOrphans,
+    options: OrphanDeleteOptions,
+    mut batch_committed: Progress,
+) -> Result<OrphanDeletionReport, Error>
+where
+    Progress: FnMut(&DeletionReport) -> bool,
+{
     let retained = retention::compute(database, options.keep_recent)?;
     let mut report = OrphanDeletionReport::default();
     let event_aggregate_ids = raw_orphans
@@ -57,7 +74,12 @@ pub fn delete(
         .collect::<SessionIds>();
     merge_deletion_report(
         &mut report.deletion,
-        sessions::delete(database, &event_aggregate_ids, options.deletion)?,
+        sessions::delete_with_progress(
+            database,
+            &event_aggregate_ids,
+            options.deletion,
+            &mut batch_committed,
+        )?,
     );
 
     let mut candidates = raw_orphans
@@ -75,7 +97,12 @@ pub fn delete(
         }
         merge_deletion_report(
             &mut report.deletion,
-            sessions::delete(database, &dangling, options.deletion)?,
+            sessions::delete_with_progress(
+                database,
+                &dangling,
+                options.deletion,
+                &mut batch_committed,
+            )?,
         );
         candidates.retain(|id| !dangling.contains(id));
         report.dangling_passes = report.dangling_passes.saturating_add(1);
@@ -119,6 +146,9 @@ fn merge_deletion_report(target: &mut DeletionReport, source: DeletionReport) {
             .or_insert(rows);
     }
     target.transactions = target.transactions.saturating_add(source.transactions);
+    target
+        .deleted_session_ids
+        .extend(source.deleted_session_ids);
 }
 
 fn sqlite_error(context: &str, source: rusqlite::Error) -> Error {

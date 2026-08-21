@@ -60,6 +60,9 @@ pub enum Error {
         available_bytes: u64,
     },
 
+    #[error("database reclaim strategy is unavailable: {reason}")]
+    ReclaimUnavailable { reason: String },
+
     #[error("SQLite {check} failed: {message}")]
     IntegrityCheckFailed { check: String, message: String },
 
@@ -113,7 +116,7 @@ impl Error {
             Self::NotFound { .. } => 3,
             Self::SchemaIncompatible { .. } => 4,
             Self::DatabaseBusy { .. } => 5,
-            Self::InsufficientDiskSpace { .. } => 6,
+            Self::InsufficientDiskSpace { .. } | Self::ReclaimUnavailable { .. } => 6,
             Self::IntegrityCheckFailed { .. } => 7,
             Self::Interrupted { .. } => 8,
             Self::UnsupportedPlatform { .. } => 9,
@@ -209,6 +212,14 @@ mod tests {
                 "2000",
             ),
             (
+                "reclaim_unavailable",
+                Error::ReclaimUnavailable {
+                    reason: "incremental auto-vacuum is disabled".to_owned(),
+                },
+                6,
+                "incremental auto-vacuum",
+            ),
+            (
                 "integrity_check_failed",
                 Error::IntegrityCheckFailed {
                     check: "foreign_key_check".to_owned(),
@@ -287,7 +298,7 @@ mod tests {
         assert!(
             names_by_code
                 .iter()
-                .all(|(&code, names)| code == 1 || names.len() == 1)
+                .all(|(&code, names)| code == 1 || code == 6 || names.len() == 1)
         );
     }
 

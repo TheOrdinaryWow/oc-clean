@@ -89,6 +89,7 @@ impl Default for DeleteOptions {
 pub struct DeletionReport {
     pub table_rows: BTreeMap<String, u64>,
     pub transactions: u64,
+    pub deleted_session_ids: SessionIds,
 }
 
 impl Default for DeletionReport {
@@ -99,6 +100,7 @@ impl Default for DeletionReport {
                 .map(|table| (table.table.to_owned(), 0))
                 .collect(),
             transactions: 0,
+            deleted_session_ids: SessionIds::new(),
         }
     }
 }
@@ -154,6 +156,25 @@ pub fn delete(
     session_ids: &SessionIds,
     options: DeleteOptions,
 ) -> Result<DeletionReport, Error> {
+    delete_with_progress(database, session_ids, options, |_| true)
+}
+
+/// Deletes sessions in bounded transactions and reports every committed batch to the caller.
+///
+/// Returning `false` from `batch_committed` stops before the next transaction.
+///
+/// # Errors
+///
+/// Returns the same typed failures as [`delete`].
+pub fn delete_with_progress<Progress>(
+    database: &DatabaseConnection<ReadWrite>,
+    session_ids: &SessionIds,
+    options: DeleteOptions,
+    mut batch_committed: Progress,
+) -> Result<DeletionReport, Error>
+where
+    Progress: FnMut(&DeletionReport) -> bool,
+{
     let batch_size = validate_options(options)?;
     ensure_foreign_keys(database.connection())?;
     let batcher = TempIdBatcher::materialize(
@@ -167,6 +188,7 @@ pub fn delete(
         let Some(transaction) = batcher.begin_batch(batch_size)? else {
             break;
         };
+        let batch_ids = batch_session_ids(&transaction)?;
         deadline.ensure_remaining()?;
         accumulate_counts(&transaction, &mut report)?;
         deadline.ensure_remaining()?;
@@ -185,9 +207,24 @@ pub fn delete(
         drop(deadline);
         checkpoint_wal(database.connection())?;
         report.transactions = report.transactions.saturating_add(1);
+        report.deleted_session_ids.extend(batch_ids);
+        if !batch_committed(&report) {
+            break;
+        }
     }
 
     Ok(report)
+}
+
+fn batch_session_ids(transaction: &rusqlite::Transaction<'_>) -> Result<SessionIds, Error> {
+    let mut statement = transaction
+        .prepare("SELECT id FROM batch_ids ORDER BY id")
+        .map_err(|source| sqlite_error("preparing committed session ids", source))?;
+    statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|source| sqlite_error("querying committed session ids", source))?
+        .collect::<Result<SessionIds, _>>()
+        .map_err(|source| sqlite_error("reading committed session ids", source))
 }
 
 fn validate_options(options: DeleteOptions) -> Result<i64, Error> {
