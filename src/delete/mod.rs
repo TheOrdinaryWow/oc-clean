@@ -2,6 +2,7 @@ use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use crate::error::Error;
 
+pub mod orphans;
 pub mod projects;
 pub mod sessions;
 
