@@ -1,5 +1,7 @@
 # oc-clean
 
+English | [Simplified Chinese](README.zh.md)
+
 `oc-clean` is a Rust command-line utility for inspecting, pruning, and compacting OpenCode's SQLite database and its associated storage. It provides read-only analysis and diagnostics, dry-run cleanup planning, bounded session deletion, orphan cleanup, snapshot garbage collection, and database space reclamation.
 
 ## Why This Exists
