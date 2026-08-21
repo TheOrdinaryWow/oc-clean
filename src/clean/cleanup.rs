@@ -52,10 +52,7 @@ impl CleanupOutcome {
         database: &DatabaseConnection<ReadWrite>,
         paths: &DerivedPaths,
     ) {
-        match snapshot::remove_orphaned(database, &paths.snapshot) {
-            Ok(report) => self.record_removal(report),
-            Err(error) => self.partial_failures.push(error.to_string()),
-        }
+        self.remove_orphaned(database, paths);
         match storage::sweep(database, &paths.storage, SweepScope::AllOrphans) {
             Ok(report) => self.record_sweep(report),
             Err(error) => self.partial_failures.push(error.to_string()),

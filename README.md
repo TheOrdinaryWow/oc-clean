@@ -125,25 +125,26 @@ The table is the complete set of long flags defined by the current clap interfac
 | Global | `--force-schema` | CLI only | Downgrade Tier 3 schema-semantic findings to warnings; Tier 1 remains mandatory and Tier 2 is already tolerated. |
 | Global | `--dangerously-skip-confirm` | CLI only | Bypass the interactive confirmation required by applied `clean` and `vacuum`, including JSON and piped execution. |
 | Global | `--skip-backup` | CLI only | Remove the temporary rollback copy after a successful full rebuild instead of retaining the default `.bak` file. |
-| analyze | `--json` | CLI only | Emit one stable JSON report on stdout. |
-| analyze | `--log-format <LOG_FORMAT>` | CLI only | Select `text` or `json` diagnostics on stderr; default is `text`. |
-| analyze | `--top <N>` | CLI only | Limit the largest-session rollup; default is `10`. |
-| analyze | `--quick` | CLI only | Emit file accounting and row counts without full distributions and rollups. |
-| doctor | `--json` | CLI only | Emit one stable JSON diagnostic report on stdout. |
-| clean | `--older-than <AGE>` | CLI only | Select session subtrees whose latest activity is at least this coarse age. |
-| clean | `--project <PATH_OR_GLOB>` | CLI only | Select sessions belonging to an exact project path or glob. |
-| clean | `--larger-than <SIZE>` | CLI only | Select session subtrees whose attributable payload reaches this decimal size. |
-| clean | `--archived` | CLI only | Select archived sessions. |
-| clean | `--orphans` | CLI only | Include session-shaped orphan events, dangling sessions, and orphan external storage. |
-| clean | `--keep-recent <N>` | CLI only | Retain this many recently active root sessions per project; default is `100`. |
-| clean | `--incremental` | CLI only | Reclaim free pages with incremental vacuum on a database already using `auto_vacuum=INCREMENTAL`. |
-| clean | `--no-vacuum` | CLI only | Commit selected deletion and skip page reclamation. |
-| clean | `--gc-snapshots` | CLI only | Compact retained snapshot repositories after cleanup. |
-| clean | `--json` | CLI only | Emit the cleanup report as JSON on stdout. |
-| clean | `--log-format <LOG_FORMAT>` | CLI only | Select `text` or `json` diagnostics on stderr; default is `text`. |
-| vacuum | `--json` | CLI only | Emit the vacuum report as JSON on stdout. |
-| vacuum | `--log-format <LOG_FORMAT>` | CLI only | Select `text` or `json` diagnostics on stderr; default is `text`. |
-| vacuum | `--incremental` | CLI only | Reclaim freelist pages with incremental vacuum instead of a full rebuild. |
+| analyze | `--json` | `OCC_JSON` | Emit one stable JSON report on stdout. |
+| analyze | `--log-format <LOG_FORMAT>` | `OCC_LOG_FORMAT` | Select `text` or `json` diagnostics on stderr; default is `text`. |
+| analyze | `--top <N>` | `OCC_TOP` | Limit the largest-session rollup; default is `10`. |
+| analyze | `--quick` | `OCC_QUICK` | Emit file accounting and row counts without full distributions and rollups. |
+| doctor | `--json` | `OCC_JSON` | Emit one stable JSON diagnostic report on stdout. |
+| clean | `--older-than <AGE>` | `OCC_OLDER_THAN` | Select session subtrees whose latest activity is at least this coarse age. |
+| clean | `--project <PATH_OR_GLOB>` | `OCC_PROJECT` | Select sessions belonging to an exact project path or glob. |
+| clean | `--larger-than <SIZE>` | `OCC_LARGER_THAN` | Select session subtrees whose attributable payload reaches this decimal size. |
+| clean | `--archived` | `OCC_ARCHIVED` | Select archived sessions. |
+| clean | `--orphans` | `OCC_ORPHANS` | Include session-shaped orphan events, dangling sessions, and orphan external storage. |
+| clean | `--keep-recent <N>` | `OCC_KEEP_RECENT` | Retain this many recently active root sessions per project; default is `100`. |
+| clean | `--incremental` | `OCC_INCREMENTAL` | Reclaim free pages with incremental vacuum on a database already using `auto_vacuum=INCREMENTAL`. |
+| clean | `--no-vacuum` | `OCC_NO_VACUUM` | Commit selected deletion and skip page reclamation. |
+| clean | `--gc-snapshots` | `OCC_GC_SNAPSHOTS` | Compact retained snapshot repositories after cleanup. |
+| clean | `--prune-empty-projects` | `OCC_PRUNE_EMPTY_PROJECTS` | Also prune projects that were already empty before cleanup. |
+| clean | `--json` | `OCC_JSON` | Emit the cleanup report as JSON on stdout. |
+| clean | `--log-format <LOG_FORMAT>` | `OCC_LOG_FORMAT` | Select `text` or `json` diagnostics on stderr; default is `text`. |
+| vacuum | `--json` | `OCC_JSON` | Emit the vacuum report as JSON on stdout. |
+| vacuum | `--log-format <LOG_FORMAT>` | `OCC_LOG_FORMAT` | Select `text` or `json` diagnostics on stderr; default is `text`. |
+| vacuum | `--incremental` | `OCC_INCREMENTAL` | Reclaim freelist pages with incremental vacuum instead of a full rebuild. |
 
 ## Environment Variables
 

@@ -202,7 +202,11 @@ where
     }
 
     phase(observer, PhaseId::P14);
-    let pruned_projects = projects::prune(&database, &affected_projects, false)?;
+    let pruned_projects = projects::prune(
+        &database,
+        &affected_projects,
+        arguments.prune_empty_projects,
+    )?;
     let combined = combine_reports(
         &session_report,
         orphan_report.as_ref().unwrap_or(&DeletionReport::default()),
@@ -233,7 +237,6 @@ where
     stop_after_delete_if_cancelled(&combined, arguments, output, signals)?;
     phase(observer, PhaseId::P17);
     cleanup.remove_pruned(&paths, &pruned_projects);
-    cleanup.remove_orphaned(&database, &paths);
     stop_after_delete_if_cancelled(&combined, arguments, output, signals)?;
     if arguments.orphans {
         phase(observer, PhaseId::P17b);

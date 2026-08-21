@@ -1,10 +1,13 @@
 use std::cell::RefCell;
+use std::ffi::OsString;
 use std::io::Cursor;
 use std::path::Path;
 
 use crate::cli::{CleanArgs, Cli, Commands, LogFormat};
 use crate::reclaim::headroom::FreeSpaceProvider;
 use crate::safety::holders::{Completeness, HolderInspector, Inspection, Verdict};
+use clap::Parser;
+use rusqlite::Connection;
 
 use super::command::{RuntimeContext, run_with};
 use super::signal::SignalController;
@@ -63,6 +66,7 @@ fn arguments(incremental: bool) -> CleanArgs {
         incremental,
         no_vacuum: false,
         gc_snapshots: true,
+        prune_empty_projects: false,
         json: false,
         log_format: LogFormat::Text,
     }
@@ -180,6 +184,118 @@ fn exact_phase_order_covers_default_and_conditional_paths() {
             PhaseId::P21,
         ]
     );
+}
+
+fn run_project_pruning(prune_empty_projects: bool) -> (Fixture, Vec<String>) {
+    let fixture = Fixture::build(&FixtureConfig {
+        project_count: 2,
+        session_count: 1,
+        archived_session_count: 1,
+        ..FixtureConfig::default()
+    })
+    .expect("fixture should build");
+    let mut argv = vec![
+        OsString::from("oc-clean"),
+        OsString::from("--db"),
+        fixture.database_path.as_os_str().to_owned(),
+        OsString::from("--apply"),
+        OsString::from("--dangerously-skip-confirm"),
+        OsString::from("clean"),
+        OsString::from("--archived"),
+        OsString::from("--keep-recent"),
+        OsString::from("0"),
+        OsString::from("--no-vacuum"),
+    ];
+    if prune_empty_projects {
+        argv.push(OsString::from("--prune-empty-projects"));
+    }
+    let cli = Cli::try_parse_from(argv).expect("clean arguments should parse");
+    let Commands::Clean(arguments) = &cli.command else {
+        panic!("clean command should parse");
+    };
+    run_with(
+        &cli,
+        arguments,
+        &mut Cursor::new(Vec::<u8>::new()),
+        &mut Vec::new(),
+        &UnlimitedSpace,
+        &NotHeldInspector,
+        RuntimeContext {
+            stdin_is_terminal: false,
+            stdout_is_terminal: false,
+        },
+        &SignalController::new(),
+        &Recorder::default(),
+    )
+    .expect("applied clean should succeed");
+    let connection = fixture.connect().expect("fixture should reconnect");
+    let projects = connection
+        .prepare("SELECT id FROM project ORDER BY id")
+        .expect("project query should prepare")
+        .query_map([], |row| row.get(0))
+        .expect("project query should execute")
+        .collect::<Result<Vec<String>, _>>()
+        .expect("project ids should decode");
+    drop(connection);
+    (fixture, projects)
+}
+
+#[test]
+fn prune_empty_projects_extends_pruning_to_preexisting_empty_projects() {
+    let (default_fixture, default_projects) = run_project_pruning(false);
+    assert_eq!(default_projects, ["project-1"]);
+    assert!(!default_fixture.snapshot_dir.join("project-0").exists());
+    assert!(default_fixture.snapshot_dir.join("project-1").is_dir());
+
+    let (explicit_fixture, explicit_projects) = run_project_pruning(true);
+    assert_eq!(explicit_projects, Vec::<String>::new());
+    assert!(!explicit_fixture.snapshot_dir.join("project-0").exists());
+    assert!(!explicit_fixture.snapshot_dir.join("project-1").exists());
+}
+
+fn orphan_snapshot_survives_cleanup(orphans: bool) -> bool {
+    let fixture = Fixture::build(&FixtureConfig {
+        session_count: 1,
+        archived_session_count: 1,
+        orphan_snapshot_dir_count: 1,
+        ..FixtureConfig::default()
+    })
+    .expect("fixture should build");
+    let orphan = fixture
+        .orphan_snapshot_dirs
+        .first()
+        .expect("orphan snapshot should exist")
+        .clone();
+    let arguments = CleanArgs {
+        orphans,
+        gc_snapshots: false,
+        no_vacuum: true,
+        ..arguments(false)
+    };
+    let cli = cli(&fixture.database_path, false);
+    run_with(
+        &cli,
+        &arguments,
+        &mut Cursor::new(Vec::<u8>::new()),
+        &mut Vec::new(),
+        &UnlimitedSpace,
+        &NotHeldInspector,
+        RuntimeContext {
+            stdin_is_terminal: false,
+            stdout_is_terminal: false,
+        },
+        &SignalController::new(),
+        &Recorder::default(),
+    )
+    .expect("applied clean should succeed");
+    assert!(Connection::open(&fixture.database_path).is_ok());
+    orphan.is_dir()
+}
+
+#[test]
+fn preexisting_orphan_snapshots_require_the_orphans_selector() {
+    assert!(orphan_snapshot_survives_cleanup(false));
+    assert!(!orphan_snapshot_survives_cleanup(true));
 }
 
 #[test]
