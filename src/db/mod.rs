@@ -8,6 +8,7 @@ use std::fs::File;
 use std::io::{self, Seek};
 use std::marker::PhantomData;
 #[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

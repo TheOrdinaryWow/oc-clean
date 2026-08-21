@@ -796,7 +796,11 @@ fn rollback_after_verification_failure<Ops: FileOperations>(
 }
 
 fn sync_file_and_parent(path: &Path) -> Result<(), Error> {
-    fs::File::open(path)
+    // Flushing needs a writable handle: Windows denies FlushFileBuffers on a read-only handle,
+    // while unix accepts fsync on either.
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
         .and_then(|file| file.sync_all())
         .map_err(|source| io_error(path, source))?;
     sync_parent_directory(path)
