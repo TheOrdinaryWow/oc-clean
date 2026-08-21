@@ -8,7 +8,7 @@ use crate::db::{DatabaseConnection, ReadWrite};
 use crate::error::Error;
 use crate::select::predicates::SessionIds;
 
-const DEFAULT_BATCH_SIZE: usize = 2_500;
+pub(crate) const DEFAULT_BATCH_SIZE: usize = 2_500;
 const DEFAULT_BATCH_TIME_LIMIT: Duration = Duration::from_secs(30);
 const PROGRESS_HANDLER_OPS: i32 = 1_000;
 const DELETE_SESSION_SQL: &str = "DELETE FROM session WHERE id IN (SELECT id FROM batch_ids)";
@@ -188,7 +188,7 @@ where
         let Some(transaction) = batcher.begin_batch(batch_size)? else {
             break;
         };
-        let batch_ids = batch_session_ids(&transaction)?;
+        let batch_ids = batch_existing_session_ids(&transaction)?;
         deadline.ensure_remaining()?;
         accumulate_counts(&transaction, &mut report)?;
         deadline.ensure_remaining()?;
@@ -216,9 +216,34 @@ where
     Ok(report)
 }
 
-fn batch_session_ids(transaction: &rusqlite::Transaction<'_>) -> Result<SessionIds, Error> {
+pub(super) fn delete_event_aggregates_with_progress<Progress>(
+    database: &DatabaseConnection<ReadWrite>,
+    aggregate_ids: &SessionIds,
+    options: DeleteOptions,
+    mut batch_committed: Progress,
+) -> Result<DeletionReport, Error>
+where
+    Progress: FnMut(&DeletionReport) -> bool,
+{
+    let mut report = delete_with_progress(database, aggregate_ids, options, |report| {
+        let mut aggregate_report = report.clone();
+        aggregate_report.deleted_session_ids.clear();
+        batch_committed(&aggregate_report)
+    })?;
+    report.deleted_session_ids.clear();
+    Ok(report)
+}
+
+fn batch_existing_session_ids(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<SessionIds, Error> {
     let mut statement = transaction
-        .prepare("SELECT id FROM batch_ids ORDER BY id")
+        .prepare(
+            "SELECT batch_ids.id
+             FROM batch_ids
+             INNER JOIN session ON session.id = batch_ids.id
+             ORDER BY batch_ids.id",
+        )
         .map_err(|source| sqlite_error("preparing committed session ids", source))?;
     statement
         .query_map([], |row| row.get::<_, String>(0))
