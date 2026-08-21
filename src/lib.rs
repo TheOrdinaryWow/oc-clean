@@ -1,6 +1,7 @@
 pub mod analyze;
 pub mod cli;
 pub mod db;
+pub mod delete;
 pub mod doctor;
 pub mod error;
 pub mod paths;
