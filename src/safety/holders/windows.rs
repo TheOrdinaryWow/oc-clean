@@ -19,6 +19,10 @@ use super::{
 pub struct WindowsHolderInspector;
 
 impl HolderInspector for WindowsHolderInspector {
+    #[expect(
+        unsafe_code,
+        reason = "Restart Manager is a C API and holder detection has no safe Windows equivalent"
+    )]
     fn inspect(&self, database_path: &Path) -> Inspection {
         let mut session_handle = 0;
         let mut session_key = vec![0_u16; CCH_RM_SESSION_KEY as usize + 1];
@@ -44,6 +48,10 @@ impl HolderInspector for WindowsHolderInspector {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "Restart Manager is a C API and holder detection has no safe Windows equivalent"
+)]
 fn inspect_session(session_handle: u32, database_path: &Path) -> Inspection {
     let targets = database_related_paths(database_path);
     let wide_paths = targets
