@@ -1,7 +1,8 @@
 use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
+use std::fs;
 use std::io::Cursor;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::cli::{CleanArgs, Cli, Commands, LogFormat};
 use crate::reclaim::headroom::FreeSpaceProvider;
@@ -43,6 +44,23 @@ struct FixedSpace(u64);
 impl FreeSpaceProvider for FixedSpace {
     fn available_space(&self, _directory: &Path) -> std::io::Result<u64> {
         Ok(self.0)
+    }
+}
+
+struct StorageMutationObserver {
+    path: PathBuf,
+    bytes: u64,
+}
+
+impl PhaseObserver for StorageMutationObserver {
+    fn entered(&self, phase: PhaseId) {
+        if phase == PhaseId::P9 {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&self.path)
+                .and_then(|file| file.set_len(self.bytes))
+                .expect("storage mutation at P9 should succeed");
+        }
     }
 }
 
@@ -178,6 +196,7 @@ fn exact_phase_order_covers_default_and_conditional_paths() {
             PhaseId::P6,
             PhaseId::P7,
             PhaseId::P8,
+            PhaseId::P9,
             PhaseId::P10,
             PhaseId::P11,
             PhaseId::P12,
@@ -191,6 +210,51 @@ fn exact_phase_order_covers_default_and_conditional_paths() {
             PhaseId::P20,
             PhaseId::P21,
         ]
+    );
+}
+
+#[test]
+fn p9_precedes_impact_summary_work() {
+    const MUTATED_STORAGE_BYTES: u64 = 16 * 1_024 * 1_024;
+
+    let fixture = fixture(false);
+    let mut cli = cli(&fixture.database_path, false);
+    cli.apply = false;
+    let mut arguments = arguments(false);
+    arguments.json = true;
+    let storage_path = fixture
+        .storage_dir
+        .join("session")
+        .join(format!("{}.json", fixture.session_ids[0]));
+    let observer = StorageMutationObserver {
+        path: storage_path,
+        bytes: MUTATED_STORAGE_BYTES,
+    };
+    let mut output = Vec::new();
+
+    run_with(
+        &cli,
+        &arguments,
+        &mut Cursor::new(Vec::<u8>::new()),
+        &mut output,
+        &UnlimitedSpace,
+        &NotHeldInspector,
+        RuntimeContext {
+            stdin_is_terminal: false,
+            stdout_is_terminal: false,
+        },
+        &SignalController::new(),
+        &observer,
+    )
+    .expect("dry-run should succeed");
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&output).expect("dry-run output should be JSON");
+    assert!(
+        report["impact"]["total_bytes"]
+            .as_u64()
+            .expect("total bytes should be numeric")
+            >= MUTATED_STORAGE_BYTES
     );
 }
 

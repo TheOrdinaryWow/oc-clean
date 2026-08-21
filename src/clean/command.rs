@@ -158,6 +158,7 @@ where
     observer.performing(PhaseId::P8, PhaseOperation::DescendantExpansion);
     let selected = selection::expand_candidates(&database, &candidates, &retained)?;
 
+    phase(observer, PhaseId::P9);
     let impact = impact::summarize(
         &database,
         &paths,
@@ -166,7 +167,6 @@ where
     if !arguments.incremental && !arguments.no_vacuum {
         let mut deletion_batch_ids = impact.session_ids.clone();
         deletion_batch_ids.extend(impact.orphan_event_aggregate_ids.iter().cloned());
-        phase(observer, PhaseId::P9);
         reclaim::pre_delete_headroom(
             database_path,
             &pre_delete_space,
