@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -8,10 +8,102 @@ use std::time::Duration;
 use rusqlite::Connection;
 
 use super::fixture::{Fixture, FixtureConfig};
+#[cfg(target_os = "linux")]
+use super::holder::HoldingChild;
 use super::support::{
     assert_code, binary, command, file_hash, insert_foreign_key_violation,
     make_partial_success_fixture, row_count,
 };
+
+#[cfg(target_os = "linux")]
+#[test]
+fn clean_with_real_holder_preserves_preview_and_refuses_apply() {
+    let fixture = Fixture::build(&FixtureConfig::default()).expect("fixture should build");
+    let before_hash = file_hash(&fixture.database_path);
+    let before_sessions = row_count(&fixture.database_path, "session");
+    let _holder = HoldingChild::spawn(&fixture.database_path);
+
+    let preview = command(&fixture, "clean")
+        .args(["--archived", "--keep-recent", "0", "--json"])
+        .output()
+        .expect("clean preview should run");
+
+    assert_code(&preview, 0);
+    assert_eq!(file_hash(&fixture.database_path), before_hash);
+    assert_eq!(
+        row_count(&fixture.database_path, "session"),
+        before_sessions
+    );
+
+    let apply = command(&fixture, "clean")
+        .args([
+            "--archived",
+            "--keep-recent",
+            "0",
+            "--apply",
+            "--dangerously-skip-confirm",
+            "--json",
+        ])
+        .output()
+        .expect("clean apply should run");
+
+    assert_code(&apply, 5);
+    assert_eq!(file_hash(&fixture.database_path), before_hash);
+    assert_eq!(
+        row_count(&fixture.database_path, "session"),
+        before_sessions
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn unsupported_platform_binary_produces_exit_nine() {
+    let fixture = Fixture::build(&FixtureConfig::default()).expect("fixture should build");
+    let directory = tempfile::tempdir().expect("temporary directory should create");
+    let injected_binary = directory.path().join("oc-clean-unsupported-platform");
+    fs::copy(env!("CARGO_BIN_EXE_oc-clean"), &injected_binary)
+        .expect("compiled binary should copy");
+    inject_unsupported_platform(&injected_binary);
+
+    let output = Command::new(injected_binary)
+        .arg("analyze")
+        .arg("--db")
+        .arg(&fixture.database_path)
+        .arg("--json")
+        .env_remove("NO_COLOR")
+        .env_remove("OCC_DB")
+        .output()
+        .expect("injected compiled binary should run");
+
+    assert_code(&output, 9);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(std::env::consts::OS),
+        "stderr should identify the unsupported target: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+fn inject_unsupported_platform(path: &std::path::Path) {
+    // Rust deduplicates the host OS constant and its first match literal. Flip the copied
+    // binary's first equality branch so the unchanged production fallback receives the real OS.
+    const FIRST_PLATFORM_MATCH: &[u8] = &[0xa8, 0x01, 0x75, 0x21, 0x48, 0x8d];
+    let mut image = fs::read(path).expect("compiled binary should read");
+    let positions = image
+        .windows(FIRST_PLATFORM_MATCH.len())
+        .enumerate()
+        .filter_map(|(index, bytes)| (bytes == FIRST_PLATFORM_MATCH).then_some(index))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        positions.len(),
+        4,
+        "compiled binary should contain one first-platform branch per command"
+    );
+    for position in positions {
+        image[position + 2] = 0x74;
+    }
+    fs::write(path, image).expect("injected compiled binary should write");
+}
 
 #[test]
 fn malformed_database_produces_exit_one() {

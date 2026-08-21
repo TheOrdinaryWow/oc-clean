@@ -2,6 +2,10 @@
 #[path = "support/fixture.rs"]
 mod fixture;
 
+#[cfg(target_os = "linux")]
+#[path = "support/holder.rs"]
+mod holder;
+
 #[path = "e2e/support.rs"]
 mod support;
 

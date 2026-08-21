@@ -31,7 +31,7 @@ const EXIT_CODE_COVERAGE: [(i32, Coverage); 12] = [
     ),
     (
         9,
-        Coverage::UnitOnly("src/error.rs::error_exit_codes_match_stable_contract"),
+        Coverage::E2e("unsupported_platform_binary_produces_exit_nine"),
     ),
     (
         10,
@@ -60,6 +60,6 @@ fn documented_exit_code_table_has_a_producing_scenario() {
             .filter(|(_, coverage)| matches!(coverage, Coverage::UnitOnly(_)))
             .map(|(code, _)| *code)
             .collect::<Vec<_>>(),
-        [9, 11]
+        [11]
     );
 }
