@@ -2,7 +2,8 @@ use std::path::Path;
 
 use crate::analyze::space::{self, FileSpace};
 use crate::cli::{CleanArgs, Cli};
-use crate::db::ReadWriteConnection;
+use crate::db::{self, ReadWriteConnection};
+use crate::delete::sessions::DEFAULT_BATCH_SIZE;
 use crate::error::Error;
 use crate::reclaim::headroom::{
     FreeSpaceProvider, HeadroomInput, HeadroomVerdict, evaluate_headroom,
@@ -13,6 +14,9 @@ use crate::reclaim::vacuum_into::{VacuumIntoOptions, vacuum_into_with_observer};
 use super::signal::SignalController;
 
 const INCREMENTAL_PAGES_PER_BATCH: u32 = 1_000;
+const WAL_DIRTY_PAGES_PER_SESSION: u64 = 64;
+const WAL_HEADER_BYTES: u64 = 32;
+const WAL_FRAME_HEADER_BYTES: u64 = 24;
 
 pub(super) fn pre_delete_headroom(
     database_path: &Path,
@@ -136,24 +140,30 @@ fn ensure_headroom(
     }
 }
 
-/// Bounds one delete batch when only aggregate candidate bytes are available.
+/// Conservatively bounds the WAL space needed by one delete batch.
 ///
-/// Every ID-sorted delete batch is a subset of the selected candidates, so its attributable bytes
-/// cannot exceed `selected_bytes`, regardless of how skewed their sizes or ordering are. Adding one
-/// page preserves the allowance for SQLite's page-granular WAL accounting.
+/// The current cascade can touch roughly 36 table and index b-trees per session. Reserving 64 frames
+/// per candidate leaves room for interior pages, freelist maintenance, and page splits. The complete
+/// selected payload remains in the estimate because only an aggregate is available here and an
+/// ID-sorted batch can contain every large candidate. This intentionally favors an early headroom
+/// refusal over exhausting the filesystem before the post-batch checkpoint.
 fn one_batch_wal_allowance(selected_bytes: u64, selected_count: usize, page_size: u32) -> u64 {
-    if selected_count == 0 {
-        return u64::from(page_size);
-    }
-    selected_bytes.saturating_add(u64::from(page_size))
+    let batch_count = selected_count.min(DEFAULT_BATCH_SIZE);
+    let batch_count = u64::try_from(batch_count).unwrap_or(u64::MAX);
+    let frame_bytes = u64::from(page_size).saturating_add(WAL_FRAME_HEADER_BYTES);
+    let structural_bytes = batch_count
+        .saturating_mul(WAL_DIRTY_PAGES_PER_SESSION)
+        .saturating_mul(frame_bytes);
+
+    WAL_HEADER_BYTES
+        .saturating_add(frame_bytes)
+        .saturating_add(selected_bytes)
+        .saturating_add(structural_bytes)
 }
 
 fn incremental_error(error: IncrementalVacuumError) -> Error {
     match error {
-        IncrementalVacuumError::Sqlite { context, source } => Error::Sqlite {
-            context: context.to_owned(),
-            source,
-        },
+        IncrementalVacuumError::Sqlite { context, source } => db::sqlite_error(context, source),
         IncrementalVacuumError::Cancelled { progress } => Error::Interrupted {
             completed: format!(
                 "{} pages and {} bytes reclaimed",
@@ -175,7 +185,6 @@ fn interrupted(completed: &str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::delete::sessions::DEFAULT_BATCH_SIZE;
 
     #[test]
     fn wal_allowance_covers_all_selected_candidate_bytes() {
@@ -183,9 +192,9 @@ mod tests {
         let selected_bytes = u64::try_from(selected_count)
             .expect("test count should fit u64")
             .saturating_mul(10);
-        assert_eq!(
-            one_batch_wal_allowance(selected_bytes, selected_count, 4_096),
-            selected_bytes.saturating_add(4_096)
+        assert!(
+            one_batch_wal_allowance(selected_bytes, selected_count, 4_096)
+                > selected_bytes.saturating_add(4_096)
         );
     }
 
@@ -204,5 +213,35 @@ mod tests {
         assert!(
             one_batch_wal_allowance(selected_bytes, candidate_bytes.len(), 4_096) >= actual_peak
         );
+    }
+
+    #[test]
+    fn wal_allowance_covers_dirty_pages_for_many_zero_payload_sessions() {
+        let selected_count = DEFAULT_BATCH_SIZE;
+        let page_size = 4_096_u32;
+        let reasonable_dirty_page_floor = u64::try_from(selected_count)
+            .expect("test count should fit u64")
+            .saturating_mul(4)
+            .saturating_mul(u64::from(page_size));
+
+        assert!(
+            one_batch_wal_allowance(0, selected_count, page_size) >= reasonable_dirty_page_floor
+        );
+    }
+
+    #[test]
+    fn incremental_busy_error_uses_database_busy_category() {
+        let source = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+
+        assert!(matches!(
+            incremental_error(IncrementalVacuumError::Sqlite {
+                context: "incremental vacuum",
+                source,
+            }),
+            Error::DatabaseBusy { .. }
+        ));
     }
 }
