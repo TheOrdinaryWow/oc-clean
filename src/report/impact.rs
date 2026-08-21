@@ -106,6 +106,8 @@ pub struct ImpactSelection {
     pub larger_than: Option<Size>,
     pub keep_recent: u64,
     pub sweep_orphans: bool,
+    /// Whether projects that were already empty before this run are eligible for pruning.
+    pub prune_empty_projects: bool,
     /// How many of the largest selected sessions to describe in the preview.
     pub preview_top: usize,
 }
@@ -428,7 +430,11 @@ fn database_impact<Access>(
 ) -> Result<DatabaseImpact, Error> {
     let payload = selected_session_payload(database, &planned.session_ids, selection.preview_top)?;
     let session_payload_bytes = payload.bytes;
-    let project_ids = projects_emptied_by(database, &planned.session_ids)?;
+    let project_ids = projects_emptied_by(
+        database,
+        &planned.session_ids,
+        selection.prune_empty_projects,
+    )?;
     let mut impact_by_table = DELETION_TABLES
         .iter()
         .map(|table| ((*table).to_owned(), TableImpact::default()))
@@ -607,10 +613,24 @@ fn selection_roots<Access>(
     Ok(roots)
 }
 
+/// Projects the applied run would prune, mirroring `delete::projects::prune`.
+///
+/// A project is pruned when deleting `session_ids` leaves it with no sessions. When
+/// `prune_preexisting_empty` is set, projects that already hold no session at all are pruned too,
+/// exactly as the applied path does.
 fn projects_emptied_by<Access>(
     database: &DatabaseConnection<Access>,
     session_ids: &SessionIds,
+    prune_preexisting_empty: bool,
 ) -> Result<BTreeSet<String>, Error> {
+    let mut projects = if prune_preexisting_empty {
+        all_project_ids(database)?
+            .into_iter()
+            .map(|project_id| (project_id, (0_u64, 0_u64)))
+            .collect::<BTreeMap<_, _>>()
+    } else {
+        BTreeMap::new()
+    };
     let mut statement = database
         .connection()
         .prepare("SELECT id, project_id FROM session")
@@ -620,22 +640,33 @@ fn projects_emptied_by<Access>(
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })
         .map_err(|source| sqlite_error("querying project-prune impact", source))?;
-    let mut selected = BTreeMap::<String, u64>::new();
-    let mut total = BTreeMap::<String, u64>::new();
     for row in rows {
         let (session_id, project_id) =
             row.map_err(|source| sqlite_error("reading project-prune impact", source))?;
-        *total.entry(project_id.clone()).or_default() += 1;
+        let counts = projects.entry(project_id).or_default();
+        counts.0 += 1;
         if session_ids.contains(&session_id) {
-            *selected.entry(project_id).or_default() += 1;
+            counts.1 += 1;
         }
     }
-    Ok(selected
+    Ok(projects
         .into_iter()
-        .filter_map(|(project_id, selected_count)| {
-            (total.get(&project_id) == Some(&selected_count)).then_some(project_id)
-        })
+        .filter_map(|(project_id, (total, selected))| (total == selected).then_some(project_id))
         .collect())
+}
+
+fn all_project_ids<Access>(
+    database: &DatabaseConnection<Access>,
+) -> Result<BTreeSet<String>, Error> {
+    let mut statement = database
+        .connection()
+        .prepare("SELECT id FROM project")
+        .map_err(|source| sqlite_error("preparing project-prune project census", source))?;
+    statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|source| sqlite_error("querying project-prune project census", source))?
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(|source| sqlite_error("reading project-prune project census", source))
 }
 
 fn table_impact<Access>(
@@ -1096,6 +1127,36 @@ mod tests {
 
         assert!(!impact.session_ids.contains("ses_dangling_0"));
         assert_eq!(impact.summary.orphan_row_count, 0);
+    }
+
+    #[test]
+    fn preexisting_empty_projects_are_previewed_only_when_pruning_is_requested() {
+        fn project_prune_count(prune_empty_projects: bool) -> u64 {
+            let fixture = Fixture::build(&FixtureConfig {
+                project_count: 2,
+                session_count: 1,
+                archived_session_count: 1,
+                ..FixtureConfig::default()
+            })
+            .expect("fixture should build");
+            let database = open_fixture(&fixture);
+
+            summarize(
+                &database,
+                &derived_paths(fixture.root()),
+                &ImpactSelection {
+                    archived: true,
+                    prune_empty_projects,
+                    ..ImpactSelection::default()
+                },
+            )
+            .expect("project-prune impact should succeed")
+            .summary
+            .project_prune_count
+        }
+
+        assert_eq!(project_prune_count(false), 1);
+        assert_eq!(project_prune_count(true), 2);
     }
 
     #[test]
