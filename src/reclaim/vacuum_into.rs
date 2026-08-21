@@ -9,6 +9,7 @@ use tracing::warn;
 
 use crate::db::{FileIdentity, ReadWriteConnection};
 use crate::error::Error;
+use crate::safety::holders::resolve_database_target;
 
 use super::platform;
 
@@ -183,6 +184,9 @@ fn vacuum_into_with_runtime<Ops: FileOperations, Hooks: SwapHooks>(
     hooks: &Hooks,
 ) -> Result<VacuumIntoReport, Error> {
     validate_file_target(database_path)?;
+    let database_path =
+        resolve_database_target(database_path).map_err(|source| io_error(database_path, source))?;
+    let database_path = database_path.as_path();
     let original_bytes = file_size(database_path)?;
     checkpoint_source(database.connection())?;
     let snapshot = source_snapshot(database.connection())?;
@@ -1191,6 +1195,12 @@ mod tests {
         rename_source_was_canonical: AtomicBool,
     }
 
+    struct InjectedSwapFailures {
+        fail_rename: bool,
+        fail_cleanup: bool,
+        backup_path: Mutex<Option<PathBuf>>,
+    }
+
     struct FailingSidecarRemovalOperations;
 
     impl FileOperations for FailingSidecarRemovalOperations {
@@ -1262,6 +1272,55 @@ mod tests {
                 io::ErrorKind::PermissionDenied,
                 "injected rename failure",
             ))
+        }
+    }
+
+    impl InjectedSwapFailures {
+        fn new(fail_rename: bool, fail_cleanup: bool) -> Self {
+            Self {
+                fail_rename,
+                fail_cleanup,
+                backup_path: Mutex::new(None),
+            }
+        }
+    }
+
+    impl FileOperations for InjectedSwapFailures {
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            let is_backup = self
+                .backup_path
+                .lock()
+                .expect("backup path lock")
+                .as_deref()
+                == Some(path);
+            if self.fail_cleanup && is_backup {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected backup cleanup failure",
+                ));
+            }
+            fs::remove_file(path)
+        }
+
+        fn hard_link(&self, source: &Path, destination: &Path) -> io::Result<()> {
+            fs::hard_link(source, destination)?;
+            *self.backup_path.lock().expect("backup path lock") = Some(destination.to_path_buf());
+            Ok(())
+        }
+
+        fn copy(&self, source: &Path, destination: &Path) -> io::Result<u64> {
+            fs::copy(source, destination)
+        }
+
+        fn rename(&self, source: &Path, destination: &Path) -> io::Result<()> {
+            if self.fail_rename {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected rename failure",
+                ))
+            } else {
+                fs::rename(source, destination)
+            }
         }
     }
 
@@ -1360,6 +1419,54 @@ mod tests {
         assert_eq!(
             directory_names(fixture.path.parent().expect("fixture parent")),
             vec!["opencode-nightly.db".to_owned(), backup_name.into_owned()]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_database_swap_replaces_target_and_preserves_lexical_link() {
+        let fixture = Fixture::new("real.db");
+        let link = fixture
+            .path
+            .parent()
+            .expect("fixture should have a parent")
+            .join("db.sqlite");
+        symlink("real.db", &link).expect("database symlink should be created");
+        let database = open_read_write(&Target::File(link.clone()), ConnectionOptions::default())
+            .expect("symlinked fixture should open read-write");
+        database
+            .acquire_exclusive_lock()
+            .expect("symlinked fixture should acquire an exclusive lock");
+        let data_version = database
+            .data_version()
+            .expect("fixture data version should be readable");
+
+        let report = vacuum_into_with_runtime(
+            database,
+            &link,
+            data_version,
+            VacuumIntoOptions::default(),
+            &SystemFileOperations,
+            &NoopHooks,
+        )
+        .expect("symlinked database swap should succeed");
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("database link metadata should be readable")
+                .file_type()
+                .is_symlink()
+        );
+        assert_verified_database(&fixture.path);
+        assert!(fs::metadata(&fixture.path).expect("target metadata").len() < fixture.original_len);
+        assert!(
+            report
+                .backup_path
+                .expect("backup should be retained")
+                .file_name()
+                .expect("backup should have a filename")
+                .to_string_lossy()
+                .starts_with("real.db.bak.")
         );
     }
 
@@ -1525,6 +1632,31 @@ mod tests {
             directory_names(fixture.path.parent().expect("fixture parent")),
             vec!["rename-failure.db".to_owned()]
         );
+    }
+
+    #[test]
+    fn rename_and_backup_cleanup_double_failure_returns_swap_rollback_failed() {
+        let fixture = Fixture::new("rollback-failure.db");
+        let operations = InjectedSwapFailures::new(true, true);
+
+        let error = run_with(
+            &fixture,
+            VacuumIntoOptions { skip_backup: true },
+            &operations,
+            &NoopHooks,
+        )
+        .expect_err("rename and backup cleanup should both fail");
+
+        assert_eq!(error.exit_code(), 11);
+        let Error::SwapRollbackFailed {
+            database_path,
+            backup_path,
+        } = error
+        else {
+            panic!("expected fatal swap rollback failure");
+        };
+        assert_eq!(database_path, fixture.path);
+        assert!(backup_path.exists());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Cross-platform process-holder inspection and command gating.
 
 use std::ffi::OsString;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::error::Error;
@@ -166,6 +167,26 @@ pub(crate) fn database_related_paths(database_path: &Path) -> [PathBuf; 3] {
         path_with_suffix(&database_path, "-wal"),
         path_with_suffix(&database_path, "-shm"),
     ]
+}
+
+pub(crate) fn resolve_database_target(database_path: &Path) -> io::Result<PathBuf> {
+    let lexical_path = normalize_database_path(database_path);
+    if !std::fs::symlink_metadata(&lexical_path)?
+        .file_type()
+        .is_symlink()
+    {
+        return Ok(lexical_path);
+    }
+
+    let target = std::fs::read_link(&lexical_path)?;
+    let resolved = if target.is_absolute() {
+        target
+    } else if let Some(parent) = lexical_path.parent() {
+        parent.join(target)
+    } else {
+        target
+    };
+    Ok(normalize_database_path(&resolved))
 }
 
 fn normalize_database_path(path: &Path) -> PathBuf {

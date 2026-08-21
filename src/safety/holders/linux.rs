@@ -9,6 +9,7 @@ use procfs::process::{FDTarget, Process, all_processes_with_root};
 
 use super::{
     Completeness, HolderInfo, HolderInspector, Inspection, Verdict, database_related_paths,
+    resolve_database_target,
 };
 
 /// Linux inspector backed by procfs.
@@ -35,7 +36,20 @@ impl LinuxHolderInspector {
 
 impl HolderInspector for LinuxHolderInspector {
     fn inspect(&self, database_path: &Path) -> Inspection {
-        let targets = database_related_paths(database_path);
+        let display_targets = database_related_paths(database_path);
+        let resolved_database_path = match resolve_database_target(database_path) {
+            Ok(path) => path,
+            Err(error) => {
+                return Inspection {
+                    verdict: Verdict::CannotDetermine(format!(
+                        "cannot resolve database target {}: {error}",
+                        database_path.display()
+                    )),
+                    completeness: Completeness::Unsupported,
+                };
+            }
+        };
+        let comparison_targets = database_related_paths(&resolved_database_path);
         let processes = match all_processes_with_root(&self.proc_root) {
             Ok(processes) => processes,
             Err(error) => return root_error_inspection(&self.proc_root, &error),
@@ -52,7 +66,13 @@ impl HolderInspector for LinuxHolderInspector {
                     continue;
                 }
             };
-            inspect_process(&process, &targets, &mut matches, &mut partial);
+            inspect_process(
+                &process,
+                &comparison_targets,
+                &display_targets,
+                &mut matches,
+                &mut partial,
+            );
         }
 
         let holders = matches
@@ -89,7 +109,8 @@ impl HolderInspector for LinuxHolderInspector {
 
 fn inspect_process(
     process: &Process,
-    targets: &[PathBuf; 3],
+    comparison_targets: &[PathBuf; 3],
+    display_targets: &[PathBuf; 3],
     matches: &mut BTreeMap<u32, (Option<String>, Vec<PathBuf>)>,
     partial: &mut bool,
 ) {
@@ -113,9 +134,11 @@ fn inspect_process(
         let FDTarget::Path(path) = fd.target else {
             continue;
         };
-        let Some(target) = targets.iter().find(|target| *target == &path) else {
+        let Some(target_index) = comparison_targets.iter().position(|target| target == &path)
+        else {
             continue;
         };
+        let target = &display_targets[target_index];
         let Ok(pid) = u32::try_from(process.pid) else {
             continue;
         };
@@ -157,4 +180,33 @@ fn process_vanished(error: &ProcError) -> bool {
 
 fn scan_was_blinded(error: &ProcError) -> bool {
     !process_vanished(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+    use std::os::unix::fs::symlink;
+
+    use super::*;
+
+    #[test]
+    fn detects_holder_through_database_symlink_and_reports_lexical_path() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let target = directory.path().join("real.db");
+        File::create(&target).expect("database target should be created");
+        let link = directory.path().join("db.sqlite");
+        symlink("real.db", &link).expect("database symlink should be created");
+        let _held = File::open(&target).expect("database target should be held open");
+
+        let inspection = LinuxHolderInspector::default().inspect(&link);
+
+        let Verdict::Held(holders) = inspection.verdict else {
+            panic!("expected current process to hold the symlinked database target");
+        };
+        let holder = holders
+            .iter()
+            .find(|holder| holder.pid == std::process::id())
+            .expect("current process should be reported as a holder");
+        assert_eq!(holder.matched_paths, vec![link]);
+    }
 }
