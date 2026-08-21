@@ -1,11 +1,13 @@
 use std::io::{IsTerminal, Write};
 use std::path::Path;
 
-use super::model::{DoctorReport, VacuumHeadroom};
+use super::model::{CheckReport, DoctorReport, ForeignKeyReport, HolderReport, VacuumHeadroom};
+use crate::analyze::space::FileSpace;
 use crate::analyze::{orphans, space};
 use crate::cli::{Cli, DoctorArgs};
 use crate::db::{self, ConnectionOptions};
 use crate::error::Error;
+use crate::parallel::{self, JobHandle};
 use crate::paths::{self, DatabaseOptions, Environment, Platform, Target};
 use crate::report::progress;
 
@@ -22,46 +24,12 @@ pub fn run(cli: &Cli, arguments: &DoctorArgs, output: &mut dyn Write) -> Result<
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or(Path::new(paths::MEMORY_DATA_DIR));
     let derived_paths = paths::derived_paths(data_directory);
-    let database = db::open_read_only(&target, ConnectionOptions::default())?;
-    let connection = database.connection();
-
-    // An integrity check on a large database runs for minutes with no output of its own,
-    // so every step is announced; a silent terminal is indistinguishable from a hang.
-    let bar = progress::phases("doctor", 8);
-    bar.set_message("running the integrity check");
-    let integrity_check = super::checks::integrity_check(connection)?;
-    bar.step("inspecting the schema");
-    let schema = db::schema::inspect_report(connection)?;
-    ensure_schema_compatible(&schema)?;
-    bar.step("running the foreign-key check");
-    let foreign_key_check = super::checks::foreign_key_check(connection)?;
-    bar.step("accounting for file space");
-    let file_space = space::analyze(&database)?.file;
-    bar.step("counting orphans");
-    let orphans = orphans::analyze(&database, &derived_paths)?;
-    bar.step("scanning for database holders");
-    let holders = super::checks::holders(database_path);
-    bar.step("estimating rebuild headroom");
-    let vacuum_headroom = vacuum_headroom(
+    let report = inspect(
         &target,
         database_path,
-        file_space.live_bytes,
-        database.capabilities().hard_links,
+        &derived_paths,
+        run_independent_checks,
     )?;
-    bar.step("reading auto-vacuum and timestamp state");
-    let report = DoctorReport {
-        database_path: database_path.to_owned(),
-        schema,
-        integrity_check,
-        foreign_key_check,
-        orphans,
-        holders,
-        vacuum_headroom,
-        auto_vacuum: super::checks::auto_vacuum(connection)?,
-        timestamp_sanity: super::checks::timestamp_sanity(connection)?,
-    };
-    bar.step("writing the report");
-    bar.finish();
 
     if arguments.json {
         super::json::write(&report, output)?;
@@ -73,6 +41,124 @@ pub fn run(cli: &Cli, arguments: &DoctorArgs, output: &mut dyn Write) -> Result<
         super::human::write(&report, output, style)?;
     }
     ensure_report_health(&report)
+}
+
+fn inspect(
+    target: &Target,
+    database_path: &Path,
+    derived_paths: &paths::DerivedPaths,
+    independent_checks: impl FnOnce(&Target, &Path) -> Result<IndependentChecks, Error>,
+) -> Result<DoctorReport, Error> {
+    let database = db::open_read_only(target, ConnectionOptions::default())?;
+    let connection = database.connection();
+
+    let bar = progress::spinner("doctor", "inspecting the schema");
+    let schema = db::schema::inspect_report(connection)?;
+    bar.finish();
+    ensure_schema_compatible(&schema)?;
+
+    let IndependentChecks {
+        integrity_check,
+        foreign_key_check,
+        file_space,
+        holders,
+    } = independent_checks(target, database_path)?;
+
+    let bar = progress::spinner("doctor", "counting orphans");
+    let orphans = orphans::analyze(&database, derived_paths)?;
+    bar.finish();
+
+    let bar = progress::spinner("doctor", "estimating rebuild headroom");
+    let vacuum_headroom = vacuum_headroom(
+        target,
+        database_path,
+        file_space.live_bytes,
+        database.capabilities().hard_links,
+    )?;
+    bar.finish();
+
+    let bar = progress::spinner("doctor", "reading auto-vacuum and timestamp state");
+    let report = DoctorReport {
+        database_path: database_path.to_owned(),
+        schema,
+        integrity_check,
+        foreign_key_check,
+        orphans,
+        holders,
+        vacuum_headroom,
+        auto_vacuum: super::checks::auto_vacuum(connection)?,
+        timestamp_sanity: super::checks::timestamp_sanity(connection)?,
+    };
+    bar.finish();
+    Ok(report)
+}
+
+#[derive(Debug, PartialEq)]
+struct IndependentChecks {
+    integrity_check: CheckReport,
+    foreign_key_check: ForeignKeyReport,
+    file_space: FileSpace,
+    holders: HolderReport,
+}
+
+fn run_independent_checks(
+    target: &Target,
+    database_path: &Path,
+) -> Result<IndependentChecks, Error> {
+    parallel::group("doctor", 4, |group| {
+        let integrity_check = group.spawn("running the integrity check", || {
+            let database = db::open_read_only(target, ConnectionOptions::default())?;
+            super::checks::integrity_check(database.connection())
+        });
+        let foreign_key_check = group.spawn("running the foreign-key check", || {
+            let database = db::open_read_only(target, ConnectionOptions::default())?;
+            super::checks::foreign_key_check(database.connection())
+        });
+        let file_space = group.spawn("accounting for file space", || {
+            let database = db::open_read_only(target, ConnectionOptions::default())?;
+            Ok(space::analyze(&database)?.file)
+        });
+        let holders = group.spawn("scanning for database holders", || {
+            Ok(super::checks::holders(database_path))
+        });
+
+        join_independent_checks(integrity_check, foreign_key_check, file_space, holders)
+    })
+}
+
+fn join_independent_checks(
+    integrity_check: JobHandle<'_, CheckReport>,
+    foreign_key_check: JobHandle<'_, ForeignKeyReport>,
+    file_space: JobHandle<'_, FileSpace>,
+    holders: JobHandle<'_, HolderReport>,
+) -> Result<IndependentChecks, Error> {
+    // Joining every handle before propagating errors lets scoped workers finish while preserving
+    // declaration order as the stable error-priority contract.
+    let integrity_check = integrity_check.join();
+    let foreign_key_check = foreign_key_check.join();
+    let file_space = file_space.join();
+    let holders = holders.join();
+
+    Ok(IndependentChecks {
+        integrity_check: integrity_check?,
+        foreign_key_check: foreign_key_check?,
+        file_space: file_space?,
+        holders: holders?,
+    })
+}
+
+#[cfg(test)]
+fn run_independent_checks_sequential(
+    target: &Target,
+    database_path: &Path,
+) -> Result<IndependentChecks, Error> {
+    let database = db::open_read_only(target, ConnectionOptions::default())?;
+    Ok(IndependentChecks {
+        integrity_check: super::checks::integrity_check(database.connection())?,
+        foreign_key_check: super::checks::foreign_key_check(database.connection())?,
+        file_space: space::analyze(&database)?.file,
+        holders: super::checks::holders(database_path),
+    })
 }
 
 fn ensure_schema_compatible(schema: &db::schema::SchemaReport) -> Result<(), Error> {
@@ -157,3 +243,7 @@ fn current_platform() -> Result<Platform, Error> {
         }),
     }
 }
+
+#[cfg(test)]
+#[path = "command_tests.rs"]
+mod tests;

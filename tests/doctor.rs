@@ -258,18 +258,30 @@ mod doctor {
             .connect()
             .expect("fixture should connect")
             .execute_batch(
-                "ALTER TABLE session RENAME COLUMN time_updated TO incompatible_time_updated",
+                "ALTER TABLE session RENAME COLUMN time_updated TO incompatible_time_updated;
+                 CREATE TABLE doctor_fk (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT REFERENCES session(id)
+                 );
+                 PRAGMA foreign_keys = OFF;
+                 INSERT INTO doctor_fk VALUES ('broken', 'ses_missing');",
             )
             .expect("required column should be renamed");
 
-        let output = run(&fixture, &[]);
+        let output = run(&fixture, &["--json"]);
 
         assert_eq!(output.status.code(), Some(4));
         assert!(
-            String::from_utf8_lossy(&output.stderr).contains("schema is incompatible"),
-            "stderr: {}",
-            String::from_utf8_lossy(&output.stderr)
+            output.stdout.is_empty(),
+            "schema gate must suppress the report"
         );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("schema is incompatible"),
+            "stderr: {stderr}"
+        );
+        assert!(!stderr.contains("foreign_key_check"));
+        assert!(!stderr.contains("integrity_check"));
     }
 
     fn metadata(path: &Path) -> (u64, std::time::SystemTime) {
