@@ -1,6 +1,7 @@
 use std::fs;
 #[cfg(unix)]
 use std::io::{BufRead, BufReader, Read};
+#[cfg(target_arch = "x86_64")]
 use std::process::Command;
 #[cfg(unix)]
 use std::process::Stdio;

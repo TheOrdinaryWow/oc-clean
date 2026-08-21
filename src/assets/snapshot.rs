@@ -472,7 +472,6 @@ fn sqlite_error(context: &str, source: rusqlite::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
     use std::fs;
     use std::path::PathBuf;
     use std::process::Command;
@@ -711,12 +710,15 @@ mod tests {
         let fixture = Fixture::new();
         let _repository =
             bare_repository_with_loose_objects(&fixture, "project-retained", "worktree-hash");
+        let empty_path_directory = fixture.directory.path().join("no-executables");
+        fs::create_dir_all(&empty_path_directory)
+            .expect("empty search directory should be created");
 
         let outcome = gc_retained_with_path(
             &fixture.snapshot_root,
             &project_ids(&["project-retained"]),
             &ProjectIds::new(),
-            Some(OsStr::new("")),
+            Some(empty_path_directory.as_os_str()),
         )
         .expect("missing git should be a successful skip");
 
