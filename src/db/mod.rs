@@ -271,22 +271,32 @@ impl AnchoredDatabaseFile {
         &self.resolved_path
     }
 
-    #[cfg(unix)]
+    /// Path SQLite should open, pinned to the anchored descriptor where the platform allows it.
+    ///
+    /// Opening `/proc/self/fd/N` performs a fresh open of the same inode, so SQLite gets its own
+    /// read-write handle while the path stays immune to an ancestor swap. `/dev/fd/N` on other
+    /// unices duplicates the descriptor instead, which would hand SQLite this anchor's read-only
+    /// access, so those platforms fall back to the resolved path.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(crate) fn sqlite_path(&self) -> PathBuf {
         descriptor_path(&self.descriptor)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     pub(crate) fn sqlite_path(&self) -> PathBuf {
         self.resolved_path.clone()
     }
 
-    #[cfg(unix)]
+    /// Path used to inspect the database file, pinned to the anchored parent where possible.
+    ///
+    /// The same `/proc` versus `/dev/fd` difference applies: only Linux resolves a descriptor
+    /// path to the directory itself, so only Linux can address the file through its parent.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(crate) fn inspection_path(&self) -> PathBuf {
         descriptor_path(&self.parent_descriptor).join(&self.file_name)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     pub(crate) fn inspection_path(&self) -> PathBuf {
         self.resolved_path.clone()
     }
@@ -399,7 +409,8 @@ impl AnchoredDatabaseFile {
             .map_err(|source| path_open_error(path, source))?
             .descriptor;
         #[cfg(not(unix))]
-        let candidate = File::open(path).map_err(|source| path_open_error(path, source))?;
+        let candidate =
+            open_for_identity_probe(path).map_err(|source| path_open_error(path, source))?;
         let candidate_identity = file_identity_from_handle(path, &candidate)?;
         self.ensure_same_file(candidate_identity, reason)
     }
@@ -423,7 +434,7 @@ impl AnchoredDatabaseFile {
         };
         #[cfg(not(unix))]
         let candidate_identity = {
-            let candidate = File::open(&self.resolved_path)
+            let candidate = open_for_identity_probe(&self.resolved_path)
                 .map_err(|source| path_open_error(&self.resolved_path, source))?;
             file_identity_from_handle(&self.resolved_path, &candidate)?
         };
@@ -459,6 +470,29 @@ fn descriptor_path(descriptor: &File) -> PathBuf {
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
 fn descriptor_path(descriptor: &File) -> PathBuf {
     PathBuf::from(format!("/dev/fd/{}", descriptor.as_raw_fd()))
+}
+
+/// Opens a path for an identity probe without disturbing handles already held on the file.
+///
+/// Windows rejects a second open whose sharing mode conflicts with an existing handle, and these
+/// probes run while SQLite and the anchor still hold the database, so full sharing is required.
+#[cfg(windows)]
+fn open_for_identity_probe(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+
+    fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_for_identity_probe(path: &Path) -> std::io::Result<File> {
+    File::open(path)
 }
 
 pub(crate) fn anchor_for_holder_scan(path: &Path) -> Result<Arc<AnchoredDatabaseFile>, Error> {
