@@ -1,15 +1,25 @@
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
+#[cfg(unix)]
+use std::io::{self, Seek};
 use std::marker::PhantomData;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use rusqlite::{Connection, ErrorCode, InterruptHandle, OpenFlags};
+#[cfg(unix)]
+use rustix::fs::{AtFlags, Mode, OFlags, linkat, openat, renameat, unlinkat};
 
 use crate::error::Error;
 use crate::paths::Target;
+#[cfg(unix)]
+use crate::safety::holders::open_database_target;
+#[cfg(not(unix))]
 use crate::safety::holders::resolve_database_target;
 
 pub mod schema;
@@ -64,6 +74,10 @@ pub type FileIdentity = (u64, i64, i64, u64, u64);
 #[derive(Debug)]
 pub(crate) struct AnchoredDatabaseFile {
     descriptor: File,
+    #[cfg(unix)]
+    parent_descriptor: File,
+    #[cfg(unix)]
+    file_name: OsString,
     lexical_path: PathBuf,
     resolved_path: PathBuf,
 }
@@ -159,11 +173,19 @@ fn open_file<Access>(
 ) -> Result<DatabaseConnection<Access>, Error> {
     let anchor = database_anchor(path, retention)?;
     before_open();
-    anchor.ensure_path_matches(path, "database target changed before SQLite open")?;
-    anchor.ensure_resolved_path_matches("resolved database target changed before SQLite open")?;
-    let connection = Connection::open_with_flags(anchor.resolved_path(), flags)
+    #[cfg(not(unix))]
+    {
+        anchor.ensure_path_matches(path, "database target changed before SQLite open")?;
+        anchor
+            .ensure_resolved_path_matches("resolved database target changed before SQLite open")?;
+    }
+    let expected_identity = anchor.identity()?;
+    let connection = Connection::open_with_flags(anchor.sqlite_path(), flags)
         .map_err(|source| sqlite_error(context, source))?;
-    anchor.ensure_resolved_path_matches("resolved database target changed during SQLite open")?;
+    anchor.ensure_identity(
+        expected_identity,
+        "anchored database changed during SQLite open",
+    )?;
     finish_open(connection, Some(anchor), options)
 }
 
@@ -187,10 +209,24 @@ fn open_read_only_with_hook(
 }
 
 impl AnchoredDatabaseFile {
+    #[cfg(unix)]
+    fn open(path: &Path) -> Result<Self, Error> {
+        let target = open_database_target(path).map_err(|source| path_open_error(path, source))?;
+        Ok(Self {
+            descriptor: target.descriptor,
+            parent_descriptor: target.parent_descriptor,
+            file_name: target.file_name,
+            lexical_path: path.to_path_buf(),
+            resolved_path: target.resolved_path,
+        })
+    }
+
+    #[cfg(not(unix))]
     fn open(path: &Path) -> Result<Self, Error> {
         let resolved_path =
             resolve_database_target(path).map_err(|source| path_open_error(path, source))?;
-        let descriptor = File::open(path).map_err(|source| path_open_error(path, source))?;
+        let descriptor =
+            File::open(&resolved_path).map_err(|source| path_open_error(path, source))?;
         let anchor = Self {
             descriptor,
             lexical_path: path.to_path_buf(),
@@ -204,6 +240,119 @@ impl AnchoredDatabaseFile {
         &self.resolved_path
     }
 
+    #[cfg(unix)]
+    pub(crate) fn sqlite_path(&self) -> PathBuf {
+        descriptor_path(&self.descriptor)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn sqlite_path(&self) -> PathBuf {
+        self.resolved_path.clone()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn inspection_path(&self) -> PathBuf {
+        descriptor_path(&self.parent_descriptor).join(&self.file_name)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn inspection_path(&self) -> PathBuf {
+        self.resolved_path.clone()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn sibling_path(&self, path: &Path) -> Result<PathBuf, Error> {
+        let name = self.sibling_name(path)?;
+        Ok(descriptor_path(&self.parent_descriptor).join(name))
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn sibling_path(&self, path: &Path) -> Result<PathBuf, Error> {
+        Ok(path.to_path_buf())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn hard_link_to(&self, destination: &Path) -> io::Result<()> {
+        let destination = self.sibling_name_io(destination)?;
+        linkat(
+            rustix::fs::CWD,
+            descriptor_path(&self.descriptor),
+            &self.parent_descriptor,
+            destination,
+            AtFlags::SYMLINK_FOLLOW,
+        )
+        .map_err(Into::into)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn copy_to_exclusive(&self, destination: &Path) -> io::Result<u64> {
+        let destination = self.sibling_name_io(destination)?;
+        let output = openat(
+            &self.parent_descriptor,
+            &destination,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )?;
+        let mut output = File::from(output);
+        let mut input = self.descriptor.try_clone()?;
+        input.rewind()?;
+        let result = io::copy(&mut input, &mut output).and_then(|bytes| {
+            output.set_permissions(input.metadata()?.permissions())?;
+            Ok(bytes)
+        });
+        if result.is_err() {
+            drop(output);
+            let _ = unlinkat(&self.parent_descriptor, &destination, AtFlags::empty());
+        }
+        result
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn rename_sibling_over_source(&self, source: &Path) -> io::Result<()> {
+        renameat(
+            &self.parent_descriptor,
+            self.sibling_name_io(source)?,
+            &self.parent_descriptor,
+            &self.file_name,
+        )
+        .map_err(Into::into)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn remove_sibling(&self, path: &Path) -> io::Result<()> {
+        unlinkat(
+            &self.parent_descriptor,
+            self.sibling_name_io(path)?,
+            AtFlags::empty(),
+        )
+        .map_err(Into::into)
+    }
+
+    #[cfg(unix)]
+    fn sibling_name(&self, path: &Path) -> Result<OsString, Error> {
+        self.sibling_name_io(path)
+            .map_err(|source| path_open_error(path, source))
+    }
+
+    #[cfg(unix)]
+    fn sibling_name_io(&self, path: &Path) -> io::Result<OsString> {
+        if path.parent() != self.resolved_path.parent() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is outside the anchored database directory",
+                    path.display()
+                ),
+            ));
+        }
+        path.file_name().map(OsStr::to_owned).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} has no file name", path.display()),
+            )
+        })
+    }
+
     pub(crate) fn identity(&self) -> Result<FileIdentity, Error> {
         let metadata = self.descriptor.metadata().map_err(|source| Error::Io {
             path: self.lexical_path.clone(),
@@ -213,6 +362,11 @@ impl AnchoredDatabaseFile {
     }
 
     pub(crate) fn ensure_path_matches(&self, path: &Path, reason: &str) -> Result<(), Error> {
+        #[cfg(unix)]
+        let candidate = open_database_target(path)
+            .map_err(|source| path_open_error(path, source))?
+            .descriptor;
+        #[cfg(not(unix))]
         let candidate = File::open(path).map_err(|source| path_open_error(path, source))?;
         let metadata = candidate
             .metadata()
@@ -222,6 +376,26 @@ impl AnchoredDatabaseFile {
     }
 
     pub(crate) fn ensure_resolved_path_matches(&self, reason: &str) -> Result<(), Error> {
+        #[cfg(unix)]
+        let candidate_identity = {
+            let candidate = File::from(
+                openat(
+                    &self.parent_descriptor,
+                    &self.file_name,
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|source| Error::Io {
+                    path: self.resolved_path.clone(),
+                    source: source.into(),
+                })?,
+            );
+            let metadata = candidate
+                .metadata()
+                .map_err(|source| path_open_error(&self.resolved_path, source))?;
+            file_identity_from_metadata(&self.resolved_path, &metadata)?
+        };
+        #[cfg(not(unix))]
         let candidate_identity = file_identity(&self.resolved_path)?;
         self.ensure_same_file(candidate_identity, reason)
     }
@@ -245,6 +419,16 @@ impl AnchoredDatabaseFile {
             Err(database_target_changed(reason))
         }
     }
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+fn descriptor_path(descriptor: &File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", descriptor.as_raw_fd()))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn descriptor_path(descriptor: &File) -> PathBuf {
+    PathBuf::from(format!("/dev/fd/{}", descriptor.as_raw_fd()))
 }
 
 pub(crate) fn anchor_for_holder_scan(path: &Path) -> Result<Arc<AnchoredDatabaseFile>, Error> {
@@ -413,11 +597,8 @@ fn finish_open<Access>(
     database_anchor: Option<Arc<AnchoredDatabaseFile>>,
     options: ConnectionOptions,
 ) -> Result<DatabaseConnection<Access>, Error> {
-    let database_path = database_anchor
-        .as_deref()
-        .map(|anchor| anchor.resolved_path().to_path_buf());
     apply_pragmas(&connection, options)?;
-    let capabilities = probe_capabilities(&connection, database_path.as_deref())?;
+    let capabilities = probe_capabilities(&connection, database_anchor.as_deref())?;
     Ok(DatabaseConnection {
         connection,
         capabilities,
@@ -443,7 +624,7 @@ fn apply_pragmas(connection: &Connection, options: ConnectionOptions) -> Result<
 
 fn probe_capabilities(
     connection: &Connection,
-    database_path: Option<&Path>,
+    database_anchor: Option<&AnchoredDatabaseFile>,
 ) -> Result<Capabilities, Error> {
     let octet_length = connection
         .query_row("SELECT octet_length('x')", [], |row| row.get::<_, i64>(0))
@@ -455,8 +636,8 @@ fn probe_capabilities(
     let sqlite_version = connection
         .query_row("SELECT sqlite_version()", [], |row| row.get(0))
         .map_err(|source| sqlite_error("probing SQLite version", source))?;
-    let hard_links = match database_path {
-        Some(path) => probe_hard_links(path)?,
+    let hard_links = match database_anchor {
+        Some(anchor) => probe_hard_links(anchor)?,
         None => false,
     };
 
@@ -468,7 +649,8 @@ fn probe_capabilities(
     })
 }
 
-fn probe_hard_links(database_path: &Path) -> Result<bool, Error> {
+fn probe_hard_links(anchor: &AnchoredDatabaseFile) -> Result<bool, Error> {
+    let database_path = anchor.resolved_path();
     let Some(parent) = database_path.parent() else {
         return Ok(false);
     };
@@ -477,10 +659,18 @@ fn probe_hard_links(database_path: &Path) -> Result<bool, Error> {
         ".oc-clean-link-probe-{}-{sequence}",
         std::process::id()
     ));
-    if fs::hard_link(database_path, &probe_path).is_err() {
+    #[cfg(unix)]
+    let link_result = anchor.hard_link_to(&probe_path);
+    #[cfg(not(unix))]
+    let link_result = fs::hard_link(database_path, &probe_path);
+    if link_result.is_err() {
         return Ok(false);
     }
-    fs::remove_file(&probe_path).map_err(|source| Error::Io {
+    #[cfg(unix)]
+    let remove_result = anchor.remove_sibling(&probe_path);
+    #[cfg(not(unix))]
+    let remove_result = fs::remove_file(&probe_path);
+    remove_result.map_err(|source| Error::Io {
         path: probe_path,
         source,
     })?;
@@ -504,15 +694,6 @@ pub(crate) fn sqlite_error(context: &str, source: rusqlite::Error) -> Error {
 }
 
 #[cfg(unix)]
-pub(crate) fn file_identity(path: &Path) -> Result<FileIdentity, Error> {
-    let metadata = fs::metadata(path).map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    file_identity_from_metadata(path, &metadata)
-}
-
-#[cfg(unix)]
 #[expect(
     clippy::unnecessary_wraps,
     reason = "Windows metadata conversion shares this fallible cross-platform contract"
@@ -530,15 +711,6 @@ fn file_identity_from_metadata(
         metadata.dev(),
         metadata.ino(),
     ))
-}
-
-#[cfg(windows)]
-pub(crate) fn file_identity(path: &Path) -> Result<FileIdentity, Error> {
-    let metadata = fs::metadata(path).map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    file_identity_from_metadata(path, &metadata)
 }
 
 #[cfg(windows)]
@@ -610,7 +782,7 @@ mod tests {
     }
 
     #[test]
-    fn symlink_retarget_between_resolution_and_open_is_rejected() {
+    fn symlink_retarget_between_resolution_and_open_uses_pinned_database() {
         let directory = TempDir::new().expect("temporary directory should be created");
         let original = directory.path().join("original.db");
         let replacement = directory.path().join("replacement.db");
@@ -619,7 +791,7 @@ mod tests {
         create_database(&replacement, "replacement");
         symlink("original.db", &link).expect("database symlink should be created");
 
-        let error = open_read_only_with_hook(
+        let connection = open_read_only_with_hook(
             &Target::File(link.clone()),
             ConnectionOptions::default(),
             || {
@@ -628,8 +800,14 @@ mod tests {
                     .expect("replacement database symlink should be created");
             },
         )
-        .expect_err("retargeted database symlink should abort open");
+        .expect("SQLite should open the descriptor-pinned database");
 
-        assert!(matches!(error, Error::DatabaseBusy { .. }));
+        let marker = connection
+            .connection()
+            .query_row("SELECT value FROM marker", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .expect("marker should be readable");
+        assert_eq!(marker, "original");
     }
 }

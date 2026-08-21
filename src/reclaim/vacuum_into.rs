@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rusqlite::{Connection, ErrorCode, OptionalExtension};
 use tracing::warn;
 
-use crate::db::{AnchoredDatabaseFile, FileIdentity, ReadWriteConnection, file_identity};
+use crate::db::{AnchoredDatabaseFile, FileIdentity, ReadWriteConnection};
 use crate::error::Error;
 
 use super::platform;
@@ -107,6 +107,26 @@ trait FileOperations {
         copy_exclusive(source, destination)
     }
     fn rename(&self, source: &Path, destination: &Path) -> io::Result<()>;
+    fn hard_link_anchored(
+        &self,
+        anchor: &AnchoredDatabaseFile,
+        destination: &Path,
+    ) -> io::Result<()> {
+        self.hard_link(anchor.resolved_path(), destination)
+    }
+    fn copy_anchored_exclusive(
+        &self,
+        anchor: &AnchoredDatabaseFile,
+        destination: &Path,
+    ) -> io::Result<u64> {
+        self.copy_exclusive(anchor.resolved_path(), destination)
+    }
+    fn rename_anchored(&self, anchor: &AnchoredDatabaseFile, source: &Path) -> io::Result<()> {
+        self.rename(source, anchor.resolved_path())
+    }
+    fn remove_anchored(&self, _anchor: &AnchoredDatabaseFile, path: &Path) -> io::Result<()> {
+        self.remove_file(path)
+    }
 }
 
 struct SystemFileOperations;
@@ -126,6 +146,34 @@ impl FileOperations for SystemFileOperations {
 
     fn rename(&self, source: &Path, destination: &Path) -> io::Result<()> {
         platform::rename_over(source, destination)
+    }
+
+    #[cfg(unix)]
+    fn hard_link_anchored(
+        &self,
+        anchor: &AnchoredDatabaseFile,
+        destination: &Path,
+    ) -> io::Result<()> {
+        anchor.hard_link_to(destination)
+    }
+
+    #[cfg(unix)]
+    fn copy_anchored_exclusive(
+        &self,
+        anchor: &AnchoredDatabaseFile,
+        destination: &Path,
+    ) -> io::Result<u64> {
+        anchor.copy_to_exclusive(destination)
+    }
+
+    #[cfg(unix)]
+    fn rename_anchored(&self, anchor: &AnchoredDatabaseFile, source: &Path) -> io::Result<()> {
+        anchor.rename_sibling_over_source(source)
+    }
+
+    #[cfg(unix)]
+    fn remove_anchored(&self, anchor: &AnchoredDatabaseFile, path: &Path) -> io::Result<()> {
+        anchor.remove_sibling(path)
     }
 }
 
@@ -192,14 +240,16 @@ fn vacuum_into_with_runtime<Ops: FileOperations, Hooks: SwapHooks>(
     let database_path = database_anchor.resolved_path();
     database_anchor
         .ensure_resolved_path_matches("resolved database target changed before VACUUM INTO")?;
-    let original_bytes = file_size(database_path)?;
+    let anchored_database_path = database_anchor.inspection_path();
+    let original_bytes = file_size(&anchored_database_path)?;
     checkpoint_source(database.connection())?;
     let snapshot = source_snapshot(database.connection())?;
     let timestamp = match hooks.timestamp() {
         Some(timestamp) => timestamp,
         None => utc_compact_timestamp(database.connection())?,
     };
-    let temporary_path = generated_path(database_path, ".oc-clean-tmp-", &timestamp)?;
+    let temporary_display_path = generated_path(database_path, ".oc-clean-tmp-", &timestamp)?;
+    let temporary_path = database_anchor.sibling_path(&temporary_display_path)?;
     ensure_available_path(&temporary_path)?;
     let temporary = TemporaryDatabase {
         path: temporary_path,
@@ -207,7 +257,7 @@ fn vacuum_into_with_runtime<Ops: FileOperations, Hooks: SwapHooks>(
     };
 
     vacuum_to(database.connection(), &temporary.path)?;
-    hooks.after_vacuum(database_path, &temporary.path);
+    hooks.after_vacuum(database_path, &temporary_display_path);
     verify_output(&temporary.path, &snapshot)?;
     restore_wal_and_verify_auto_vacuum(&temporary.path, snapshot.auto_vacuum)?;
 
@@ -215,10 +265,10 @@ fn vacuum_into_with_runtime<Ops: FileOperations, Hooks: SwapHooks>(
         return Err(database_busy("source data_version changed before swap"));
     }
     let identity = database_anchor.identity()?;
-    ensure_wal_truncated(database_path)?;
+    ensure_wal_truncated(&anchored_database_path)?;
     let hard_links = database.capabilities().hard_links;
     drop(database);
-    hooks.after_lock_closed(database_path, &temporary.path);
+    hooks.after_lock_closed(database_path, &temporary_display_path);
     database_anchor.ensure_path_matches(
         requested_database_path,
         "database target changed after the VACUUM lock closed",
@@ -233,7 +283,7 @@ fn vacuum_into_with_runtime<Ops: FileOperations, Hooks: SwapHooks>(
         requested_database_path,
         database_path,
         database_anchor.as_ref(),
-        &temporary.path,
+        &temporary_display_path,
         &proposed_backup_path,
         identity,
         hard_links,
@@ -245,23 +295,25 @@ fn vacuum_into_with_runtime<Ops: FileOperations, Hooks: SwapHooks>(
     let backup_path = swap_result?;
 
     hooks.after_rename(database_path);
-    sync_file_and_parent(database_path)?;
-    if let Err(verification_error) = verify_swapped_database(database_path) {
+    sync_file_and_parent(&anchored_database_path)?;
+    if let Err(verification_error) = verify_swapped_database(&anchored_database_path) {
+        let rollback_backup = backup_path.as_deref().unwrap_or(&proposed_backup_path);
+        let rollback_backup = database_anchor.sibling_path(rollback_backup)?;
         rollback_after_verification_failure(
             operations,
-            database_path,
-            backup_path.as_deref().unwrap_or(&proposed_backup_path),
+            &anchored_database_path,
+            &rollback_backup,
             backup_path.is_some(),
         )?;
         return Err(verification_error);
     }
-    let compacted_bytes = file_size(database_path)?;
+    let compacted_bytes = file_size(&anchored_database_path)?;
     cleanup_temporary_sidecars(operations, &temporary.path);
     if options.skip_backup
         && let Some(backup_path) = &backup_path
     {
         operations
-            .remove_file(backup_path)
+            .remove_anchored(database_anchor.as_ref(), backup_path)
             .map_err(|source| io_error(backup_path, source))?;
     }
 
@@ -295,15 +347,16 @@ fn swap_critical_section<Ops: FileOperations, Hooks: SwapHooks>(
         "database target changed before swap",
     )?;
     database_anchor.ensure_resolved_path_matches("resolved database target changed before swap")?;
-    if file_identity(database_path)? != expected_identity {
+    if database_anchor.identity()? != expected_identity {
         return Err(database_busy("source file identity changed before swap"));
     }
-    ensure_sidecars_quiescent(database_path)?;
-    remove_quiescent_sidecars(operations, database_path)?;
+    let anchored_database_path = database_anchor.inspection_path();
+    ensure_sidecars_quiescent(&anchored_database_path)?;
+    remove_quiescent_sidecars(operations, &anchored_database_path)?;
 
     let backup_path = create_recovery_link(
         operations,
-        database_path,
+        database_anchor,
         backup_path,
         hard_links,
         skip_backup,
@@ -322,13 +375,17 @@ fn swap_critical_section<Ops: FileOperations, Hooks: SwapHooks>(
         expected_identity,
         "anchored database changed before replacement",
     )?;
-    if let Err(source) = operations.rename(temporary_path, database_path) {
-        if let Some(backup_path) = &backup_path
-            && operations.remove_file(backup_path).is_err()
-        {
+    if let Err(source) = operations.rename_anchored(database_anchor, temporary_path) {
+        let failed_backup_cleanup = backup_path.as_ref().and_then(|backup_path| {
+            operations
+                .remove_anchored(database_anchor, backup_path)
+                .is_err()
+                .then(|| backup_path.clone())
+        });
+        if let Some(backup_path) = failed_backup_cleanup {
             return Err(Error::SwapRollbackFailed {
                 database_path: database_path.to_path_buf(),
-                backup_path: backup_path.clone(),
+                backup_path,
             });
         }
         return Err(platform::rename_error(database_path, source));
@@ -583,7 +640,7 @@ fn remove_quiescent_sidecars<Ops: FileOperations>(
 
 fn create_recovery_link<Ops: FileOperations>(
     operations: &Ops,
-    database_path: &Path,
+    database_anchor: &AnchoredDatabaseFile,
     backup_path: &Path,
     hard_links: bool,
     skip_backup: bool,
@@ -592,27 +649,33 @@ fn create_recovery_link<Ops: FileOperations>(
         return Ok(None);
     }
 
-    refuse_destination_symlink(backup_path)?;
+    refuse_destination_symlink(&database_anchor.sibling_path(backup_path)?)?;
     loop {
-        let candidate = available_backup_candidate(backup_path)?;
-        refuse_destination_symlink(&candidate)?;
+        let candidate = available_backup_candidate(database_anchor, backup_path)?;
+        refuse_destination_symlink(&database_anchor.sibling_path(&candidate)?)?;
         let result = if hard_links {
-            operations.hard_link(database_path, &candidate).map(|()| 0)
+            operations
+                .hard_link_anchored(database_anchor, &candidate)
+                .map(|()| 0)
         } else {
-            operations.copy_exclusive(database_path, &candidate)
+            operations.copy_anchored_exclusive(database_anchor, &candidate)
         };
         match result {
             Ok(_) => return Ok(Some(candidate)),
             Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
-                refuse_destination_symlink(&candidate)?;
+                refuse_destination_symlink(&database_anchor.sibling_path(&candidate)?)?;
             }
             Err(source) => return Err(io_error(&candidate, source)),
         }
     }
 }
 
-fn available_backup_candidate(backup_path: &Path) -> Result<PathBuf, Error> {
-    match fs::symlink_metadata(backup_path) {
+fn available_backup_candidate(
+    database_anchor: &AnchoredDatabaseFile,
+    backup_path: &Path,
+) -> Result<PathBuf, Error> {
+    let anchored_path = database_anchor.sibling_path(backup_path)?;
+    match fs::symlink_metadata(&anchored_path) {
         Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(backup_path.to_path_buf()),
         Err(source) => Err(io_error(backup_path, source)),
         Ok(_) => {
@@ -878,7 +941,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::db::{ConnectionOptions, open_read_write};
+    use crate::db::{ConnectionOptions, anchor_for_holder_scan, open_read_write};
     use crate::paths::Target;
 
     const USER_VERSION: i64 = 42;
@@ -1499,9 +1562,15 @@ mod tests {
         fs::write(&redirected, b"sentinel bytes").expect("sentinel should be written");
         symlink(&redirected, &destination).expect("destination symlink should be created");
 
-        let error =
-            create_recovery_link(&SystemFileOperations, &source, &destination, false, false)
-                .expect_err("copy backup should refuse an existing destination symlink");
+        let anchor = anchor_for_holder_scan(&source).expect("source should be anchored");
+        let error = create_recovery_link(
+            &SystemFileOperations,
+            anchor.as_ref(),
+            &destination,
+            false,
+            false,
+        )
+        .expect_err("copy backup should refuse an existing destination symlink");
 
         assert!(matches!(error, Error::Io { .. }));
         assert_eq!(
@@ -1617,6 +1686,43 @@ mod tests {
         assert_eq!(
             fs::read(displaced).expect("original source should remain readable"),
             fixture.original_bytes
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn anchored_rename_stays_in_pinned_parent_during_ancestor_swap() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let live_directory = directory.path().join("live");
+        let displaced_directory = directory.path().join("displaced");
+        fs::create_dir(&live_directory).expect("database directory should be created");
+        let database_path = live_directory.join("opencode.db");
+        let temporary_path = live_directory.join("compacted.db");
+        fs::write(&database_path, b"original").expect("database fixture should be created");
+        fs::write(&temporary_path, b"compacted").expect("temporary fixture should be created");
+        let anchor =
+            crate::db::anchor_for_holder_scan(&database_path).expect("database should be anchored");
+
+        fs::rename(&live_directory, &displaced_directory)
+            .expect("database directory should be displaced");
+        fs::create_dir(&live_directory).expect("attacker directory should be created");
+        fs::write(&database_path, b"attacker database")
+            .expect("attacker database should be created");
+        fs::write(&temporary_path, b"attacker temporary")
+            .expect("attacker temporary should be created");
+
+        anchor
+            .rename_sibling_over_source(&temporary_path)
+            .expect("anchored rename should succeed");
+
+        assert_eq!(
+            fs::read(displaced_directory.join("opencode.db"))
+                .expect("pinned database should remain readable"),
+            b"compacted"
+        );
+        assert_eq!(
+            fs::read(&database_path).expect("attacker database should remain readable"),
+            b"attacker database"
         );
     }
 
