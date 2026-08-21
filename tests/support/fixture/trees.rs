@@ -16,7 +16,7 @@ pub(super) fn create_storage(
     }
     let mut orphans = Vec::with_capacity(config.orphan_storage_file_count);
     for index in 0..config.orphan_storage_file_count {
-        let path = bucket.join(format!("ses_orphan_{index}.json"));
+        let path = bucket.join(format!("ses_orphan{index}.json"));
         fs::write(&path, b"{}")?;
         orphans.push(path);
     }

@@ -4,8 +4,10 @@ mod fixture;
 
 mod select {
     mod orphans {
-        use std::collections::BTreeSet;
+        use std::{collections::BTreeSet, fs};
 
+        use oc_clean::analyze::orphans::analyze;
+        use oc_clean::assets::storage::{SweepScope, sweep};
         use oc_clean::db::{ConnectionOptions, ReadOnlyConnection, open_read_only};
         use oc_clean::paths::{Target, derived_paths};
         use oc_clean::select::orphans::{
@@ -102,6 +104,38 @@ mod select {
                 fixture.orphan_storage_files.iter().cloned().collect()
             );
             assert_eq!(selected.snapshot_directories, expected_snapshots);
+        }
+
+        #[test]
+        fn strict_storage_names_match_between_preview_analysis_and_apply() {
+            let fixture = Fixture::build(&FixtureConfig::default()).expect("fixture should build");
+            let paths = derived_paths(fixture.root());
+            let bucket = paths.storage.join("regression");
+            fs::create_dir_all(&bucket).expect("storage bucket should be created");
+            let valid = bucket.join("ses_abc123.json");
+            let invalid = bucket.join("ses_bad id.json");
+            fs::write(&valid, b"valid orphan").expect("valid orphan should be written");
+            fs::write(&invalid, b"invalid orphan").expect("invalid orphan should be written");
+
+            let database = open_fixture(&fixture);
+            let selected = select(&database, &paths).expect("orphan selection should succeed");
+            let census = analyze(&database, &paths).expect("orphan census should succeed");
+
+            assert_eq!(selected.storage_files, BTreeSet::from([valid.clone()]));
+            assert_eq!(census.orphan_storage_files.count, 1);
+            assert!(!selected.storage_files.contains(&invalid));
+
+            let report = sweep(&database, &paths.storage, SweepScope::AllOrphans)
+                .expect("orphan storage sweep should succeed");
+            let applied = [valid.clone(), invalid.clone()]
+                .into_iter()
+                .filter(|path| !path.exists())
+                .collect::<BTreeSet<_>>();
+
+            assert_eq!(report.deleted_files, census.orphan_storage_files.count);
+            assert_eq!(applied, selected.storage_files);
+            assert_eq!(applied, BTreeSet::from([valid]));
+            assert!(invalid.exists());
         }
 
         #[test]

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::types::ValueRef;
 
 use crate::analyze::{attribution, orphans as orphan_census, space};
+use crate::assets::storage::session_id_from_path;
 use crate::cli::types::{Duration, Size};
 use crate::db::DatabaseConnection;
 use crate::error::Error;
@@ -636,20 +637,13 @@ fn storage_files(
                 .file_type()
                 .map_err(|source| io_error(&entry.path(), source))?
                 .is_file()
-                && storage_session_id(&entry.path()).is_some_and(|id| session_ids.contains(id))
+                && session_id_from_path(&entry.path()).is_some_and(|id| session_ids.contains(id))
             {
                 selected.insert(entry.path());
             }
         }
     }
     Ok(selected)
-}
-
-fn storage_session_id(path: &Path) -> Option<&str> {
-    let name = path.file_name()?.to_str()?;
-    let id = name.strip_suffix(".json")?;
-    let suffix = id.strip_prefix("ses_")?;
-    (!suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())).then_some(id)
 }
 
 fn snapshot_directories(

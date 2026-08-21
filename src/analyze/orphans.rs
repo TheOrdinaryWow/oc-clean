@@ -5,6 +5,7 @@ use std::path::Path;
 use rusqlite::Connection;
 use rusqlite::types::ValueRef;
 
+use crate::assets::storage::session_id_from_path;
 use crate::db::DatabaseConnection;
 use crate::error::Error;
 use crate::paths::DerivedPaths;
@@ -206,7 +207,7 @@ fn orphan_storage_files(
         }
         for entry in directory_entries(&bucket.path())? {
             if entry_is_file(&entry)?
-                && storage_session_id(&entry.path()).is_some_and(|id| !session_ids.contains(id))
+                && session_id_from_path(&entry.path()).is_some_and(|id| !session_ids.contains(id))
             {
                 result.count = result.count.saturating_add(1);
                 result.bytes = result.bytes.saturating_add(metadata(&entry.path())?.len());
@@ -270,13 +271,6 @@ fn entry_is_file(entry: &fs::DirEntry) -> Result<bool, Error> {
         .file_type()
         .map(|file_type| file_type.is_file())
         .map_err(|source| io_error(&entry.path(), source))
-}
-
-fn storage_session_id(path: &Path) -> Option<&str> {
-    (path.extension()? == "json")
-        .then(|| path.file_stem()?.to_str())
-        .flatten()
-        .filter(|id| id.starts_with("ses_"))
 }
 
 fn metadata(path: &Path) -> Result<fs::Metadata, Error> {

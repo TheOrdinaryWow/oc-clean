@@ -67,19 +67,19 @@ pub fn sweep<Access>(
             if !entry_is_file(&entry)? {
                 continue;
             }
-            let Some(session_id) = storage_session_id(&entry) else {
+            let path = entry.path();
+            let Some(session_id) = session_id_from_path(&path) else {
                 report.non_conforming_files = report.non_conforming_files.saturating_add(1);
                 continue;
             };
-            if !scope.includes(&session_id) {
+            if !scope.includes(session_id) {
                 continue;
             }
-            if session_exists(database.connection(), &session_id)? {
+            if session_exists(database.connection(), session_id)? {
                 report.retained_live_session_files =
                     report.retained_live_session_files.saturating_add(1);
                 continue;
             }
-            let path = entry.path();
             match fs::remove_file(&path) {
                 Ok(()) => report.deleted_files = report.deleted_files.saturating_add(1),
                 Err(source) => report.file_errors.push(SweepFileError { path, source }),
@@ -108,11 +108,10 @@ fn session_exists(connection: &Connection, session_id: &str) -> Result<bool, Err
         .map_err(|source| sqlite_error("re-validating a storage file session", source))
 }
 
-fn storage_session_id(entry: &fs::DirEntry) -> Option<String> {
-    let filename = entry.file_name();
-    let filename = filename.to_str()?;
+pub(crate) fn session_id_from_path(path: &Path) -> Option<&str> {
+    let filename = path.file_name()?.to_str()?;
     let session_id = filename.strip_suffix(".json")?;
-    is_session_id(session_id).then(|| session_id.to_owned())
+    is_session_id(session_id).then_some(session_id)
 }
 
 fn is_session_id(value: &str) -> bool {
