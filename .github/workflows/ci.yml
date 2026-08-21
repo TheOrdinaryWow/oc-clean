@@ -7,6 +7,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
 jobs:
   test:
     name: Test (${{ matrix.os }})
@@ -51,13 +59,67 @@ jobs:
             ${{ runner.os }}-nightly-
 
       - name: Check formatting
-        run: cargo fmt --check
+        run: cargo fmt --all -- --check
 
       - name: Lint
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Build
-        run: cargo build
+        run: cargo build --all-features
 
       - name: Test
-        run: cargo nextest run
+        run: cargo nextest run --all-features --no-tests=pass
+
+      - name: Doctests
+        run: cargo test --doc --all-features
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install nightly Rust toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview, rust-src
+
+      - name: Install cargo-llvm-cov and cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov,cargo-nextest
+
+      - name: Cache Cargo registry and build artifacts
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-coverage-${{ steps.toolchain.outputs.cachekey }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-coverage-
+
+      # AGENTS.md sets 80 percent line coverage as the project floor.
+      - name: Enforce line coverage floor
+        run: cargo llvm-cov --all-features nextest --no-tests=pass --fail-under-lines 80
+
+  audit:
+    name: Dependency advisories
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Scan dependencies
+        run: cargo audit --deny warnings
