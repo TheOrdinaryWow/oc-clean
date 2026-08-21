@@ -8,6 +8,7 @@ use std::path::Path;
 
 use crate::error::Error;
 
+const ERROR_ACCESS_DENIED: i32 = 5;
 const ERROR_SHARING_VIOLATION: i32 = 32;
 const ERROR_LOCK_VIOLATION: i32 = 33;
 const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
@@ -46,7 +47,7 @@ pub(super) fn rename_over(source: &Path, destination: &Path) -> io::Result<()> {
 pub(super) fn rename_error(destination: &Path, source: io::Error) -> Error {
     if matches!(
         source.raw_os_error(),
-        Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+        Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
     ) {
         Error::DatabaseBusy {
             holders: Vec::new(),
@@ -108,10 +109,14 @@ mod tests {
 
     #[test]
     fn other_rename_errors_remain_io_errors() {
+        const ERROR_FILE_NOT_FOUND: i32 = 2;
+
         let path = Path::new("opencode.db");
 
-        let error = rename_error(path, io::Error::from_raw_os_error(5));
+        let error = rename_error(path, io::Error::from_raw_os_error(ERROR_FILE_NOT_FOUND));
 
-        assert!(matches!(error, Error::Io { source, .. } if source.raw_os_error() == Some(5)));
+        assert!(
+            matches!(error, Error::Io { source, .. } if source.raw_os_error() == Some(ERROR_FILE_NOT_FOUND))
+        );
     }
 }
