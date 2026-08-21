@@ -3,6 +3,7 @@ use std::path::Path;
 use crate::analyze::space::{self, FileSpace};
 use crate::cli::{CleanArgs, Cli};
 use crate::db::ReadWriteConnection;
+use crate::delete::sessions::DEFAULT_BATCH_SIZE;
 use crate::error::Error;
 use crate::reclaim::headroom::{
     FreeSpaceProvider, HeadroomInput, HeadroomVerdict, evaluate_headroom,
@@ -141,7 +142,7 @@ fn one_batch_wal_allowance(selected_bytes: u64, selected_count: usize, page_size
         return u64::from(page_size);
     }
     let count = u64::try_from(selected_count).unwrap_or(u64::MAX);
-    let batch = count.min(500);
+    let batch = count.min(u64::try_from(DEFAULT_BATCH_SIZE).unwrap_or(u64::MAX));
     selected_bytes
         .div_ceil(count)
         .saturating_mul(batch)
@@ -169,5 +170,26 @@ fn incremental_error(error: IncrementalVacuumError) -> Error {
 fn interrupted(completed: &str) -> Error {
     Error::Interrupted {
         completed: completed.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::delete::sessions::DEFAULT_BATCH_SIZE;
+
+    #[test]
+    fn wal_allowance_scales_to_the_session_delete_batch_size() {
+        let selected_count = DEFAULT_BATCH_SIZE.saturating_mul(2);
+        let selected_bytes = u64::try_from(selected_count)
+            .expect("test count should fit u64")
+            .saturating_mul(10);
+        assert_eq!(
+            one_batch_wal_allowance(selected_bytes, selected_count, 4_096),
+            u64::try_from(DEFAULT_BATCH_SIZE)
+                .expect("batch size should fit u64")
+                .saturating_mul(10)
+                .saturating_add(4_096)
+        );
     }
 }
