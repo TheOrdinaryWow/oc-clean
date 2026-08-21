@@ -312,11 +312,11 @@ impl AnchoredDatabaseFile {
     pub(crate) fn hard_link_to(&self, destination: &Path) -> io::Result<()> {
         let destination = self.sibling_name_io(destination)?;
         linkat(
-            rustix::fs::CWD,
-            descriptor_path(&self.descriptor),
+            &self.parent_descriptor,
+            self.file_name.as_os_str(),
             &self.parent_descriptor,
             destination,
-            AtFlags::SYMLINK_FOLLOW,
+            AtFlags::empty(),
         )
         .map_err(Into::into)
     }
