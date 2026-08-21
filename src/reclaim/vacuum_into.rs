@@ -1262,7 +1262,8 @@ mod tests {
         }
         #[cfg(not(unix))]
         {
-            left == right
+            left.as_os_str().to_string_lossy().to_lowercase()
+                == right.as_os_str().to_string_lossy().to_lowercase()
         }
     }
 
@@ -1483,7 +1484,8 @@ mod tests {
         }
         #[cfg(not(unix))]
         {
-            left == right
+            left.as_os_str().to_string_lossy().to_lowercase()
+                == right.as_os_str().to_string_lossy().to_lowercase()
         }
     }
 
