@@ -2,9 +2,25 @@ pub mod types;
 
 use std::path::PathBuf;
 
+use clap::builder::BoolishValueParser;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use self::types::{Duration, Size};
+
+/// Value parser for every switch that can also be set from the environment.
+///
+/// A command line writes `--flag` and never a value, but an environment variable has to spell
+/// one out, and there is no single spelling operators agree on: shell scripts export `1`, CI
+/// systems write `true`, and configuration files use `yes` or `on`. clap's default boolean
+/// parser accepts only `true` and `false`, which rejects the rest with a confusing message about
+/// a flag the user never typed a value for.
+///
+/// `BoolishValueParser` accepts `1`/`0`, `true`/`false`, `yes`/`no`, `y`/`n`, `t`/`f`, and
+/// `on`/`off`, case-insensitively. Only `true` and `false` are advertised in `--help`, so the
+/// help output stays as short as it is now.
+fn boolish() -> BoolishValueParser {
+    BoolishValueParser::new()
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -42,7 +58,7 @@ pub struct Cli {
     pub log: LogMode,
 
     /// Preview the selection and exit without mutating anything.
-    #[arg(long, env = "OCC_DRY_RUN", global = true)]
+    #[arg(long, env = "OCC_DRY_RUN", global = true, value_parser = boolish())]
     pub dry_run: bool,
 
     #[arg(long, global = true)]
@@ -108,11 +124,11 @@ pub struct CleanArgs {
     pub larger_than: Option<Size>,
 
     /// Select archived sessions.
-    #[arg(long, env = "OCC_ARCHIVED")]
+    #[arg(long, env = "OCC_ARCHIVED", value_parser = boolish())]
     pub archived: bool,
 
     /// Include database and external-storage orphans.
-    #[arg(long, env = "OCC_ORPHANS")]
+    #[arg(long, env = "OCC_ORPHANS", value_parser = boolish())]
     pub orphans: bool,
 
     /// Retain this many most recently active root sessions per project.
@@ -120,19 +136,19 @@ pub struct CleanArgs {
     pub keep_recent: u64,
 
     /// Use incremental auto-vacuum instead of rebuilding the database.
-    #[arg(long, env = "OCC_INCREMENTAL")]
+    #[arg(long, env = "OCC_INCREMENTAL", value_parser = boolish())]
     pub incremental: bool,
 
     /// Commit deletions without reclaiming database pages.
-    #[arg(long, env = "OCC_NO_VACUUM")]
+    #[arg(long, env = "OCC_NO_VACUUM", value_parser = boolish())]
     pub no_vacuum: bool,
 
     /// Compact retained snapshot repositories after cleanup.
-    #[arg(long, env = "OCC_GC_SNAPSHOTS")]
+    #[arg(long, env = "OCC_GC_SNAPSHOTS", value_parser = boolish())]
     pub gc_snapshots: bool,
 
     /// Also prune projects that were already empty before this cleanup.
-    #[arg(long, env = "OCC_PRUNE_EMPTY_PROJECTS")]
+    #[arg(long, env = "OCC_PRUNE_EMPTY_PROJECTS", value_parser = boolish())]
     pub prune_empty_projects: bool,
 
     /// Limit the selected-session preview listed before deletion.
@@ -140,7 +156,7 @@ pub struct CleanArgs {
     pub top: usize,
 
     /// Emit the report as JSON on stdout.
-    #[arg(long, env = "OCC_JSON")]
+    #[arg(long, env = "OCC_JSON", value_parser = boolish())]
     pub json: bool,
 }
 
@@ -167,7 +183,7 @@ impl LogMode {
 #[derive(Debug, Args)]
 pub struct AnalyzeArgs {
     /// Emit the report as one stable JSON object on stdout.
-    #[arg(long, env = "OCC_JSON")]
+    #[arg(long, env = "OCC_JSON", value_parser = boolish())]
     pub json: bool,
 
     /// Limit the largest-session rollup.
@@ -175,25 +191,25 @@ pub struct AnalyzeArgs {
     pub top: usize,
 
     /// Add the technical layers: orphan census, external directories, object space, row counts.
-    #[arg(long, env = "OCC_DETAILED")]
+    #[arg(long, env = "OCC_DETAILED", value_parser = boolish())]
     pub detailed: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct DoctorArgs {
     /// Emit the report as one stable JSON object on stdout.
-    #[arg(long, env = "OCC_JSON")]
+    #[arg(long, env = "OCC_JSON", value_parser = boolish())]
     pub json: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct VacuumArgs {
     /// Emit the report as one stable JSON object on stdout.
-    #[arg(long, env = "OCC_JSON")]
+    #[arg(long, env = "OCC_JSON", value_parser = boolish())]
     pub json: bool,
 
     /// Reclaim freelist pages from a database already using incremental auto-vacuum.
-    #[arg(long, env = "OCC_INCREMENTAL")]
+    #[arg(long, env = "OCC_INCREMENTAL", value_parser = boolish())]
     pub incremental: bool,
 }
 
@@ -325,6 +341,58 @@ mod tests {
             DESTRUCTIVE_OPTIONS
                 .iter()
                 .all(|option| checked.contains(*option))
+        );
+    }
+
+    #[test]
+    fn boolean_environment_bindings_accept_the_shapes_operators_actually_write() {
+        // Values a shell script or CI system is likely to export for an on/off switch. Parsing
+        // is exercised end-to-end in the environment-binding integration test; this checks that
+        // every switch advertises the same accepted set, so none is left on clap's default
+        // `true`/`false`-only parser.
+        const ACCEPTED: [&str; 8] = ["1", "0", "true", "false", "yes", "no", "on", "off"];
+
+        fn assert_accepts(command: &Command, checked: &mut BTreeSet<String>) {
+            for argument in command.get_arguments() {
+                let Some(long) = argument.get_long() else {
+                    continue;
+                };
+                if argument.get_env().is_none() || !checked.insert(long.to_owned()) {
+                    continue;
+                }
+                // Only the on/off switches take a boolean-shaped value.
+                if !matches!(argument.get_action(), clap::ArgAction::SetTrue) {
+                    continue;
+                }
+
+                let possible = argument
+                    .get_value_parser()
+                    .possible_values()
+                    .map(|values| {
+                        values
+                            .map(|value| value.get_name().to_owned())
+                            .collect::<BTreeSet<_>>()
+                    })
+                    .unwrap_or_default();
+                for value in ACCEPTED {
+                    assert!(
+                        possible.contains(value),
+                        "--{long} should accept `{value}`, accepts {possible:?}"
+                    );
+                }
+            }
+            for subcommand in command.get_subcommands() {
+                assert_accepts(subcommand, checked);
+            }
+        }
+
+        let mut command = Cli::command();
+        command.build();
+        let mut checked = BTreeSet::new();
+        assert_accepts(&command, &mut checked);
+        assert!(
+            checked.contains("detailed"),
+            "the walk should have reached the subcommand flags"
         );
     }
 

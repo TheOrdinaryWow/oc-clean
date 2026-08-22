@@ -5,6 +5,52 @@ use super::fixture::{Fixture, FixtureConfig};
 use super::support::{assert_code, command, file_hash, json, row_count, session_ids, table_counts};
 
 #[test]
+fn boolean_environment_variables_accept_shell_and_ci_spellings() {
+    let fixture = Fixture::build(&FixtureConfig {
+        session_count: 2,
+        ..FixtureConfig::default()
+    })
+    .expect("fixture should build");
+
+    // A shell script exports `1`, a CI system writes `true`, a config file uses `yes` or `on`.
+    // All four must reach the same flag, and their negations must leave it off.
+    for value in ["1", "true", "TRUE", "yes", "on"] {
+        let output = command(&fixture, "analyze")
+            .env("OCC_DETAILED", value)
+            .env("OCC_JSON", "1")
+            .output()
+            .expect("analyze should run");
+        assert_code(&output, 0);
+        assert_eq!(
+            json(&output)["mode"],
+            "detailed",
+            "OCC_DETAILED={value} should enable the flag"
+        );
+    }
+
+    for value in ["0", "false", "FALSE", "no", "off"] {
+        let output = command(&fixture, "analyze")
+            .env("OCC_DETAILED", value)
+            .env("OCC_JSON", "yes")
+            .output()
+            .expect("analyze should run");
+        assert_code(&output, 0);
+        assert_eq!(
+            json(&output)["mode"],
+            "standard",
+            "OCC_DETAILED={value} should leave the flag off"
+        );
+    }
+
+    // An unrecognized value is still rejected rather than silently treated as one or the other.
+    let output = command(&fixture, "analyze")
+        .env("OCC_DETAILED", "maybe")
+        .output()
+        .expect("analyze should run");
+    assert_code(&output, 2);
+}
+
+#[test]
 fn analyze_reports_every_layer_in_human_and_json_forms() {
     let fixture = Fixture::build(&FixtureConfig {
         project_count: 2,

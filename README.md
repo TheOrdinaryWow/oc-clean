@@ -198,6 +198,8 @@ The table is the complete set of long flags defined by the current clap interfac
 
 The executable is named `oc-clean`, while its own environment-variable prefix is `OCC_`. The current clap interface exposes an `OCC_*` environment binding for every non-destructive option across all four subcommands; destructive switches intentionally require visible command-line input.
 
+On/off switches read `1`, `true`, `yes`, `y`, `t`, and `on` as enabled, and `0`, `false`, `no`, `n`, `f`, and `off` as disabled, ignoring case. A value outside those sets is rejected with exit code 2 rather than guessed at. Only `true` and `false` appear in `--help`, because listing twelve spellings would crowd the output without telling anyone anything new.
+
 `OCC_CHANNEL` is the environment equivalent of `--channel`; explicit `--db`/`OCC_DB` and `OPENCODE_DB` path selectors take precedence over channel naming. `OPENCODE_DB` belongs to OpenCode and participates in fallback database discovery after `--db` and `OCC_DB`. `XDG_DATA_HOME`, `HOME`, `USERPROFILE`, and `OPENCODE_DISABLE_CHANNEL_DB` may also influence platform discovery. `NO_COLOR` disables color in human report output. `RUST_LOG` selects the tracing filter and, when `--log`/`OCC_LOG` is unset, implicitly enables `text` diagnostics.
 
 ## Duration And Size Grammars

@@ -198,6 +198,8 @@ oc-clean vacuum --incremental
 
 可执行文件名为 `oc-clean`，而它自己的环境变量前缀是 `OCC_`。当前 clap 接口为全部四个子命令的每个非破坏性选项都提供了 `OCC_*` 环境变量绑定；破坏性开关有意要求在命令行上可见地传入。
 
+开关类变量把 `1`、`true`、`yes`、`y`、`t`、`on` 读作启用，把 `0`、`false`、`no`、`n`、`f`、`off` 读作关闭，大小写不敏感。不在这两组之内的取值会以退出码 2 拒绝，而不是猜测其含义。`--help` 里只列出 `true` 和 `false`，因为把十二种写法全部列出只会让输出变长而不增加信息。
+
 `OCC_CHANNEL` 是 `--channel` 的环境变量等价物；显式的 `--db`/`OCC_DB` 和 `OPENCODE_DB` 路径选择器优先于通道命名。`OPENCODE_DB` 属于 OpenCode，在 `--db` 和 `OCC_DB` 之后参与数据库发现回退。`XDG_DATA_HOME`、`HOME`、`USERPROFILE` 和 `OPENCODE_DISABLE_CHANNEL_DB` 也可能影响平台发现。`NO_COLOR` 会关闭人类可读报告输出中的颜色。`RUST_LOG` 用于选择 tracing 过滤级别，并在未设置 `--log`/`OCC_LOG` 时隐式启用 `text` 诊断输出。
 
 ## 时长与体积语法
