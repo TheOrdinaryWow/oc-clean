@@ -9,7 +9,7 @@ use tracing::{info, warn};
 mod signal;
 
 use super::headroom::{
-    FreeSpaceProvider, Fs2FreeSpaceProvider, HeadroomEstimate, HeadroomInput, HeadroomVerdict,
+    FreeSpaceProvider, Fs4FreeSpaceProvider, HeadroomEstimate, HeadroomInput, HeadroomVerdict,
     evaluate_headroom,
 };
 use super::incremental::{
@@ -102,7 +102,7 @@ pub fn run(cli: &Cli, arguments: &VacuumArgs, output: &mut dyn Write) -> Result<
         arguments,
         &mut input,
         output,
-        &Fs2FreeSpaceProvider,
+        &Fs4FreeSpaceProvider,
         inspector.as_ref(),
         runtime,
         &signals,

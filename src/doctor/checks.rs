@@ -9,7 +9,7 @@ use super::model::{
 use crate::db;
 use crate::error::Error;
 use crate::reclaim::headroom::{
-    FreeSpaceProvider, Fs2FreeSpaceProvider, HeadroomInput, HeadroomVerdict, evaluate_headroom,
+    FreeSpaceProvider, Fs4FreeSpaceProvider, HeadroomInput, HeadroomVerdict, evaluate_headroom,
 };
 use crate::safety::holders::{
     CommandMode, Completeness, HolderInspector, Inspection, Verdict, inspect_and_decide,
@@ -66,7 +66,7 @@ pub(super) fn vacuum_headroom(
         database_path,
         current_live_bytes,
         hardlink_supported,
-        &Fs2FreeSpaceProvider,
+        &Fs4FreeSpaceProvider,
     )
 }
 

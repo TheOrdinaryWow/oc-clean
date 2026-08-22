@@ -43,7 +43,7 @@ pub struct LargeFixtureReport {
 }
 
 pub(super) fn ensure_capacity(directory: &Path, target_size_bytes: u64) -> FixtureResult<()> {
-    let available_bytes = fs2::available_space(directory)?;
+    let available_bytes = fs4::available_space(directory)?;
     let reserve_bytes = (target_size_bytes / 10).max(MIN_DISK_RESERVE_BYTES);
     let required_bytes = target_size_bytes.saturating_add(reserve_bytes);
     if required_bytes > available_bytes {

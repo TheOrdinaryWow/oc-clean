@@ -14,11 +14,11 @@ pub trait FreeSpaceProvider {
 
 /// Filesystem-backed free-space provider.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Fs2FreeSpaceProvider;
+pub struct Fs4FreeSpaceProvider;
 
-impl FreeSpaceProvider for Fs2FreeSpaceProvider {
+impl FreeSpaceProvider for Fs4FreeSpaceProvider {
     fn available_space(&self, directory: &Path) -> io::Result<u64> {
-        fs2::available_space(directory)
+        fs4::available_space(directory)
     }
 }
 

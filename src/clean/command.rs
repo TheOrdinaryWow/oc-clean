@@ -14,7 +14,7 @@ use crate::doctor::foreign_key_check;
 use crate::error::Error;
 use crate::parallel::{self, JobHandle};
 use crate::paths::{self, DatabaseOptions, DerivedPaths, Environment, Platform, Target};
-use crate::reclaim::headroom::{FreeSpaceProvider, Fs2FreeSpaceProvider};
+use crate::reclaim::headroom::{FreeSpaceProvider, Fs4FreeSpaceProvider};
 use crate::reclaim::incremental::{IncrementalVacuumError, check_auto_vacuum};
 use crate::report::format::{self, Style};
 use crate::report::impact::{self, Impact, ReportMode};
@@ -56,7 +56,7 @@ pub fn run(cli: &Cli, arguments: &CleanArgs, output: &mut dyn Write) -> Result<(
         arguments,
         &mut input,
         output,
-        &Fs2FreeSpaceProvider,
+        &Fs4FreeSpaceProvider,
         platform_inspector().as_ref(),
         RuntimeContext {
             stdin_is_terminal: io::stdin().is_terminal(),
