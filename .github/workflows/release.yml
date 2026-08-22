@@ -75,6 +75,12 @@ jobs:
         with:
           bin: oc-clean
           target: ${{ matrix.target }}
+          # The action reaches for `cross` whenever host and target triples differ,
+          # which includes gnu-host/musl-target on the same architecture. `cross`
+          # only ships x86_64 images, so that choice fails outright on the arm64
+          # runners. Every target here builds on a runner of its own architecture
+          # and musl-tools supplies the C compiler, so plain cargo is enough.
+          build-tool: cargo
           archive: $bin-$tag-$target
           ref: refs/tags/${{ inputs.tag }}
           include: README.md,LICENSE-MIT,LICENSE-APACHE
