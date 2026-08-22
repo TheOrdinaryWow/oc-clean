@@ -124,6 +124,22 @@ pub fn analyze<Access>(
     })
 }
 
+/// Analyzes session ages without walking the external directories.
+///
+/// The standard report shows ages but not directory accounting, and the directory walk is the
+/// expensive half: it stats every file under `storage/`, `snapshot/`, `tool-output/`, and `log/`.
+///
+/// # Errors
+///
+/// Returns [`Error::DatabaseBusy`] for SQLite lock contention, or [`Error::Sqlite`] for other age
+/// query failures.
+pub fn age_buckets<Access>(
+    database: &DatabaseConnection<Access>,
+    now_ms: i64,
+) -> Result<Vec<AgeBucket>, Error> {
+    age_distribution(database, now_ms)
+}
+
 fn age_distribution<Access>(
     database: &DatabaseConnection<Access>,
     now_ms: i64,

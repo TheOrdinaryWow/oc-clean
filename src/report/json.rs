@@ -11,7 +11,7 @@ use crate::error::Error;
 pub(super) fn write(report: &AnalysisReport, output: &mut dyn Write) -> Result<(), Error> {
     let value = json!({
         "schema_version": SCHEMA_VERSION,
-        "mode": match report.mode { ReportMode::Full => "full", ReportMode::Quick => "quick" },
+        "mode": match report.mode { ReportMode::Detailed => "detailed", ReportMode::Standard => "standard" },
         "file_space": file_space(report),
         "row_counts": report.row_counts,
         "table_space": report.table_space.as_ref().map(table_space),

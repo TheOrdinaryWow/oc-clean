@@ -55,8 +55,8 @@ oc-clean --help
 oc-clean --db /srv/opencode/opencode.db analyze
 OCC_DB=/srv/opencode/opencode.db oc-clean doctor
 oc-clean analyze --db :memory: --json
-OCC_CHANNEL=nightly oc-clean analyze --quick
-OPENCODE_DB=opencode-beta.db oc-clean analyze --quick
+OCC_CHANNEL=nightly oc-clean analyze
+OPENCODE_DB=opencode-beta.db oc-clean analyze
 ```
 
 ## 快速开始
@@ -76,14 +76,29 @@ oc-clean clean --older-than 90D
 
 ### `analyze`
 
-`analyze` 以只读方式打开数据库。完整模式会报告数据库空间分配、表与行分布、会话年龄与体积分布、孤儿数据计数、最大的会话、项目汇总，以及关联的外部存储。快速模式只做文件级统计和行数统计。
+`analyze` 以只读方式打开数据库，默认输出四个部分，顺序按照"决定删什么"这件事需要的先后排列：
+
+1. **Database File Space** — 总量、活跃数据、空闲列表、WAL 与 SHM 字节数。
+2. **Largest Sessions** — 体积最大的会话及其标题和所属项目。
+3. **Project Attribution** — 按项目汇总的字节数。
+4. **Age Distribution** — 按年龄段划分的会话数与字节数。
+
+`--detailed` 会追加四个技术性部分，它们描述的是"数据库作为数据库"的状态，而不是"哪些会话可以删"：
+
+5. **Orphan Census** — 此前删除操作遗留的行与文件。
+6. **External Directories** — storage、snapshot、tool-output、log 四个目录下的文件数与字节数。
+7. **Table and Index Space** — 按对象统计的字节占用。
+8. **Row Counts** — 每张应用表的行数。
+
+不带这个开关时，这四项是被跳过而不是被隐藏：对象空间统计要遍历 `dbstat`，孤儿普查要 stat 外部目录下的每个文件。在已提交的 1.9 GB 基准夹具上，标准报告耗时 454 ms，完整报告 1,165 ms。
 
 报告中的每个会话除体积外还会给出标题、所属项目路径、最后活跃时间和消息数量，因为会话 ID 只是一串随机字符，无法说明会话内容。项目汇总同样以绝对 worktree 路径为主键，项目 ID 保留在旁边一列。路径超出终端宽度时会从开头截断，让用于区分不同检出的末尾目录保持可见。这些描述信息只会为报告实际展示的会话查询，因此 `--top` 决定了它们的开销上限。
 
 ```sh
 oc-clean analyze
 oc-clean analyze --top 25
-oc-clean analyze --quick --json
+oc-clean analyze --detailed
+oc-clean analyze --detailed --json
 oc-clean analyze --json --log json
 ```
 
@@ -161,7 +176,7 @@ oc-clean vacuum --incremental
 | Global | `--skip-backup` | 仅命令行 | 在完整重建成功后删除临时回滚副本，而不是保留默认的 `.bak` 文件。 |
 | analyze | `--json` | `OCC_JSON` | 在 stdout 输出一个稳定的 JSON 报告。 |
 | analyze | `--top <N>` | `OCC_TOP` | 限制最大会话汇总的条数，默认 `10`。 |
-| analyze | `--quick` | `OCC_QUICK` | 只输出文件统计和行数，不做完整分布与汇总。 |
+| analyze | `--detailed` | `OCC_DETAILED` | 追加孤儿普查、外部目录、对象空间与行数统计。 |
 | doctor | `--json` | `OCC_JSON` | 在 stdout 输出一个稳定的 JSON 诊断报告。 |
 | clean | `--older-than <AGE>` | `OCC_OLDER_THAN` | 选择最近活动时间至少达到该粗粒度年龄的会话子树。 |
 | clean | `--include <PATH_OR_GLOB>` | `OCC_INCLUDE` | 选择项目路径或 glob 匹配的会话。与 `--exclude` 互斥。 |
@@ -247,7 +262,7 @@ JSON 报告契约记录在 [docs/json-report.md](docs/json-report.md)（英文�
 
 ## 实测性能
 
-已提交的基准使用一个目标为 2,000,000,000 字节的生成夹具，实际达到 1,962,291,200 字节，包含 2,675 个会话、53,500 条消息和 214,000 个片段。记录到的完整分析冷启动耗时 1,687.796 ms，热态 1,576.023 ms；快速分析耗时 8.662 ms。这些是来自 `benchmarks.json` 的实测回归参考值，本地结果会受主机硬件、文件系统、SQLite 行为、保留数据形态和缓存状态影响。
+已提交的基准使用一个目标为 2,000,000,000 字节的生成夹具，实际达到 1,962,291,200 字节，包含 2,675 个会话、53,500 条消息和 214,000 个片段。记录到的 `--detailed` 分析冷启动耗时 1,165.335 ms，热态 1,123.208 ms；标准分析耗时 453.755 ms。这些是来自 `benchmarks.json` 的实测回归参考值，本地结果会受主机硬件、文件系统、SQLite 行为、保留数据形态和缓存状态影响。
 
 在同一个 2,675 会话夹具上进行的删除批次调优结果：
 

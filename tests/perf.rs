@@ -200,12 +200,12 @@ fn performance_budgets_hold_on_the_committed_large_fixture_scale() {
         .large_report()
         .expect("bench-large fixture should carry a generation report");
 
-    let (cold, _) = timed_analyze(&fixture.database_path, false);
-    let (warm, _) = timed_analyze(&fixture.database_path, false);
-    let (quick, quick_output) = timed_analyze(&fixture.database_path, true);
-    let quick_json: serde_json::Value = serde_json::from_slice(&quick_output.stdout)
-        .expect("quick analysis should emit one JSON report");
-    assert_eq!(quick_json["mode"], "quick");
+    let (cold, _) = timed_analyze(&fixture.database_path, true);
+    let (warm, _) = timed_analyze(&fixture.database_path, true);
+    let (standard, standard_output) = timed_analyze(&fixture.database_path, false);
+    let standard_json: serde_json::Value = serde_json::from_slice(&standard_output.stdout)
+        .expect("standard analysis should emit one JSON report");
+    assert_eq!(standard_json["mode"], "standard");
 
     println!(
         "fixture_bytes={} sessions={} messages={} parts={} generation_s={:.3}",
@@ -216,19 +216,22 @@ fn performance_budgets_hold_on_the_committed_large_fixture_scale() {
         report.generation_time.as_secs_f64()
     );
     println!(
-        "analyze_full_cold_s={:.3} analyze_full_warm_s={:.3} analyze_quick_s={:.3}",
+        "analyze_detailed_cold_s={:.3} analyze_detailed_warm_s={:.3} analyze_standard_s={:.3}",
         cold.as_secs_f64(),
         warm.as_secs_f64(),
-        quick.as_secs_f64()
+        standard.as_secs_f64()
     );
 
+    // A standard report skips the object-space walk and the external-directory stat sweep, so it
+    // must stay meaningfully cheaper than the detailed one it is carved out of.
     assert!(
-        quick < Duration::from_secs(1),
-        "analyze --quick took {:.3}s; hard budget is under 1.000s",
-        quick.as_secs_f64()
+        standard < cold,
+        "analyze took {:.3}s standard versus {:.3}s detailed; the standard path must skip work",
+        standard.as_secs_f64(),
+        cold.as_secs_f64()
     );
-    assert_relative_budget("cold", cold, baseline.full_cold_ms);
-    assert_relative_budget("warm", warm, baseline.full_warm_ms);
+    assert_relative_budget("cold", cold, baseline.detailed_cold_ms);
+    assert_relative_budget("warm", warm, baseline.detailed_warm_ms);
     assert_eq!(
         DeleteOptions::default().batch_size,
         baseline.fastest_delete_batch_size,
@@ -417,8 +420,8 @@ fn matching_brace(source: &str, open_brace: usize) -> Option<usize> {
 #[cfg(feature = "bench-large")]
 struct Baseline {
     target_size_bytes: u64,
-    full_cold_ms: f64,
-    full_warm_ms: f64,
+    detailed_cold_ms: f64,
+    detailed_warm_ms: f64,
     fastest_delete_batch_size: usize,
 }
 
@@ -457,10 +460,10 @@ fn read_baseline(path: &Path) -> Baseline {
         target_size_bytes: value["fixture"]["target_size_bytes"]
             .as_u64()
             .expect("fixture target should be an integer"),
-        full_cold_ms: value["analyze"]["full_cold_ms"]
+        detailed_cold_ms: value["analyze"]["detailed_cold_ms"]
             .as_f64()
             .expect("cold baseline should be numeric"),
-        full_warm_ms: value["analyze"]["full_warm_ms"]
+        detailed_warm_ms: value["analyze"]["detailed_warm_ms"]
             .as_f64()
             .expect("warm baseline should be numeric"),
         fastest_delete_batch_size,
@@ -468,15 +471,15 @@ fn read_baseline(path: &Path) -> Baseline {
 }
 
 #[cfg(feature = "bench-large")]
-fn timed_analyze(database_path: &Path, quick: bool) -> (Duration, Output) {
+fn timed_analyze(database_path: &Path, detailed: bool) -> (Duration, Output) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_oc-clean"));
     command
         .arg("--db")
         .arg(database_path)
         .arg("analyze")
         .arg("--json");
-    if quick {
-        command.arg("--quick");
+    if detailed {
+        command.arg("--detailed");
     }
     let started = Instant::now();
     let output = command

@@ -55,8 +55,8 @@ Without an override, Linux and macOS resolve the latest channel to `~/.local/sha
 oc-clean --db /srv/opencode/opencode.db analyze
 OCC_DB=/srv/opencode/opencode.db oc-clean doctor
 oc-clean analyze --db :memory: --json
-OCC_CHANNEL=nightly oc-clean analyze --quick
-OPENCODE_DB=opencode-beta.db oc-clean analyze --quick
+OCC_CHANNEL=nightly oc-clean analyze
+OPENCODE_DB=opencode-beta.db oc-clean analyze
 ```
 
 ## Quick Start
@@ -76,14 +76,29 @@ The second command prints the same impact, asks `Proceed? [y/n]`, and deletes on
 
 ### `analyze`
 
-`analyze` opens the database read-only. Full mode reports database allocation, table and row distribution, session age and size distributions, orphan counts, largest sessions, project rollups, and associated external storage. Quick mode limits work to file-level accounting and row counts.
+`analyze` opens the database read-only and reports four sections by default, in the order an operator deciding what to delete needs them:
+
+1. **Database File Space** — total, live, freelist, WAL, and SHM bytes.
+2. **Largest Sessions** — the biggest sessions with their titles and owning projects.
+3. **Project Attribution** — bytes rolled up per project.
+4. **Age Distribution** — sessions and bytes by age band.
+
+`--detailed` appends four technical sections that describe the database as a database rather than as a set of deletable sessions:
+
+5. **Orphan Census** — rows and files left behind by earlier deletions.
+6. **External Directories** — file counts and bytes under storage, snapshot, tool-output, and log.
+7. **Table and Index Space** — per-object byte accounting.
+8. **Row Counts** — rows per application table.
+
+Those four are skipped rather than hidden without the flag: object-space accounting walks `dbstat`, and the orphan census stats every file under the external directories. On the committed 1.9 GB benchmark fixture a standard report takes 454 ms against 1,165 ms detailed.
 
 Each reported session carries its title, owning project path, last-activity date, and message count alongside its size, because a session identifier is a random string that tells an operator nothing about what the session contains. The project rollup is keyed by absolute worktree path for the same reason, with the project identifier kept beside it. A path too long for the terminal is shortened from the front, so the trailing directories that distinguish one checkout from another stay visible. Those descriptions are looked up only for the sessions the report displays, so `--top` bounds their cost.
 
 ```sh
 oc-clean analyze
 oc-clean analyze --top 25
-oc-clean analyze --quick --json
+oc-clean analyze --detailed
+oc-clean analyze --detailed --json
 oc-clean analyze --json --log json
 ```
 
@@ -161,7 +176,7 @@ The table is the complete set of long flags defined by the current clap interfac
 | Global | `--skip-backup` | CLI only | Remove the temporary rollback copy after a successful full rebuild instead of retaining the default `.bak` file. |
 | analyze | `--json` | `OCC_JSON` | Emit one stable JSON report on stdout. |
 | analyze | `--top <N>` | `OCC_TOP` | Limit the largest-session rollup; default is `10`. |
-| analyze | `--quick` | `OCC_QUICK` | Emit file accounting and row counts without full distributions and rollups. |
+| analyze | `--detailed` | `OCC_DETAILED` | Add the orphan census, external directories, object space, and row counts. |
 | doctor | `--json` | `OCC_JSON` | Emit one stable JSON diagnostic report on stdout. |
 | clean | `--older-than <AGE>` | `OCC_OLDER_THAN` | Select session subtrees whose latest activity is at least this coarse age. |
 | clean | `--include <PATH_OR_GLOB>` | `OCC_INCLUDE` | Select sessions belonging to a matching project path or glob. Conflicts with `--exclude`. |
@@ -245,7 +260,7 @@ oc-clean clean --older-than 120D --dangerously-skip-confirm --json > result.json
 
 ## Measured Performance
 
-The committed benchmark uses a generated 2,000,000,000-byte target fixture that reached 1,962,291,200 bytes with 2,675 sessions, 53,500 messages, and 214,000 parts. The recorded full analysis took 1,687.796 ms cold and 1,576.023 ms warm; quick analysis took 8.662 ms. These are measured regression references from `benchmarks.json`, and host hardware, filesystem, SQLite behavior, retained data shape, and cache state affect local results.
+The committed benchmark uses a generated 2,000,000,000-byte target fixture that reached 1,962,291,200 bytes with 2,675 sessions, 53,500 messages, and 214,000 parts. The recorded `--detailed` analysis took 1,165.335 ms cold and 1,123.208 ms warm; a standard analysis took 453.755 ms. These are measured regression references from `benchmarks.json`, and host hardware, filesystem, SQLite behavior, retained data shape, and cache state affect local results.
 
 Delete-batch tuning on the same 2,675-session fixture produced:
 

@@ -174,9 +174,9 @@ pub struct AnalyzeArgs {
     #[arg(long, env = "OCC_TOP", default_value_t = 10, value_name = "N")]
     pub top: usize,
 
-    /// Emit only file-level accounting and row counts.
-    #[arg(long, env = "OCC_QUICK")]
-    pub quick: bool,
+    /// Add the technical layers: orphan census, external directories, object space, row counts.
+    #[arg(long, env = "OCC_DETAILED")]
+    pub detailed: bool,
 }
 
 #[derive(Debug, Args)]

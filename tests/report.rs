@@ -24,6 +24,72 @@ mod report {
         String::from_utf8(output.stdout.clone()).expect("stdout should be UTF-8")
     }
 
+    /// Every section a detailed report renders, in the order the report renders them.
+    const DETAILED_HEADINGS: [&str; 8] = [
+        "Database File Space",
+        "Largest Sessions",
+        "Project Attribution",
+        "Age Distribution",
+        "Orphan Census",
+        "External Directories",
+        "Table and Index Space",
+        "Row Counts",
+    ];
+
+    /// The four sections `--detailed` adds to a standard report.
+    const DETAIL_ONLY_HEADINGS: [&str; 4] = [
+        "Orphan Census",
+        "External Directories",
+        "Table and Index Space",
+        "Row Counts",
+    ];
+
+    #[test]
+    fn a_standard_report_omits_the_technical_layers_that_detailed_adds() {
+        let fixture = Fixture::build(&FixtureConfig {
+            project_count: 2,
+            session_count: 3,
+            orphan_event_count: 2,
+            ..FixtureConfig::default()
+        })
+        .expect("fixture should build");
+
+        let human = stdout(&run(&fixture, &[]));
+        for heading in ["Database File Space", "Largest Sessions"] {
+            assert!(
+                human.contains(heading),
+                "missing heading {heading}: {human}"
+            );
+        }
+        for heading in DETAIL_ONLY_HEADINGS {
+            assert!(
+                !human.contains(heading),
+                "`{heading}` belongs to --detailed: {human}"
+            );
+        }
+
+        let json: Value = serde_json::from_slice(&run(&fixture, &["--json"]).stdout)
+            .expect("stdout should be one JSON object");
+        assert_eq!(json["mode"], "standard");
+        // The skipped layers are absent as work, not merely as output.
+        for key in [
+            "row_counts",
+            "table_space",
+            "orphans",
+            "external_directories",
+        ] {
+            assert!(json[key].is_null(), "standard report should null {key}");
+        }
+        for key in [
+            "file_space",
+            "project_attribution",
+            "largest_sessions",
+            "age_distribution",
+        ] {
+            assert!(!json[key].is_null(), "standard report should carry {key}");
+        }
+    }
+
     #[test]
     fn human_and_json_reports_cross_check_three_fields() {
         let fixture = Fixture::build(&FixtureConfig {
@@ -35,29 +101,22 @@ mod report {
         })
         .unwrap();
 
-        let human = run(&fixture, &[]);
+        let human = run(&fixture, &["--detailed"]);
         assert!(
             human.status.success(),
             "stderr: {}",
             String::from_utf8_lossy(&human.stderr)
         );
         let human = stdout(&human);
-        for heading in [
-            "Database File Space",
-            "Table and Index Space",
-            "Project Attribution",
-            "Largest Sessions",
-            "Orphan Census",
-            "Age Distribution",
-            "External Directories",
-        ] {
-            assert!(
-                human.contains(heading),
-                "missing heading {heading}: {human}"
-            );
+        let mut cursor = 0;
+        for heading in DETAILED_HEADINGS {
+            let found = human[cursor..].find(heading).unwrap_or_else(|| {
+                panic!("missing heading {heading} after the previous one: {human}")
+            });
+            cursor += found + heading.len();
         }
 
-        let json = run(&fixture, &["--json"]);
+        let json = run(&fixture, &["--detailed", "--json"]);
         assert!(
             json.status.success(),
             "stderr: {}",
@@ -65,10 +124,11 @@ mod report {
         );
         let json: Value =
             serde_json::from_slice(&json.stdout).expect("stdout should be one JSON object");
-        assert_eq!(json["schema_version"], 1);
-        assert_eq!(json["mode"], "full");
+        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["mode"], "detailed");
         for key in [
             "file_space",
+            "row_counts",
             "table_space",
             "project_attribution",
             "largest_sessions",
@@ -78,7 +138,7 @@ mod report {
         ] {
             assert!(
                 !json[key].is_null(),
-                "full report layer {key} should be present"
+                "detailed report layer {key} should be present"
             );
         }
 
@@ -190,7 +250,7 @@ mod analyze {
         }
 
         #[test]
-        fn quick_reports_file_accounting_and_row_counts_only() {
+        fn detailed_reports_the_row_counts_a_standard_run_skips() {
             let fixture = Fixture::build(&FixtureConfig {
                 project_count: 2,
                 session_count: 3,
@@ -200,24 +260,14 @@ mod analyze {
             let output = binary()
                 .args(["analyze", "--db"])
                 .arg(&fixture.database_path)
-                .args(["--quick", "--json"])
+                .args(["--detailed", "--json"])
                 .output()
                 .unwrap();
             assert!(output.status.success());
             let json: Value = serde_json::from_slice(&output.stdout).unwrap();
-            assert_eq!(json["mode"], "quick");
+            assert_eq!(json["mode"], "detailed");
             assert_eq!(json["row_counts"]["project"], 2);
             assert_eq!(json["row_counts"]["session"], 3);
-            for key in [
-                "table_space",
-                "project_attribution",
-                "largest_sessions",
-                "orphans",
-                "age_distribution",
-                "external_directories",
-            ] {
-                assert!(json[key].is_null(), "quick report should skip {key}");
-            }
         }
 
         #[test]

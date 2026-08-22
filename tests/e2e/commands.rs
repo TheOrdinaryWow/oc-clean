@@ -19,9 +19,11 @@ fn analyze_reports_every_layer_in_human_and_json_forms() {
     .expect("fixture should build");
 
     let human = command(&fixture, "analyze")
+        .arg("--detailed")
         .output()
         .expect("human analyze should run");
     let machine = command(&fixture, "analyze")
+        .arg("--detailed")
         .arg("--json")
         .output()
         .expect("JSON analyze should run");
@@ -31,18 +33,18 @@ fn analyze_reports_every_layer_in_human_and_json_forms() {
     let human = String::from_utf8(human.stdout).expect("human report should be UTF-8");
     for heading in [
         "Database File Space",
-        "Row Counts",
-        "Table and Index Space",
-        "Project Attribution",
         "Largest Sessions",
-        "Orphan Census",
+        "Project Attribution",
         "Age Distribution",
+        "Orphan Census",
         "External Directories",
+        "Table and Index Space",
+        "Row Counts",
     ] {
         assert!(human.contains(heading), "missing human layer {heading}");
     }
     let report = json(&machine);
-    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["schema_version"], 2);
     assert!(
         human.contains("Project"),
         "the session table names the owning project"

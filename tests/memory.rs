@@ -8,8 +8,14 @@ fn analyze_accepts_fresh_in_memory_database() {
 
     assert_success(&output);
     let report: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
-    assert_eq!(report["mode"], "full");
-    assert_eq!(report["row_counts"]["session"], 0);
+    assert_eq!(report["mode"], "standard");
+    assert_eq!(
+        report["largest_sessions"]
+            .as_array()
+            .expect("a standard report carries the session rollup")
+            .len(),
+        0
+    );
 }
 
 #[test]

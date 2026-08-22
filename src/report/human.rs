@@ -17,18 +17,20 @@ pub(super) fn write(
     output: &mut dyn Write,
     style: Style,
 ) -> Result<(), Error> {
+    // Order is by decreasing usefulness to an operator deciding what to delete: overall size,
+    // then what is large, then how old it is. The technical layers follow, behind `--detailed`.
     file_space(report, output, style)?;
-    row_counts(report, output, style)?;
+    largest_sessions(report, output, style)?;
+    project_attribution(report, output, style)?;
+    age_distribution(report, output, style)?;
 
-    if report.mode == ReportMode::Quick {
+    if report.mode == ReportMode::Standard {
         return Ok(());
     }
-    table_space(report, output, style)?;
-    project_attribution(report, output, style)?;
-    largest_sessions(report, output, style)?;
     orphans(report, output, style)?;
-    age_distribution(report, output, style)?;
-    external_directories(report, output, style)
+    external_directories(report, output, style)?;
+    table_space(report, output, style)?;
+    row_counts(report, output, style)
 }
 
 fn file_space(report: &AnalysisReport, output: &mut dyn Write, style: Style) -> Result<(), Error> {
@@ -53,8 +55,12 @@ fn file_space(report: &AnalysisReport, output: &mut dyn Write, style: Style) -> 
 
 fn row_counts(report: &AnalysisReport, output: &mut dyn Write, style: Style) -> Result<(), Error> {
     format::heading(output, "Row Counts", style)?;
+    let counts = report
+        .row_counts
+        .as_ref()
+        .expect("detailed report has row counts");
     let mut grid = Grid::new(style, &[("Table", Align::Left), ("Rows", Align::Right)]);
-    for (table, rows) in &report.row_counts {
+    for (table, rows) in counts {
         grid.row(vec![table.clone(), rows.to_string()]);
     }
     grid.write(output)

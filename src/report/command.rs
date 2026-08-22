@@ -33,10 +33,10 @@ pub fn run(cli: &Cli, arguments: &AnalyzeArgs, output: &mut dyn Write) -> Result
     let database = db::open_read_only(&target, ConnectionOptions::default())?;
     db::schema::inspect(database.connection(), cli.force_schema)?;
 
-    let report = if arguments.quick {
-        quick_report(&database, &target)?
+    let report = if arguments.detailed {
+        detailed_report(&database, &derived_paths, arguments.top)?
     } else {
-        full_report(&database, &derived_paths, arguments.top)?
+        standard_report(&database, &target, arguments.top)?
     };
     info!(mode = ?report.mode, "analysis complete");
 
@@ -51,7 +51,7 @@ pub fn run(cli: &Cli, arguments: &AnalyzeArgs, output: &mut dyn Write) -> Result
     }
 }
 
-fn full_report<Access>(
+fn detailed_report<Access>(
     database: &DatabaseConnection<Access>,
     paths: &DerivedPaths,
     top: usize,
@@ -77,7 +77,7 @@ fn full_report<Access>(
     progress.step("done");
     progress.finish();
 
-    Ok(AnalysisReport::full(
+    Ok(AnalysisReport::detailed(
         space,
         row_counts,
         attribution,
@@ -86,13 +86,32 @@ fn full_report<Access>(
     ))
 }
 
-fn quick_report<Access>(
+/// Analyzes only the layers the standard report renders.
+///
+/// The skipped layers are skipped as work, not merely as output: object-space accounting walks
+/// `dbstat`, the orphan census scans the external directories, and neither result would be shown.
+fn standard_report<Access>(
     database: &DatabaseConnection<Access>,
     target: &Target,
+    top: usize,
 ) -> Result<AnalysisReport, Error> {
+    let progress = progress::phases("analyze", 3);
+
+    progress.set_message("accounting for file space");
     let file_space = file_space(database.connection(), target)?;
-    let row_counts = row_counts(database.connection())?;
-    Ok(AnalysisReport::quick(file_space, row_counts))
+    progress.step("attributing project and session bytes");
+    let mut attribution = attribution::analyze(database, top)?;
+    attribution::describe(database.connection(), &mut attribution.sessions)?;
+    progress.step("building the age distribution");
+    let age_distribution = distribution::age_buckets(database, now_ms()?)?;
+    progress.step("done");
+    progress.finish();
+
+    Ok(AnalysisReport::standard(
+        file_space,
+        attribution,
+        age_distribution,
+    ))
 }
 
 fn file_space(

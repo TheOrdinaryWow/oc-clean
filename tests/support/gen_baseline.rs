@@ -29,9 +29,9 @@ fn main() -> BaselineResult<()> {
     let report = fixture
         .large_report()
         .expect("bench-large fixture should carry a generation report");
-    let cold = measure_report(&fixture.database_path, false)?;
-    let warm = measure_report(&fixture.database_path, false)?;
-    let quick = measure_report(&fixture.database_path, true)?;
+    let cold = measure_report(&fixture.database_path, true)?;
+    let warm = measure_report(&fixture.database_path, true)?;
+    let standard = measure_report(&fixture.database_path, false)?;
     let delete_measurements = measure_delete_batches()?;
 
     fs::write(
@@ -40,7 +40,7 @@ fn main() -> BaselineResult<()> {
             report,
             cold,
             warm,
-            quick,
+            standard,
             &delete_measurements,
         ))?,
     )?;
@@ -55,10 +55,10 @@ fn main() -> BaselineResult<()> {
         report.generation_time.as_secs_f64()
     );
     println!(
-        "analyze_full_cold_s={:.3} analyze_full_warm_s={:.3} analyze_quick_s={:.3}",
+        "analyze_detailed_cold_s={:.3} analyze_detailed_warm_s={:.3} analyze_standard_s={:.3}",
         cold.as_secs_f64(),
         warm.as_secs_f64(),
-        quick.as_secs_f64()
+        standard.as_secs_f64()
     );
     for measurement in &delete_measurements {
         println!(
@@ -79,12 +79,12 @@ fn output_path() -> PathBuf {
     )
 }
 
-fn measure_report(database_path: &Path, quick: bool) -> BaselineResult<Duration> {
+fn measure_report(database_path: &Path, detailed: bool) -> BaselineResult<Duration> {
     let cli = Cli {
         command: Commands::Analyze(AnalyzeArgs {
             json: true,
             top: 10,
-            quick,
+            detailed,
         }),
         db: Some(database_path.to_owned()),
         channel: None,
@@ -152,11 +152,11 @@ fn baseline_document(
     report: &LargeFixtureReport,
     cold: Duration,
     warm: Duration,
-    quick: Duration,
+    standard: Duration,
     delete_measurements: &[DeleteMeasurement],
 ) -> serde_json::Value {
     serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "fixture": {
             "target_size_bytes": report.target_size_bytes,
             "achieved_size_bytes": report.achieved_size_bytes,
@@ -167,9 +167,9 @@ fn baseline_document(
             "generation_ms": milliseconds(report.generation_time),
         },
         "analyze": {
-            "full_cold_ms": milliseconds(cold),
-            "full_warm_ms": milliseconds(warm),
-            "quick_ms": milliseconds(quick),
+            "detailed_cold_ms": milliseconds(cold),
+            "detailed_warm_ms": milliseconds(warm),
+            "standard_ms": milliseconds(standard),
         },
         "delete_batch_tuning": delete_measurements
             .iter()

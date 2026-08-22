@@ -19,23 +19,30 @@ use crate::analyze::space::{FileSpace, ObjectSpaceReport, SpaceReport};
 use crate::error::Error;
 
 /// Version of the documented JSON report contract.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
+/// How much of the analysis an invocation asked for.
+///
+/// The split is by audience, not by cost. A standard report answers "what is taking up space and
+/// can I delete it", which is what an operator opens `analyze` for. The detailed layers answer
+/// questions about the database as a database, and burying the first set under the second made
+/// the common case harder to read.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReportMode {
-    Full,
-    Quick,
+    Standard,
+    Detailed,
 }
 
 /// Normalized report consumed by both renderers.
 ///
-/// JSON always includes `schema_version`, `mode`, `file_space`, `row_counts`, and all seven layer
-/// keys. Full reports populate every layer. Quick reports set scan-backed layers to `null`.
+/// JSON always includes `schema_version`, `mode`, `file_space`, and all seven layer keys.
+/// Detailed reports populate every layer. Standard reports set the four detail layers to `null`,
+/// because the work behind them is skipped rather than merely hidden.
 #[derive(Clone, Debug)]
 pub struct AnalysisReport {
     mode: ReportMode,
     file_space: FileSpace,
-    row_counts: BTreeMap<String, u64>,
+    row_counts: Option<BTreeMap<String, u64>>,
     table_space: Option<ObjectSpaceReport>,
     project_attribution: Option<Vec<ProjectAttribution>>,
     largest_sessions: Option<Vec<SessionAttribution>>,
@@ -46,7 +53,7 @@ pub struct AnalysisReport {
 
 impl AnalysisReport {
     #[must_use]
-    pub fn full(
+    pub fn detailed(
         space: SpaceReport,
         row_counts: BTreeMap<String, u64>,
         attribution: AttributionReport,
@@ -54,9 +61,9 @@ impl AnalysisReport {
         distribution: DistributionReport,
     ) -> Self {
         Self {
-            mode: ReportMode::Full,
+            mode: ReportMode::Detailed,
             file_space: space.file,
-            row_counts,
+            row_counts: Some(row_counts),
             table_space: Some(space.objects),
             project_attribution: Some(attribution.projects),
             largest_sessions: Some(attribution.sessions),
@@ -67,16 +74,20 @@ impl AnalysisReport {
     }
 
     #[must_use]
-    pub fn quick(file_space: FileSpace, row_counts: BTreeMap<String, u64>) -> Self {
+    pub fn standard(
+        file_space: FileSpace,
+        attribution: AttributionReport,
+        age_distribution: Vec<AgeBucket>,
+    ) -> Self {
         Self {
-            mode: ReportMode::Quick,
+            mode: ReportMode::Standard,
             file_space,
-            row_counts,
+            row_counts: None,
             table_space: None,
-            project_attribution: None,
-            largest_sessions: None,
+            project_attribution: Some(attribution.projects),
+            largest_sessions: Some(attribution.sessions),
             orphans: None,
-            age_distribution: None,
+            age_distribution: Some(age_distribution),
             external_directories: None,
         }
     }
