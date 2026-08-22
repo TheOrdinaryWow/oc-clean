@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.1](https://github.com/TheOrdinaryWow/oc-clean/compare/v0.1.0...v0.1.1) (2026-08-22)
+
+
+### Bug Fixes
+
+* **ci:** build musl targets natively instead of through cross ([2a63acc](https://github.com/TheOrdinaryWow/oc-clean/commit/2a63acc2e5b6d953d2451e9c74b92b69d5a6b055))
+* **ci:** name the release branch after the component so releases get tagged ([a60b200](https://github.com/TheOrdinaryWow/oc-clean/commit/a60b200ea814d759a65b7205238605eb88ad94bc))
+
 ## 0.1.0 (2026-08-22)
 
 
