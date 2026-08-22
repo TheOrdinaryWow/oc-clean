@@ -78,7 +78,7 @@ The second command prints the same impact, asks `Proceed? [y/n]`, and deletes on
 
 `analyze` opens the database read-only. Full mode reports database allocation, table and row distribution, session age and size distributions, orphan counts, largest sessions, project rollups, and associated external storage. Quick mode limits work to file-level accounting and row counts.
 
-Each reported session carries its title, last-activity date, and message count alongside its size, because a session identifier is a random string that tells an operator nothing about what the session contains. Those descriptions are looked up only for the sessions the report displays, so `--top` bounds their cost.
+Each reported session carries its title, owning project path, last-activity date, and message count alongside its size, because a session identifier is a random string that tells an operator nothing about what the session contains. The project column shows the absolute worktree path; a path too long for the terminal is shortened from the front, so the trailing directories that distinguish one checkout from another stay visible. Those descriptions are looked up only for the sessions the report displays, so `--top` bounds their cost.
 
 ```sh
 oc-clean analyze
@@ -124,7 +124,7 @@ oc-clean clean --older-than 6M --gc-snapshots
 oc-clean clean --older-than 1Y --dangerously-skip-confirm --json
 ```
 
-The impact report lists the largest selected sessions with their titles before any deletion, capped by `--top`, so a selection can be recognized rather than only counted.
+The impact report lists the largest selected sessions with their titles and owning project paths before any deletion, capped by `--top`, so a selection can be recognized rather than only counted.
 
 Confirmed cleanup deletes sessions in bounded transactions of 2,500 candidates, deletes matching event aggregates explicitly, prunes affected empty projects, removes corresponding storage and snapshot artifacts, runs integrity checks, and rebuilds the database by default. `--no-vacuum` commits deletion while leaving free pages in the database file. `--incremental` uses incremental auto-vacuum and requires the source database to have been configured and rebuilt previously with `auto_vacuum=INCREMENTAL`. `--gc-snapshots` also compacts retained snapshot repositories.
 

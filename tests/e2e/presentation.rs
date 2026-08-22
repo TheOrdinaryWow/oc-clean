@@ -96,6 +96,10 @@ fn a_clean_dry_run_previews_the_sessions_it_would_delete() {
     let rendered = String::from_utf8(human.stdout).expect("dry run should be UTF-8");
     assert!(rendered.contains("Cleanup Impact (dry-run)"));
     assert!(rendered.contains("Largest Selected Sessions"));
+    assert!(
+        rendered.contains("Project"),
+        "the preview names the owning project"
+    );
 
     let preview = json(&machine)["impact"]["preview"]
         .as_array()
@@ -111,6 +115,13 @@ fn a_clean_dry_run_previews_the_sessions_it_would_delete() {
         assert!(session["session_id"].is_string());
         assert!(session["title"].is_string());
         assert!(session["message_count"].is_u64());
+        let path = session["project_path"]
+            .as_str()
+            .expect("a fixture session's project row exists, so its path is reported");
+        assert!(
+            path.starts_with('/'),
+            "a project path is absolute, got `{path}`"
+        );
     }
 }
 

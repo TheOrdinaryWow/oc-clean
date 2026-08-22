@@ -117,6 +117,15 @@ pub struct SessionDetails {
     pub title: String,
     pub time_updated_ms: i64,
     pub message_count: u64,
+    /// Absolute worktree path of the owning project, when that project still exists.
+    ///
+    /// A project identifier is a hash, so it cannot tell an operator which checkout a session
+    /// belongs to. The worktree path can.
+    ///
+    /// It stays optional because `PRAGMA foreign_keys` is per-connection in SQLite: the cascade
+    /// from `session.project_id` only fires for a writer that enabled it, so a tool that did not
+    /// can delete a project row and leave its sessions behind, naming a project that is gone.
+    pub project_path: Option<String>,
 }
 
 // OpenCode stores messages under two coexisting models: the legacy `message` table and the
@@ -131,8 +140,10 @@ SELECT
     MAX(
         (SELECT COUNT(*) FROM message WHERE message.session_id = session.id),
         (SELECT COUNT(*) FROM session_message WHERE session_message.session_id = session.id)
-    )
+    ),
+    project.worktree
 FROM session
+LEFT JOIN project ON project.id = session.project_id
 WHERE session.id = ?1
 ";
 
@@ -163,15 +174,20 @@ pub fn describe(connection: &Connection, sessions: &mut [SessionAttribution]) ->
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             })
             .optional()
             .map_err(|source| sqlite_error("reading session description", source))?;
-        session.details = row.map(|(title, time_updated_ms, message_count)| SessionDetails {
-            title,
-            time_updated_ms,
-            message_count: u64::try_from(message_count).unwrap_or(0),
-        });
+        session.details =
+            row.map(
+                |(title, time_updated_ms, message_count, project_path)| SessionDetails {
+                    title,
+                    time_updated_ms,
+                    message_count: u64::try_from(message_count).unwrap_or(0),
+                    project_path,
+                },
+            );
     }
     Ok(())
 }
@@ -385,6 +401,79 @@ mod tests {
                  must report the conversation's real length rather than their sum"
             );
         }
+    }
+
+    #[test]
+    fn description_carries_the_owning_project_worktree_path() {
+        let sessions = described(2, 1);
+
+        for session in &sessions {
+            let details = session
+                .details
+                .as_ref()
+                .expect("a live session should be described");
+            let path = details
+                .project_path
+                .as_ref()
+                .expect("a session whose project row exists should carry its worktree");
+            assert!(
+                path.starts_with('/'),
+                "a worktree is an absolute path, got `{path}`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_whose_project_row_is_gone_is_still_described_without_a_path() {
+        let fixture = Fixture::build(&FixtureConfig {
+            session_count: 1,
+            messages_per_session: 1,
+            parts_per_message: 1,
+            ..FixtureConfig::default()
+        })
+        .expect("fixture should build");
+
+        // `PRAGMA foreign_keys` is per-connection, so a writer that leaves it off can delete a
+        // project row without cascading to its sessions. This reproduces that leftover state.
+        let writer = rusqlite::Connection::open(&fixture.database_path)
+            .expect("fixture should open for writing");
+        writer
+            .pragma_update(None, "foreign_keys", "OFF")
+            .expect("a writer may disable the cascade");
+        writer
+            .execute("DELETE FROM project", [])
+            .expect("deleting the project without cascade should succeed");
+        drop(writer);
+
+        let database = open_read_only(
+            &Target::File(fixture.database_path.clone()),
+            ConnectionOptions::default(),
+        )
+        .expect("fixture should open read-only");
+
+        // The size rollup keys off the project, so the orphaned session is addressed directly.
+        let session_id: String = database
+            .connection()
+            .query_row("SELECT id FROM session LIMIT 1", [], |row| row.get(0))
+            .expect("the session row should survive the uncascaded delete");
+        let mut sessions = vec![SessionAttribution {
+            session_id,
+            project_id: "prj_vanished".to_owned(),
+            self_bytes: 0,
+            subtree_bytes: 0,
+            details: None,
+        }];
+        describe(database.connection(), &mut sessions).expect("description should succeed");
+
+        let details = sessions[0]
+            .details
+            .as_ref()
+            .expect("the session itself still exists");
+        assert!(
+            details.project_path.is_none(),
+            "a missing project row cannot supply a path"
+        );
+        assert!(!details.title.is_empty(), "the session is still described");
     }
 
     #[test]

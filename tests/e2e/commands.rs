@@ -43,6 +43,22 @@ fn analyze_reports_every_layer_in_human_and_json_forms() {
     }
     let report = json(&machine);
     assert_eq!(report["schema_version"], 1);
+    assert!(
+        human.contains("Project"),
+        "the session table names the owning project"
+    );
+    for session in report["largest_sessions"]
+        .as_array()
+        .expect("largest_sessions is an array")
+    {
+        let path = session["project_path"]
+            .as_str()
+            .expect("a fixture session's project row exists, so its path is reported");
+        assert!(
+            path.starts_with('/'),
+            "a project path is absolute, got `{path}`"
+        );
+    }
     for key in [
         "file_space",
         "row_counts",

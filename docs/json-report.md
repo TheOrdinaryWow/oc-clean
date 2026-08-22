@@ -24,8 +24,9 @@ Each `largest_sessions` entry always carries `session_id`, `project_id`, `self_b
 - `title`: string, the session title recorded by OpenCode.
 - `time_updated`: integer, the session's last activity as a millisecond epoch timestamp.
 - `message_count`: integer, the session's message count. OpenCode stores messages under two coexisting models, so this is the larger of the legacy `message` count and the event-sourced `session_message` count rather than their sum.
+- `project_path`: string, the absolute worktree path of the owning project. `project_id` is a hash and cannot identify a checkout on its own, so this is the field to display or group by.
 
-All three are omitted together when the session row could not be read, which happens if the row disappeared between the size rollup and the description lookup. Consumers must treat them as optional.
+The first three are omitted together when the session row could not be read, which happens if the row disappeared between the size rollup and the description lookup. `project_path` is omitted in that case too, and additionally when the project row named by `project_id` no longer exists: `PRAGMA foreign_keys` is per-connection in SQLite, so a writer that left it off can delete a project without cascading to its sessions. Consumers must treat all four as optional.
 
 ## Cleanup report
 

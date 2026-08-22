@@ -349,27 +349,25 @@ fn write_preview(
         &[
             ("Session", Align::Left),
             ("Title", Align::Left),
+            ("Project", Align::Left),
             ("Msgs", Align::Right),
             ("Last active", Align::Left),
             ("Subtree", Align::Right),
         ],
     );
+    let project_budget = format::path_budget();
     for session in &summary.preview {
-        let (title, messages, last_active) = session.details.as_ref().map_or_else(
-            || ("(unavailable)".to_owned(), "-".to_owned(), "-".to_owned()),
-            |details| {
-                (
-                    format::sanitize(&details.title, PREVIEW_TITLE_WIDTH),
-                    details.message_count.to_string(),
-                    format::timestamp_ms(details.time_updated_ms),
-                )
-            },
+        let described = format::describe_session(
+            session.details.as_ref(),
+            PREVIEW_TITLE_WIDTH,
+            project_budget,
         );
         grid.row(vec![
             style.dim(&format::short_id(&session.session_id)),
-            title,
-            messages,
-            style.dim(&last_active),
+            described.title,
+            style.dim(&described.project),
+            described.messages,
+            style.dim(&described.last_active),
             format::bytes(session.subtree_bytes),
         ]);
     }

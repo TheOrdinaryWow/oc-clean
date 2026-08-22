@@ -135,6 +135,7 @@ fn largest_sessions(
         &[
             ("Session", Align::Left),
             ("Title", Align::Left),
+            ("Project", Align::Left),
             ("Msgs", Align::Right),
             ("Last active", Align::Left),
             ("Subtree", Align::Right),
@@ -142,28 +143,16 @@ fn largest_sessions(
             ("Self %", Align::Right),
         ],
     );
+    let project_budget = format::path_budget();
     for session in sessions {
-        let (title, messages, last_active) = session.details.as_ref().map_or_else(
-            || {
-                (
-                    "(unavailable)".to_owned(),
-                    String::from("-"),
-                    String::from("-"),
-                )
-            },
-            |details| {
-                (
-                    format::sanitize(&details.title, TITLE_WIDTH),
-                    details.message_count.to_string(),
-                    format::timestamp_ms(details.time_updated_ms),
-                )
-            },
-        );
+        let described =
+            format::describe_session(session.details.as_ref(), TITLE_WIDTH, project_budget);
         grid.row(vec![
             style.dim(&format::short_id(&session.session_id)),
-            title,
-            messages,
-            style.dim(&last_active),
+            described.title,
+            style.dim(&described.project),
+            described.messages,
+            style.dim(&described.last_active),
             format::bytes(session.subtree_bytes),
             format::bytes(session.self_bytes),
             format::percent_of(session.self_bytes, session.subtree_bytes),

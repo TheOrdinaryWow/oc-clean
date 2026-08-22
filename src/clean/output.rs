@@ -145,8 +145,9 @@ fn write_json(
 
 /// Serializes one previewed session for the JSON cleanup report.
 ///
-/// The description fields are additive within the current `schema_version` and are absent
-/// when the session row could not be described, so consumers must treat them as optional.
+/// The description fields are additive within the current `schema_version` and are absent when
+/// the session row could not be described; `project_path` is additionally absent when the named
+/// project row no longer exists. Consumers must treat them all as optional.
 fn preview_entry(session: &SessionAttribution) -> serde_json::Value {
     let mut object = json!({
         "session_id": session.session_id,
@@ -158,6 +159,9 @@ fn preview_entry(session: &SessionAttribution) -> serde_json::Value {
         map.insert("title".to_owned(), json!(details.title));
         map.insert("time_updated".to_owned(), json!(details.time_updated_ms));
         map.insert("message_count".to_owned(), json!(details.message_count));
+        if let Some(project_path) = &details.project_path {
+            map.insert("project_path".to_owned(), json!(project_path));
+        }
     }
     object
 }

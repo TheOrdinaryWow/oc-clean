@@ -79,9 +79,10 @@ fn table_space(report: &crate::analyze::space::ObjectSpaceReport) -> Value {
 
 /// Serializes one attributed session, including its description when one was looked up.
 ///
-/// `title`, `time_updated`, and `message_count` are additive fields within the current
-/// `schema_version`: they are absent for a session whose row disappeared between the size
-/// rollup and the description lookup, so consumers must treat them as optional.
+/// `title`, `time_updated`, `message_count`, and `project_path` are additive fields within the
+/// current `schema_version`: the first three are absent for a session whose row disappeared
+/// between the size rollup and the description lookup, and `project_path` is additionally absent
+/// when the named project row no longer exists. Consumers must treat all four as optional.
 fn session_object(session: &SessionAttribution) -> serde_json::Value {
     let mut object = json!({
         "session_id": session.session_id,
@@ -93,6 +94,9 @@ fn session_object(session: &SessionAttribution) -> serde_json::Value {
         map.insert("title".to_owned(), json!(details.title));
         map.insert("time_updated".to_owned(), json!(details.time_updated_ms));
         map.insert("message_count".to_owned(), json!(details.message_count));
+        if let Some(project_path) = &details.project_path {
+            map.insert("project_path".to_owned(), json!(project_path));
+        }
     }
     object
 }

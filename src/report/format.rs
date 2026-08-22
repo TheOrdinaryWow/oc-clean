@@ -10,6 +10,7 @@ use comfy_table::{Cell, CellAlignment, ContentArrangement, Table, presets};
 use owo_colors::OwoColorize;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::analyze::attribution::SessionDetails;
 use crate::error::Error;
 
 const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -77,6 +78,22 @@ pub fn timestamp_ms(value: i64) -> String {
     )
 }
 
+/// Replaces every control character with a space.
+///
+/// Titles and paths are user-authored data that can carry a newline or an escape sequence,
+/// either of which would corrupt an aligned table.
+fn sanitize_control_characters(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
 /// Truncates `text` to `limit` terminal columns, replacing control characters.
 ///
 /// Control characters are stripped because a session title is user-authored data that can
@@ -86,16 +103,7 @@ pub fn timestamp_ms(value: i64) -> String {
 /// the same width on screen as a Latin one at the same limit.
 #[must_use]
 pub fn sanitize(text: &str, limit: usize) -> String {
-    let cleaned: String = text
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect();
+    let cleaned = sanitize_control_characters(text);
     let trimmed = cleaned.trim();
     if trimmed.width() <= limit {
         return trimmed.to_owned();
@@ -115,6 +123,99 @@ pub fn sanitize(text: &str, limit: usize) -> String {
     }
     truncated.push('…');
     truncated
+}
+
+/// The four descriptive cells a session contributes to a report table.
+pub struct DescribedSession {
+    pub title: String,
+    pub project: String,
+    pub messages: String,
+    pub last_active: String,
+}
+
+/// Renders a session's descriptive cells, or placeholders when it could not be described.
+///
+/// A session whose row vanished between the size rollup and the description lookup still has to
+/// occupy a row, because its bytes are real and the operator needs to see them. The placeholders
+/// say so rather than leaving cells blank, which would read as empty data.
+///
+/// The project cell is separately optional: `session.project_id` has no foreign key, so a live
+/// session can name a project row that no longer exists.
+#[must_use]
+pub fn describe_session(
+    details: Option<&SessionDetails>,
+    title_width: usize,
+    project_width: usize,
+) -> DescribedSession {
+    details.map_or_else(
+        || DescribedSession {
+            title: "(unavailable)".to_owned(),
+            project: "-".to_owned(),
+            messages: "-".to_owned(),
+            last_active: "-".to_owned(),
+        },
+        |details| DescribedSession {
+            title: sanitize(&details.title, title_width),
+            project: details
+                .project_path
+                .as_ref()
+                .map_or_else(|| "-".to_owned(), |path| path_tail(path, project_width)),
+            messages: details.message_count.to_string(),
+            last_active: timestamp_ms(details.time_updated_ms),
+        },
+    )
+}
+
+/// Shortens a filesystem path to `limit` columns by dropping leading components.
+///
+/// Paths are truncated from the head rather than the tail because the distinguishing part of a
+/// project path is its last components. Two checkouts under the same parent share a long common
+/// prefix, so cutting the tail would render them identically.
+///
+/// A path that already fits is returned unchanged, which is the common case: most worktrees are
+/// far shorter than the budget.
+#[must_use]
+pub fn path_tail(path: &str, limit: usize) -> String {
+    let cleaned = sanitize_control_characters(path);
+    let trimmed = cleaned.trim();
+    if trimmed.width() <= limit {
+        return trimmed.to_owned();
+    }
+
+    // One column is reserved for the ellipsis that marks the dropped prefix.
+    let budget = limit.saturating_sub(1);
+    let mut kept = String::new();
+    let mut used = 0;
+    for character in trimmed.chars().rev() {
+        let width = character.width().unwrap_or(0);
+        if used + width > budget {
+            break;
+        }
+        kept.push(character);
+        used += width;
+    }
+    let mut shortened = String::from("…");
+    shortened.extend(kept.chars().rev());
+    shortened
+}
+
+/// Returns how many columns a project path may occupy in a table.
+///
+/// The budget follows the terminal so a wide window shows more of the path and a narrow one is
+/// not overrun, and it is clamped at both ends: too small a budget shows nothing recognizable,
+/// and too large a one lets a single deep path dominate the row. A non-terminal stdout has no
+/// width to follow, so it falls back to the middle of that range.
+#[must_use]
+pub fn path_budget() -> usize {
+    const FALLBACK: usize = 48;
+    const MIN: usize = 24;
+    const MAX: usize = 72;
+
+    // `Table::width` reports the terminal width when stdout is a terminal, which is the stream
+    // these reports are written to. Borrowing it avoids a second terminal-size dependency.
+    Table::new()
+        .width()
+        .map_or(FALLBACK, |width| (usize::from(width) / 3).clamp(MIN, MAX))
 }
 
 /// Shortens an identifier to a recognizable prefix.
@@ -375,10 +476,66 @@ fn civil_utc(seconds: i64) -> Option<(i64, u32, u32, u32, u32)> {
 
 #[cfg(test)]
 mod tests {
+    use unicode_width::UnicodeWidthStr;
+
     use super::{
-        Align, Grid, Style, bytes, optional_bytes, percent, percent_of, sanitize, short_id,
-        timestamp_ms,
+        Align, Grid, SessionDetails, Style, bytes, describe_session, optional_bytes, path_budget,
+        path_tail, percent, percent_of, sanitize, short_id, timestamp_ms,
     };
+
+    #[test]
+    fn a_path_is_shortened_from_the_head_so_its_tail_stays_distinguishable() {
+        // A path that fits is untouched, which is the common case.
+        assert_eq!(path_tail("/work/api", 40), "/work/api");
+        assert_eq!(path_tail("/work/api", 9), "/work/api");
+
+        // Two checkouts under a shared parent must not collapse into the same rendering.
+        let first = path_tail("/home/user/projects/company/backend-api", 20);
+        let second = path_tail("/home/user/projects/company/backend-web", 20);
+        assert_ne!(first, second);
+        assert!(first.ends_with("backend-api"), "got `{first}`");
+        assert!(first.starts_with('…'), "got `{first}`");
+        assert_eq!(first.width(), 20);
+
+        // Control characters cannot break the row they sit in.
+        assert!(!path_tail("/work/a\nb", 40).contains('\n'));
+    }
+
+    #[test]
+    fn the_path_budget_stays_inside_its_clamp() {
+        let budget = path_budget();
+        assert!(
+            (24..=72).contains(&budget),
+            "budget {budget} escaped its clamp"
+        );
+    }
+
+    #[test]
+    fn an_undescribed_session_renders_placeholders_rather_than_blank_cells() {
+        let described = describe_session(None, 40, 40);
+        assert_eq!(described.title, "(unavailable)");
+        assert_eq!(described.project, "-");
+        assert_eq!(described.messages, "-");
+        assert_eq!(described.last_active, "-");
+    }
+
+    #[test]
+    fn a_described_session_without_a_project_row_still_renders_its_other_cells() {
+        let described = describe_session(
+            Some(&SessionDetails {
+                title: "a title".to_owned(),
+                time_updated_ms: 1_787_000_000_000,
+                message_count: 7,
+                project_path: None,
+            }),
+            40,
+            40,
+        );
+        assert_eq!(described.title, "a title");
+        assert_eq!(described.project, "-");
+        assert_eq!(described.messages, "7");
+        assert_ne!(described.last_active, "-");
+    }
 
     #[test]
     fn sizes_render_binary_units_without_the_raw_byte_count() {
