@@ -9,7 +9,7 @@ The schema version 1 object contains these keys:
 - `file_space`: SQLite page counts, page size, live/freelist bytes and percentage, plus optional WAL and SHM bytes.
 - `row_counts`: object mapping every application table name to its row count.
 - `table_space`: accounting method, accuracy label, and table/index/schema byte entries.
-- `project_attribution`: project identifiers and attributed payload bytes.
+- `project_attribution`: project identifiers, absolute worktree paths, and attributed payload bytes. Each entry carries `project_id`, `worktree`, and `bytes`; `worktree` is never omitted because the column is `NOT NULL` in OpenCode's schema.
 - `largest_sessions`: session and project identifiers with self and descendant-subtree payload bytes, plus the optional description fields below.
 - `orphans`: count and estimated bytes for all five orphan classes.
 - `age_distribution`: fixed age ranges with session counts and payload bytes.

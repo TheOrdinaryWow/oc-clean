@@ -106,13 +106,16 @@ fn project_attribution(
         style,
         &[
             ("Project", Align::Left),
+            ("Id", Align::Left),
             ("Size", Align::Right),
             ("Share", Align::Right),
         ],
     );
+    let project_budget = format::path_budget();
     for project in projects {
         grid.row(vec![
-            project.project_id.clone(),
+            format::path_tail(&project.worktree, project_budget),
+            style.dim(&format::short_id(&project.project_id)),
             format::bytes(project.bytes),
             format::percent_of(project.bytes, total),
         ]);

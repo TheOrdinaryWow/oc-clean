@@ -17,6 +17,7 @@ pub(super) fn write(report: &AnalysisReport, output: &mut dyn Write) -> Result<(
         "table_space": report.table_space.as_ref().map(table_space),
         "project_attribution": report.project_attribution.as_ref().map(|projects| projects.iter().map(|project| json!({
             "project_id": project.project_id,
+            "worktree": project.worktree,
             "bytes": project.bytes,
         })).collect::<Vec<_>>()),
         "largest_sessions": report.largest_sessions.as_ref().map(|sessions| sessions.iter().map(session_object).collect::<Vec<_>>()),

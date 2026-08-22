@@ -81,7 +81,7 @@ SELECT 'cycle', root_id, '', 0, 0
 FROM subtree_rollup
 WHERE cycle != 0
 UNION ALL
-SELECT 'project', project.id, '', 0, COALESCE(SUM(self_bytes.bytes), 0)
+SELECT 'project', project.id, project.worktree, 0, COALESCE(SUM(self_bytes.bytes), 0)
 FROM project
 LEFT JOIN self_bytes ON self_bytes.project_id = project.id
 GROUP BY project.id
@@ -94,6 +94,13 @@ FROM top_sessions
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectAttribution {
     pub project_id: String,
+    /// Absolute worktree path of the project.
+    ///
+    /// A project identifier is a hash, so a rollup keyed only by it cannot tell an operator
+    /// which checkout the bytes belong to. Unlike a session's project path this is never
+    /// optional: the rollup is driven by the `project` table itself, and `worktree` is
+    /// `NOT NULL` there.
+    pub worktree: String,
     pub bytes: u64,
 }
 
@@ -283,11 +290,15 @@ fn attribution_report(connection: &Connection, top_n: i64) -> Result<Attribution
 }
 
 fn project_row(row: &rusqlite::Row<'_>, project_id: String) -> Result<ProjectAttribution, Error> {
+    let worktree = row
+        .get::<_, String>(2)
+        .map_err(|source| sqlite_error("reading project worktree", source))?;
     let bytes = row
         .get::<_, i64>(4)
         .map_err(|source| sqlite_error("reading project-attributed bytes", source))?;
     Ok(ProjectAttribution {
         project_id,
+        worktree,
         bytes: non_negative_bytes(4, bytes, "reading project-attributed bytes")?,
     })
 }
@@ -401,6 +412,41 @@ mod tests {
                  must report the conversation's real length rather than their sum"
             );
         }
+    }
+
+    #[test]
+    fn the_project_rollup_carries_each_project_worktree_path() {
+        let fixture = Fixture::build(&FixtureConfig {
+            project_count: 2,
+            session_count: 2,
+            messages_per_session: 1,
+            parts_per_message: 1,
+            ..FixtureConfig::default()
+        })
+        .expect("fixture should build");
+        let database = open_read_only(
+            &Target::File(fixture.database_path.clone()),
+            ConnectionOptions::default(),
+        )
+        .expect("fixture should open read-only");
+
+        let projects = analyze(&database, 2)
+            .expect("attribution should succeed")
+            .projects;
+
+        assert_eq!(projects.len(), 2);
+        for project in &projects {
+            assert!(
+                project.worktree.starts_with('/'),
+                "a worktree is an absolute path, got `{}`",
+                project.worktree
+            );
+        }
+        // A project with no sessions still belongs in the rollup, at zero bytes.
+        assert!(
+            projects.iter().all(|project| !project.worktree.is_empty()),
+            "`project.worktree` is NOT NULL, so no row may report an empty path"
+        );
     }
 
     #[test]

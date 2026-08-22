@@ -47,6 +47,18 @@ fn analyze_reports_every_layer_in_human_and_json_forms() {
         human.contains("Project"),
         "the session table names the owning project"
     );
+    for project in report["project_attribution"]
+        .as_array()
+        .expect("project_attribution is an array")
+    {
+        let worktree = project["worktree"]
+            .as_str()
+            .expect("`project.worktree` is NOT NULL, so every rollup row carries one");
+        assert!(
+            worktree.starts_with('/'),
+            "a worktree is an absolute path, got `{worktree}`"
+        );
+    }
     for session in report["largest_sessions"]
         .as_array()
         .expect("largest_sessions is an array")

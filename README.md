@@ -78,7 +78,7 @@ The second command prints the same impact, asks `Proceed? [y/n]`, and deletes on
 
 `analyze` opens the database read-only. Full mode reports database allocation, table and row distribution, session age and size distributions, orphan counts, largest sessions, project rollups, and associated external storage. Quick mode limits work to file-level accounting and row counts.
 
-Each reported session carries its title, owning project path, last-activity date, and message count alongside its size, because a session identifier is a random string that tells an operator nothing about what the session contains. The project column shows the absolute worktree path; a path too long for the terminal is shortened from the front, so the trailing directories that distinguish one checkout from another stay visible. Those descriptions are looked up only for the sessions the report displays, so `--top` bounds their cost.
+Each reported session carries its title, owning project path, last-activity date, and message count alongside its size, because a session identifier is a random string that tells an operator nothing about what the session contains. The project rollup is keyed by absolute worktree path for the same reason, with the project identifier kept beside it. A path too long for the terminal is shortened from the front, so the trailing directories that distinguish one checkout from another stay visible. Those descriptions are looked up only for the sessions the report displays, so `--top` bounds their cost.
 
 ```sh
 oc-clean analyze
